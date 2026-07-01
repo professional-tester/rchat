@@ -751,6 +751,29 @@ pub async fn send_video_message(
             .map_err(|e| format!("Failed to store video: {}", e))?
     };
 
+    if matches!(chat_kind, ChatKind::Group) {
+        let msg_id = crate::chat::group::send_group_media_reference(
+            &app_state,
+            &net_state,
+            canonical_peer_id,
+            GroupContentType::Video,
+            file_hash.clone(),
+            Some(file_name.clone()),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!(
+            "[Backend] Video message sent: hash={}, name={}",
+            file_hash, file_name
+        );
+        return Ok(SentMediaResult {
+            msg_id,
+            file_hash,
+            file_name: Some(file_name),
+        });
+    }
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -898,6 +921,29 @@ pub async fn send_audio_message(
         storage::object::create(&conn, &file_data, Some(&file_name), Some(mime_type), None)
             .map_err(|e| format!("Failed to store audio: {}", e))?
     };
+
+    if matches!(chat_kind, ChatKind::Group) {
+        let msg_id = crate::chat::group::send_group_media_reference(
+            &app_state,
+            &net_state,
+            canonical_peer_id,
+            GroupContentType::Audio,
+            file_hash.clone(),
+            Some(file_name.clone()),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!(
+            "[Backend] Audio message sent: hash={}, name={}",
+            file_hash, file_name
+        );
+        return Ok(SentMediaResult {
+            msg_id,
+            file_hash,
+            file_name: Some(file_name),
+        });
+    }
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1264,6 +1310,26 @@ pub async fn send_sticker_message(
 
         (file_name, chat_id)
     };
+
+    if matches!(chat_kind, ChatKind::Group) {
+        let msg_id = crate::chat::group::send_group_media_reference(
+            &app_state,
+            &net_state,
+            canonical_peer_id,
+            GroupContentType::Sticker,
+            file_hash.clone(),
+            file_name.clone(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!("[Backend] Sticker message sent: hash={}", file_hash);
+        return Ok(SentMediaResult {
+            msg_id,
+            file_hash,
+            file_name,
+        });
+    }
 
     let message = storage::db::Message {
         id: msg_id.clone(),

@@ -21,10 +21,10 @@ use crate::commands::call::{
     start_video_call, start_voice_call, submit_video_call_i420_frame,
 };
 use crate::commands::chat::{
-    accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times,
-    get_chat_list, get_unread_counts, invite_group_member, join_group_chat, leave_group_chat,
-    mark_messages_read, reject_group_invite, rename_group_chat, save_temporary_chat_to_archive,
-    send_message, send_message_to_self, sync_group_chat,
+    accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list,
+    get_unread_counts, invite_group_member, join_group_chat, leave_group_chat, mark_messages_read,
+    reject_group_invite, rename_group_chat, save_temporary_chat_to_archive, send_message,
+    send_message_to_self, sync_group_chat,
 };
 use crate::commands::chat_details::{
     drop_chat_connection, force_chat_reconnect, get_chat_details_overview, get_chat_stats,

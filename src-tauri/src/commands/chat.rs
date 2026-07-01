@@ -684,8 +684,13 @@ pub async fn mark_messages_read(
     println!("[Backend] Marked {} messages as read", marked_ids.len());
 
     if !marked_ids.is_empty() && matches!(chat_kind, ChatKind::Group) {
-        if let Err(e) =
-            crate::chat::group::mark_read(&state, &net_state, resolved_chat_id.clone(), marked_ids.clone()).await
+        if let Err(e) = crate::chat::group::mark_read(
+            &state,
+            &net_state,
+            resolved_chat_id.clone(),
+            marked_ids.clone(),
+        )
+        .await
         {
             eprintln!("[Backend] Failed to publish group read receipt: {}", e);
         }
