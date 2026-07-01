@@ -1,0 +1,1845 @@
+use super::codec::{VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
+    SupportedStreamConfigRange,
+};
+use rubato::{
+    audioadapter_buffers::direct::SequentialSliceOfVecs, Async, FixedAsync, Resampler,
+    SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
+use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const TARGET_RATE: u32 = VOICE_SAMPLE_RATE;
+const FRAME_SAMPLES: usize = VOICE_FRAME_SAMPLES; // 20ms @ 48kHz mono
+const VOICE_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(5);
+const PLAYBACK_TARGET_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 8; // 160ms
+const PLAYBACK_LOW_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 4; // 80ms
+const MAX_PLAYBACK_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 16; // 320ms
+const CONCEALMENT_SAMPLES: usize = FRAME_SAMPLES;
+const CONCEALMENT_HOLD_SAMPLES: usize = FRAME_SAMPLES / 4;
+const CAPTURE_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(2);
+const PLAYBACK_RATE_MEASURE_INTERVAL: Duration = Duration::from_secs(1);
+const MIN_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 8_000.0;
+const MAX_PLAUSIBLE_OUTPUT_RATE_HZ: f64 = 192_000.0;
+const OUTPUT_CLOCK_UNSTABLE_THRESHOLD: f64 = 0.10;
+const ECHO_SUPPRESSION_HOLD: Duration = Duration::from_millis(220);
+const ECHO_PLAYBACK_PEAK_THRESHOLD: i16 = 384;
+const ECHO_NO_PLAYBACK_ACTIVITY: u64 = u64::MAX;
+const AEC_FALLBACK_ERROR_THRESHOLD: u64 = 3;
+const VOICE_OUTPUT_RATE_ENV: &str = "RCHAT_VOICE_OUTPUT_RATE";
+const PREFERRED_OUTPUT_RATES: &[u32] = &[48_000, 44_100, 24_000, 22_050, 16_000];
+
+#[derive(Debug, Default)]
+struct VoiceAudioStats {
+    started_at: Option<Instant>,
+    capture_callbacks: u64,
+    capture_input_frames: u64,
+    measured_capture_rate_hz: f64,
+    capture_resample_ratio: f64,
+    capture_panics: u64,
+    capture_echo_suppressed_samples: u64,
+    aec_enabled: bool,
+    aec_render_frames: u64,
+    aec_capture_frames: u64,
+    aec_errors: u64,
+    aec_fallback_active: bool,
+    generated_frames: u64,
+    resampler_errors: u64,
+    playback_callbacks: u64,
+    output_device_frames: u64,
+    playback_declared_rate_hz: f64,
+    playback_measured_rate_hz: f64,
+    playback_effective_rate_hz: f64,
+    output_clock_unstable: bool,
+    playback_frames_received: u64,
+    playback_samples_consumed: u64,
+    playback_samples_dropped: u64,
+    playback_queue_trim_events: u64,
+    playback_concealed_samples: u64,
+    playback_underruns: u64,
+    current_playback_queue_samples: usize,
+    max_playback_queue_samples: usize,
+}
+
+impl VoiceAudioStats {
+    fn log_summary(&self, label: &str) {
+        let elapsed = self
+            .started_at
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+            .max(0.001);
+        let capture_device_hz = self.capture_input_frames as f64 / elapsed;
+        let generated_fps = self.generated_frames as f64 / elapsed;
+        let output_device_hz = self.output_device_frames as f64 / elapsed;
+        let playback_fps = (self.playback_samples_consumed as f64 / FRAME_SAMPLES as f64) / elapsed;
+        eprintln!(
+            "[Voice][Audio][{}] capture_callbacks={}, capture_device_hz={:.1}, measured_capture_hz={:.1}, capture_resample_ratio={:.6}, capture_panics={}, capture_echo_suppressed_ms={:.1}, aec_enabled={}, aec_render_frames={}, aec_capture_frames={}, aec_errors={}, aec_fallback_active={}, generated_frames={}, generated_fps={:.1}, resampler_errors={}, playback_callbacks={}, output_device_hz={:.1}, playback_declared_hz={:.1}, playback_measured_hz={:.1}, playback_effective_hz={:.1}, output_clock_unstable={}, playback_frames_received={}, playback_fps={:.1}, playback_underruns={}, playback_concealed_samples={}, playback_samples_dropped={}, playback_queue_trim_events={}, current_playback_queue_ms={:.1}, max_playback_queue_ms={:.1}",
+            label,
+            self.capture_callbacks,
+            capture_device_hz,
+            self.measured_capture_rate_hz,
+            self.capture_resample_ratio,
+            self.capture_panics,
+            samples_to_ms(self.capture_echo_suppressed_samples as usize),
+            self.aec_enabled,
+            self.aec_render_frames,
+            self.aec_capture_frames,
+            self.aec_errors,
+            self.aec_fallback_active,
+            self.generated_frames,
+            generated_fps,
+            self.resampler_errors,
+            self.playback_callbacks,
+            output_device_hz,
+            self.playback_declared_rate_hz,
+            self.playback_measured_rate_hz,
+            self.playback_effective_rate_hz,
+            self.output_clock_unstable,
+            self.playback_frames_received,
+            playback_fps,
+            self.playback_underruns,
+            self.playback_concealed_samples,
+            self.playback_samples_dropped,
+            self.playback_queue_trim_events,
+            samples_to_ms(self.current_playback_queue_samples),
+            samples_to_ms(self.max_playback_queue_samples),
+        );
+        if self.output_clock_unstable && self.playback_queue_trim_events > 0 {
+            eprintln!(
+                "[Voice][Audio][PLAYBACK_CLOCK_MISMATCH][OUTPUT_CALLBACK_STARVATION] playback_declared_hz={:.1}, playback_measured_hz={:.1}, playback_effective_hz={:.1}, playback_queue_ms={:.1}, playback_samples_dropped={}, playback_queue_trim_events={}",
+                self.playback_declared_rate_hz,
+                self.playback_measured_rate_hz,
+                self.playback_effective_rate_hz,
+                samples_to_ms(self.current_playback_queue_samples),
+                self.playback_samples_dropped,
+                self.playback_queue_trim_events,
+            );
+        }
+    }
+}
+
+fn with_audio_stats(
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    update: impl FnOnce(&mut VoiceAudioStats),
+) {
+    if let Ok(mut guard) = stats.lock() {
+        update(&mut guard);
+    }
+}
+
+struct EchoGuard {
+    started_at: Instant,
+    last_playback_active_ms: AtomicU64,
+}
+
+impl EchoGuard {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_playback_active_ms: AtomicU64::new(ECHO_NO_PLAYBACK_ACTIVITY),
+        }
+    }
+
+    fn mark_playback_activity(&self, samples: &[i16], now: Instant) {
+        let has_audible_output = samples
+            .iter()
+            .any(|sample| (*sample as i32).abs() >= ECHO_PLAYBACK_PEAK_THRESHOLD as i32);
+        if has_audible_output {
+            self.last_playback_active_ms
+                .store(self.elapsed_ms(now), Ordering::Relaxed);
+        }
+    }
+
+    fn should_suppress_capture(&self, now: Instant) -> bool {
+        let last = self.last_playback_active_ms.load(Ordering::Relaxed);
+        if last == ECHO_NO_PLAYBACK_ACTIVITY {
+            return false;
+        }
+
+        self.elapsed_ms(now).saturating_sub(last) <= ECHO_SUPPRESSION_HOLD.as_millis() as u64
+    }
+
+    fn apply_to_capture(&self, samples: &mut [i16], now: Instant) -> bool {
+        if !self.should_suppress_capture(now) {
+            return false;
+        }
+
+        samples.fill(0);
+        true
+    }
+
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        now.checked_duration_since(self.started_at)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VoiceAecStats {
+    render_frames: u64,
+    capture_frames: u64,
+    errors: u64,
+    fallback_active: bool,
+}
+
+struct VoiceAecProcessor {
+    canceller: rchat_audio_processing::RchatEchoCanceller,
+    stats: VoiceAecStats,
+}
+
+impl VoiceAecProcessor {
+    fn new(canceller: rchat_audio_processing::RchatEchoCanceller) -> Self {
+        Self {
+            canceller,
+            stats: VoiceAecStats::default(),
+        }
+    }
+
+    fn process_render_frame(&mut self, frame: &[i16]) -> Result<(), String> {
+        match self.canceller.process_render_20ms_i16(frame) {
+            Ok(()) => {
+                self.stats.render_frames = self.stats.render_frames.saturating_add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.note_error();
+                Err(e.to_string())
+            }
+        }
+    }
+
+    fn process_capture_frame(&mut self, frame: &[i16]) -> Result<Vec<i16>, String> {
+        match self.canceller.process_capture_20ms_i16(frame) {
+            Ok(processed) => {
+                self.stats.capture_frames = self.stats.capture_frames.saturating_add(1);
+                Ok(processed)
+            }
+            Err(e) => {
+                self.note_error();
+                Err(e.to_string())
+            }
+        }
+    }
+
+    fn note_error(&mut self) {
+        self.stats.errors = self.stats.errors.saturating_add(1);
+        if self.stats.errors >= AEC_FALLBACK_ERROR_THRESHOLD {
+            self.stats.fallback_active = true;
+        }
+    }
+
+    fn fallback_active(&self) -> bool {
+        self.stats.fallback_active
+    }
+
+    fn stats(&self) -> VoiceAecStats {
+        self.stats
+    }
+}
+
+type SharedVoiceAecProcessor = Arc<Mutex<VoiceAecProcessor>>;
+
+pub struct VoiceAudioEngine {
+    playback_tx: mpsc::Sender<Vec<i16>>,
+    shutdown_tx: mpsc::Sender<()>,
+    thread_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl VoiceAudioEngine {
+    pub fn start() -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>), String> {
+        let (capture_tx, capture_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+        let (playback_tx, playback_rx) = mpsc::channel::<Vec<i16>>();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+        let stats = Arc::new(Mutex::new(VoiceAudioStats {
+            started_at: Some(Instant::now()),
+            ..VoiceAudioStats::default()
+        }));
+        let thread_stats = stats.clone();
+
+        let thread_handle = thread::Builder::new()
+            .name("rchat-voice-audio".to_string())
+            .spawn(move || {
+                run_audio_thread(capture_tx, playback_rx, shutdown_rx, thread_stats);
+            })
+            .map_err(|e| format!("Failed to start audio thread: {}", e))?;
+
+        Ok((
+            Self {
+                playback_tx,
+                shutdown_tx,
+                thread_handle: Some(thread_handle),
+            },
+            capture_rx,
+        ))
+    }
+
+    pub fn push_remote_frame(&self, samples: Vec<i16>) {
+        let _ = self.playback_tx.send(samples);
+    }
+}
+
+impl Drop for VoiceAudioEngine {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_audio_thread(
+    capture_tx: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    playback_rx: mpsc::Receiver<Vec<i16>>,
+    shutdown_rx: mpsc::Receiver<()>,
+    stats: Arc<Mutex<VoiceAudioStats>>,
+) {
+    let host = cpal::default_host();
+    let Some(input_device) = host.default_input_device() else {
+        eprintln!("[Voice] No default input device");
+        return;
+    };
+    let Some(output_device) = host.default_output_device() else {
+        eprintln!("[Voice] No default output device");
+        return;
+    };
+
+    let Ok(input_supported) = input_device.default_input_config() else {
+        eprintln!("[Voice] Failed to read input config");
+        return;
+    };
+    let Ok(output_supported_default) = output_device.default_output_config() else {
+        eprintln!("[Voice] Failed to read output config");
+        return;
+    };
+    let output_default_rate = output_supported_default.sample_rate().0;
+    let output_default_channels = output_supported_default.channels();
+    let output_default_format = output_supported_default.sample_format();
+    let output_selection = choose_voice_output_config(&output_device, output_supported_default);
+    let output_supported = output_selection.config;
+
+    let input_config = StreamConfig {
+        channels: input_supported.channels(),
+        sample_rate: input_supported.sample_rate(),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let output_config = StreamConfig {
+        channels: output_supported.channels(),
+        sample_rate: output_supported.sample_rate(),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let input_name = input_device
+        .name()
+        .unwrap_or_else(|_| "unknown".to_string());
+    let output_name = output_device
+        .name()
+        .unwrap_or_else(|_| "unknown".to_string());
+    eprintln!(
+        "[Voice][Audio] input_device='{}', input_rate={}, input_channels={}, input_format={:?}; output_device='{}', output_rate={}, output_channels={}, output_format={:?}",
+        input_name,
+        input_config.sample_rate.0,
+        input_config.channels,
+        input_supported.sample_format(),
+        output_name,
+        output_config.sample_rate.0,
+        output_config.channels,
+        output_supported.sample_format(),
+    );
+    eprintln!(
+        "[Voice][Audio] output_config_selection={} requested_output_rate={} supported_output_configs={} default_output_rate={} default_output_channels={} default_output_format={:?}; selected_output_rate={} selected_output_channels={} selected_output_format={:?}",
+        output_selection.reason.as_str(),
+        output_selection
+            .requested_rate
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        output_selection.supported_config_count,
+        output_default_rate,
+        output_default_channels,
+        output_default_format,
+        output_config.sample_rate.0,
+        output_config.channels,
+        output_supported.sample_format(),
+    );
+
+    let echo_guard = Arc::new(EchoGuard::new());
+    let aec_processor = match rchat_audio_processing::RchatEchoCanceller::new_48khz_mono() {
+        Ok(mut canceller) => {
+            let delay_ms = samples_to_ms(PLAYBACK_TARGET_QUEUE_SAMPLES) as i32;
+            let _ = canceller.set_stream_delay_ms(delay_ms);
+            eprintln!("[Voice][Audio] acoustic_echo_cancellation=enabled");
+            with_audio_stats(&stats, |s| {
+                s.aec_enabled = true;
+                s.aec_fallback_active = false;
+            });
+            Some(Arc::new(Mutex::new(VoiceAecProcessor::new(canceller))))
+        }
+        Err(e) => {
+            eprintln!(
+                "[Voice][Audio] acoustic_echo_cancellation=disabled error={}",
+                e
+            );
+            with_audio_stats(&stats, |s| {
+                s.aec_enabled = false;
+                s.aec_fallback_active = true;
+            });
+            None
+        }
+    };
+    let input_stream = match build_input_stream(
+        &input_device,
+        &input_supported.sample_format(),
+        &input_config,
+        capture_tx,
+        stats.clone(),
+        echo_guard.clone(),
+        aec_processor.clone(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[Voice] {}", e);
+            return;
+        }
+    };
+
+    let output_stream = match build_output_stream(
+        &output_device,
+        &output_supported.sample_format(),
+        &output_config,
+        playback_rx,
+        stats.clone(),
+        echo_guard,
+        aec_processor,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[Voice] {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = input_stream.play() {
+        eprintln!("[Voice] Failed to start input stream: {}", e);
+        return;
+    }
+    if let Err(e) = output_stream.play() {
+        eprintln!("[Voice] Failed to start output stream: {}", e);
+        return;
+    }
+
+    let mut last_summary = Instant::now();
+    loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
+        if last_summary.elapsed() >= VOICE_DIAGNOSTICS_INTERVAL {
+            if let Ok(guard) = stats.lock() {
+                guard.log_summary("summary");
+            }
+            last_summary = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if let Ok(guard) = stats.lock() {
+        guard.log_summary("final");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputConfigSelectionReason {
+    EnvOverride,
+    PreferredVoiceRate,
+    DefaultOutputConfig,
+    SupportedConfigUnavailable,
+}
+
+impl OutputConfigSelectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "env_override",
+            Self::PreferredVoiceRate => "preferred_voice_rate",
+            Self::DefaultOutputConfig => "default_output_config",
+            Self::SupportedConfigUnavailable => "supported_config_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OutputConfigSelection {
+    config: SupportedStreamConfig,
+    reason: OutputConfigSelectionReason,
+    requested_rate: Option<u32>,
+    supported_config_count: usize,
+}
+
+fn choose_voice_output_config(
+    output_device: &cpal::Device,
+    default: SupportedStreamConfig,
+) -> OutputConfigSelection {
+    let requested_rate = requested_output_rate_override();
+    let supported_ranges = match output_device.supported_output_configs() {
+        Ok(ranges) => ranges.collect::<Vec<_>>(),
+        Err(e) => {
+            eprintln!(
+                "[Voice][Audio] Failed to read supported output configs: {}",
+                e
+            );
+            return OutputConfigSelection {
+                config: default,
+                reason: OutputConfigSelectionReason::SupportedConfigUnavailable,
+                requested_rate,
+                supported_config_count: 0,
+            };
+        }
+    };
+
+    select_voice_output_config(default, supported_ranges, requested_rate)
+}
+
+fn requested_output_rate_override() -> Option<u32> {
+    let Ok(value) = std::env::var(VOICE_OUTPUT_RATE_ENV) else {
+        return None;
+    };
+    match value.trim().parse::<u32>() {
+        Ok(rate) if rate > 0 => Some(rate),
+        _ => {
+            eprintln!(
+                "[Voice][Audio] Ignoring invalid {}='{}'",
+                VOICE_OUTPUT_RATE_ENV, value
+            );
+            None
+        }
+    }
+}
+
+fn select_voice_output_config(
+    default: SupportedStreamConfig,
+    supported_ranges: Vec<SupportedStreamConfigRange>,
+    requested_rate: Option<u32>,
+) -> OutputConfigSelection {
+    let supported_config_count = supported_ranges.len();
+    if let Some(rate) = requested_rate {
+        if let Some(config) = find_output_config_for_rate(&supported_ranges, &default, rate) {
+            return OutputConfigSelection {
+                config,
+                reason: OutputConfigSelectionReason::EnvOverride,
+                requested_rate,
+                supported_config_count,
+            };
+        }
+        eprintln!(
+            "[Voice][Audio] Requested {}={} is not supported; falling back to voice preferences",
+            VOICE_OUTPUT_RATE_ENV, rate
+        );
+    }
+
+    for rate in PREFERRED_OUTPUT_RATES {
+        if let Some(config) = find_output_config_for_rate(&supported_ranges, &default, *rate) {
+            return OutputConfigSelection {
+                config,
+                reason: OutputConfigSelectionReason::PreferredVoiceRate,
+                requested_rate,
+                supported_config_count,
+            };
+        }
+    }
+
+    OutputConfigSelection {
+        config: default,
+        reason: OutputConfigSelectionReason::DefaultOutputConfig,
+        requested_rate,
+        supported_config_count,
+    }
+}
+
+fn find_output_config_for_rate(
+    ranges: &[SupportedStreamConfigRange],
+    default: &SupportedStreamConfig,
+    rate: u32,
+) -> Option<SupportedStreamConfig> {
+    let sample_rate = SampleRate(rate);
+    let default_channels = default.channels();
+    let default_format = default.sample_format();
+
+    for require_channels in [true, false] {
+        for require_format in [true, false] {
+            if let Some(config) = ranges.iter().find_map(|range| {
+                if require_channels && range.channels() != default_channels {
+                    return None;
+                }
+                if require_format && range.sample_format() != default_format {
+                    return None;
+                }
+                range.try_with_sample_rate(sample_rate)
+            }) {
+                return Some(config);
+            }
+        }
+    }
+
+    None
+}
+
+fn build_input_stream(
+    input_device: &cpal::Device,
+    sample_format: &SampleFormat,
+    config: &StreamConfig,
+    capture_tx: tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    stats: Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: Arc<EchoGuard>,
+    aec_processor: Option<SharedVoiceAecProcessor>,
+) -> Result<Stream, String> {
+    let channels = config.channels as usize;
+    let in_rate = config.sample_rate.0;
+    let mut assembler = VoiceFrameAssembler::new(in_rate)?;
+    let err_fn = |err| eprintln!("[Voice] Input stream error: {}", err);
+
+    match sample_format {
+        SampleFormat::F32 => {
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            input_device
+                .build_input_stream(
+                    config,
+                    move |data: &[f32], _| {
+                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        let mut mono = input_to_mono_i16_f32(data, channels);
+                        handle_capture_callback(
+                            &capture_tx,
+                            &mut assembler,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                            aec_processor.as_ref(),
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build f32 input stream: {}", e))
+        }
+        SampleFormat::I16 => {
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            input_device
+                .build_input_stream(
+                    config,
+                    move |data: &[i16], _| {
+                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        let mut mono = input_to_mono_i16_i16(data, channels);
+                        handle_capture_callback(
+                            &capture_tx,
+                            &mut assembler,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                            aec_processor.as_ref(),
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build i16 input stream: {}", e))
+        }
+        SampleFormat::U16 => {
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            input_device
+                .build_input_stream(
+                    config,
+                    move |data: &[u16], _| {
+                        with_audio_stats(&stats, |s| s.capture_callbacks += 1);
+                        let mut mono = input_to_mono_i16_u16(data, channels);
+                        handle_capture_callback(
+                            &capture_tx,
+                            &mut assembler,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                            aec_processor.as_ref(),
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build u16 input stream: {}", e))
+        }
+        _ => Err("Unsupported input sample format".to_string()),
+    }
+}
+
+fn handle_capture_callback(
+    capture_tx: &tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    assembler: &mut VoiceFrameAssembler,
+    mono: &mut [i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+) {
+    if catch_unwind(AssertUnwindSafe(|| {
+        if aec_fallback_active(aec_processor) && echo_guard.apply_to_capture(mono, Instant::now()) {
+            with_audio_stats(stats, |s| {
+                s.capture_echo_suppressed_samples = s
+                    .capture_echo_suppressed_samples
+                    .saturating_add(mono.len() as u64);
+            });
+        }
+        send_captured_frames(
+            capture_tx,
+            assembler,
+            mono,
+            stats,
+            echo_guard,
+            aec_processor,
+        );
+    }))
+    .is_err()
+    {
+        with_audio_stats(stats, |s| {
+            s.capture_panics = s.capture_panics.saturating_add(1);
+            s.resampler_errors = s.resampler_errors.saturating_add(1);
+        });
+        eprintln!("[Voice] Capture processing panicked; skipping callback frame");
+    }
+}
+
+fn build_output_stream(
+    output_device: &cpal::Device,
+    sample_format: &SampleFormat,
+    config: &StreamConfig,
+    playback_rx: mpsc::Receiver<Vec<i16>>,
+    stats: Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: Arc<EchoGuard>,
+    aec_processor: Option<SharedVoiceAecProcessor>,
+) -> Result<Stream, String> {
+    let channels = config.channels as usize;
+    let out_rate = config.sample_rate.0;
+    let mut queue = VecDeque::<i16>::new();
+    let mut playback_state = PlaybackState::new(out_rate);
+    let err_fn = |err| eprintln!("[Voice] Output stream error: {}", err);
+
+    match sample_format {
+        SampleFormat::F32 => {
+            let mut mono = Vec::<i16>::new();
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            output_device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [f32], _| {
+                        drain_playback_frames(
+                            &playback_rx,
+                            &mut queue,
+                            &stats,
+                            aec_processor.as_ref(),
+                        );
+                        write_output_frames_f32(
+                            data,
+                            channels,
+                            &mut queue,
+                            &mut playback_state,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build f32 output stream: {}", e))
+        }
+        SampleFormat::I16 => {
+            let mut mono = Vec::<i16>::new();
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            output_device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [i16], _| {
+                        drain_playback_frames(
+                            &playback_rx,
+                            &mut queue,
+                            &stats,
+                            aec_processor.as_ref(),
+                        );
+                        write_output_frames_i16(
+                            data,
+                            channels,
+                            &mut queue,
+                            &mut playback_state,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build i16 output stream: {}", e))
+        }
+        SampleFormat::U16 => {
+            let mut mono = Vec::<i16>::new();
+            let echo_guard = echo_guard.clone();
+            let aec_processor = aec_processor.clone();
+            output_device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [u16], _| {
+                        drain_playback_frames(
+                            &playback_rx,
+                            &mut queue,
+                            &stats,
+                            aec_processor.as_ref(),
+                        );
+                        write_output_frames_u16(
+                            data,
+                            channels,
+                            &mut queue,
+                            &mut playback_state,
+                            &mut mono,
+                            &stats,
+                            &echo_guard,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("Failed to build u16 output stream: {}", e))
+        }
+        _ => Err("Unsupported output sample format".to_string()),
+    }
+}
+
+fn send_captured_frames(
+    capture_tx: &tokio::sync::mpsc::UnboundedSender<Vec<i16>>,
+    assembler: &mut VoiceFrameAssembler,
+    samples: &[i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+) {
+    let before_errors = assembler.resampler_error_count();
+    let frames = assembler.push_samples(samples);
+    let error_delta = assembler
+        .resampler_error_count()
+        .saturating_sub(before_errors);
+    let measured_capture_rate_hz = assembler.measured_input_rate_hz().unwrap_or(0.0);
+    let capture_resample_ratio = assembler.resampler_ratio().unwrap_or(0.0);
+    with_audio_stats(stats, |s| {
+        s.capture_input_frames = s.capture_input_frames.saturating_add(samples.len() as u64);
+        if measured_capture_rate_hz > 0.0 {
+            s.measured_capture_rate_hz = measured_capture_rate_hz;
+        }
+        if capture_resample_ratio > 0.0 {
+            s.capture_resample_ratio = capture_resample_ratio;
+        }
+        s.generated_frames += frames.len() as u64;
+        s.resampler_errors += error_delta;
+    });
+    for frame in frames {
+        let frame = process_aec_capture_frame(aec_processor, frame, stats, echo_guard);
+        let _ = capture_tx.send(frame);
+    }
+}
+
+fn process_aec_capture_frame(
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+    mut frame: Vec<i16>,
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+) -> Vec<i16> {
+    let Some(aec_processor) = aec_processor else {
+        return frame;
+    };
+    let Ok(mut guard) = aec_processor.try_lock() else {
+        apply_echo_guard_to_capture_frame(&mut frame, stats, echo_guard, Instant::now());
+        return frame;
+    };
+
+    match guard.process_capture_frame(&frame) {
+        Ok(processed) => {
+            sync_aec_stats(stats, guard.stats());
+            processed
+        }
+        Err(_) => {
+            sync_aec_stats(stats, guard.stats());
+            apply_echo_guard_to_capture_frame(&mut frame, stats, echo_guard, Instant::now());
+            frame
+        }
+    }
+}
+
+fn apply_echo_guard_to_capture_frame(
+    frame: &mut [i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+    now: Instant,
+) {
+    if frame.iter().all(|sample| *sample == 0) {
+        return;
+    }
+    if echo_guard.apply_to_capture(frame, now) {
+        with_audio_stats(stats, |s| {
+            s.capture_echo_suppressed_samples = s
+                .capture_echo_suppressed_samples
+                .saturating_add(frame.len() as u64);
+        });
+    }
+}
+
+fn process_aec_render_frame(
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+    frame: &[i16],
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+) {
+    let Some(aec_processor) = aec_processor else {
+        return;
+    };
+    let Ok(mut guard) = aec_processor.try_lock() else {
+        return;
+    };
+
+    let _ = guard.process_render_frame(frame);
+    sync_aec_stats(stats, guard.stats());
+}
+
+fn aec_fallback_active(aec_processor: Option<&SharedVoiceAecProcessor>) -> bool {
+    let Some(aec_processor) = aec_processor else {
+        return true;
+    };
+    let Ok(guard) = aec_processor.try_lock() else {
+        return true;
+    };
+    guard.fallback_active()
+}
+
+fn sync_aec_stats(stats: &Arc<Mutex<VoiceAudioStats>>, aec_stats: VoiceAecStats) {
+    with_audio_stats(stats, |s| {
+        s.aec_render_frames = aec_stats.render_frames;
+        s.aec_capture_frames = aec_stats.capture_frames;
+        s.aec_errors = aec_stats.errors;
+        s.aec_fallback_active = aec_stats.fallback_active;
+    });
+}
+
+struct VoiceFrameAssembler {
+    resampler: VoiceResampler,
+    pending: VecDeque<i16>,
+    rate_window_started: Instant,
+    rate_window_input_samples: u64,
+    measured_input_rate_hz: Option<f64>,
+}
+
+impl VoiceFrameAssembler {
+    fn new(input_rate: u32) -> Result<Self, String> {
+        Ok(Self {
+            resampler: VoiceResampler::new(input_rate)?,
+            pending: VecDeque::with_capacity(FRAME_SAMPLES * 4),
+            rate_window_started: Instant::now(),
+            rate_window_input_samples: 0,
+            measured_input_rate_hz: None,
+        })
+    }
+
+    fn push_samples(&mut self, samples: &[i16]) -> Vec<Vec<i16>> {
+        self.update_measured_input_rate(samples.len());
+        for sample in self.resampler.push_mono_i16(samples) {
+            self.pending.push_back(sample);
+        }
+
+        let mut frames = Vec::new();
+        while self.pending.len() >= FRAME_SAMPLES {
+            let mut frame = Vec::with_capacity(FRAME_SAMPLES);
+            for _ in 0..FRAME_SAMPLES {
+                if let Some(sample) = self.pending.pop_front() {
+                    frame.push(sample);
+                }
+            }
+            frames.push(frame);
+        }
+        frames
+    }
+
+    fn resampler_error_count(&self) -> u64 {
+        self.resampler.error_count()
+    }
+
+    fn measured_input_rate_hz(&self) -> Option<f64> {
+        self.measured_input_rate_hz
+    }
+
+    fn resampler_ratio(&self) -> Option<f64> {
+        self.resampler.current_ratio()
+    }
+
+    fn update_measured_input_rate(&mut self, input_samples: usize) {
+        self.rate_window_input_samples = self
+            .rate_window_input_samples
+            .saturating_add(input_samples as u64);
+        let elapsed = self.rate_window_started.elapsed();
+        if elapsed < CAPTURE_RATE_MEASURE_INTERVAL {
+            return;
+        }
+
+        let measured = self.rate_window_input_samples as f64 / elapsed.as_secs_f64().max(0.001);
+        if (8_000.0..=192_000.0).contains(&measured) {
+            self.measured_input_rate_hz = Some(measured);
+        }
+        self.rate_window_started = Instant::now();
+        self.rate_window_input_samples = 0;
+    }
+}
+
+enum VoiceResamplerMode {
+    Bypass,
+    Rubato {
+        resampler: Async<f32>,
+        pending_input: VecDeque<f32>,
+        input_buffer: Vec<Vec<f32>>,
+        output_buffer: Vec<Vec<f32>>,
+    },
+}
+
+struct VoiceResampler {
+    mode: VoiceResamplerMode,
+    errors: u64,
+    current_ratio: Option<f64>,
+}
+
+impl VoiceResampler {
+    fn new(input_rate: u32) -> Result<Self, String> {
+        if input_rate == TARGET_RATE {
+            return Ok(Self {
+                mode: VoiceResamplerMode::Bypass,
+                errors: 0,
+                current_ratio: None,
+            });
+        }
+
+        let input_chunk = input_frames_per_voice_frame(input_rate);
+        let initial_ratio = TARGET_RATE as f64 / input_rate as f64;
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            oversampling_factor: 128,
+            interpolation: SincInterpolationType::Linear,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let resampler = Async::<f32>::new_sinc(
+            initial_ratio,
+            1.5,
+            &params,
+            input_chunk,
+            1,
+            FixedAsync::Input,
+        )
+        .map_err(|e| format!("Failed to create voice resampler: {}", e))?;
+        let output_capacity = resampler.output_frames_max().max(FRAME_SAMPLES * 2);
+
+        Ok(Self {
+            mode: VoiceResamplerMode::Rubato {
+                resampler,
+                pending_input: VecDeque::with_capacity(input_chunk * 2),
+                input_buffer: vec![vec![0.0; input_chunk]],
+                output_buffer: vec![vec![0.0; output_capacity]],
+            },
+            errors: 0,
+            current_ratio: Some(initial_ratio),
+        })
+    }
+
+    #[cfg(test)]
+    fn uses_bypass(&self) -> bool {
+        matches!(self.mode, VoiceResamplerMode::Bypass)
+    }
+
+    fn error_count(&self) -> u64 {
+        self.errors
+    }
+
+    fn current_ratio(&self) -> Option<f64> {
+        self.current_ratio
+    }
+
+    fn push_mono_i16(&mut self, samples: &[i16]) -> Vec<i16> {
+        match &mut self.mode {
+            VoiceResamplerMode::Bypass => samples.to_vec(),
+            VoiceResamplerMode::Rubato {
+                resampler,
+                pending_input,
+                input_buffer,
+                output_buffer,
+            } => {
+                for sample in samples {
+                    pending_input.push_back(i16_to_f32(*sample));
+                }
+
+                let mut out = Vec::new();
+                loop {
+                    let needed = resampler.input_frames_next();
+                    if pending_input.len() < needed {
+                        break;
+                    }
+
+                    for idx in 0..needed {
+                        input_buffer[0][idx] = pending_input.pop_front().unwrap_or(0.0);
+                    }
+
+                    let input_adapter = match SequentialSliceOfVecs::new(input_buffer, 1, needed) {
+                        Ok(adapter) => adapter,
+                        Err(e) => {
+                            self.errors = self.errors.saturating_add(1);
+                            eprintln!("[Voice] Failed to prepare resampler input: {}", e);
+                            break;
+                        }
+                    };
+                    let output_len = output_buffer[0].len();
+                    let mut output_adapter =
+                        match SequentialSliceOfVecs::new_mut(output_buffer, 1, output_len) {
+                            Ok(adapter) => adapter,
+                            Err(e) => {
+                                self.errors = self.errors.saturating_add(1);
+                                eprintln!("[Voice] Failed to prepare resampler output: {}", e);
+                                break;
+                            }
+                        };
+
+                    match resampler.process_into_buffer(&input_adapter, &mut output_adapter, None) {
+                        Ok((_read, written)) => {
+                            out.extend(output_buffer[0][..written].iter().copied().map(f32_to_i16));
+                        }
+                        Err(e) => {
+                            self.errors = self.errors.saturating_add(1);
+                            eprintln!("[Voice] Resampler error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+fn input_frames_per_voice_frame(input_rate: u32) -> usize {
+    ((input_rate as u64 * FRAME_SAMPLES as u64 + (TARGET_RATE as u64 / 2)) / TARGET_RATE as u64)
+        .max(1) as usize
+}
+
+fn input_to_mono_i16_f32(data: &[f32], channels: usize) -> Vec<i16> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    data.chunks(channels)
+        .map(|frame| f32_to_i16(frame[0]))
+        .collect()
+}
+
+fn input_to_mono_i16_i16(data: &[i16], channels: usize) -> Vec<i16> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    data.chunks(channels).map(|frame| frame[0]).collect()
+}
+
+fn input_to_mono_i16_u16(data: &[u16], channels: usize) -> Vec<i16> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    data.chunks(channels)
+        .map(|frame| u16_to_i16(frame[0]))
+        .collect()
+}
+
+fn drain_playback_frames(
+    playback_rx: &mpsc::Receiver<Vec<i16>>,
+    queue: &mut VecDeque<i16>,
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    aec_processor: Option<&SharedVoiceAecProcessor>,
+) {
+    let mut received = 0u64;
+    while let Ok(frame) = playback_rx.try_recv() {
+        process_aec_render_frame(aec_processor, &frame, stats);
+        received += 1;
+        queue.extend(frame);
+    }
+    let dropped = trim_playback_queue_to_cap(queue);
+    if received > 0 {
+        let queue_len = queue.len();
+        with_audio_stats(stats, |s| {
+            s.playback_frames_received += received;
+            s.current_playback_queue_samples = queue_len;
+            s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue_len);
+        });
+    }
+    if dropped > 0 {
+        with_audio_stats(stats, |s| {
+            s.playback_samples_dropped = s.playback_samples_dropped.saturating_add(dropped as u64);
+            s.playback_queue_trim_events = s.playback_queue_trim_events.saturating_add(1);
+            s.current_playback_queue_samples = queue.len();
+        });
+    }
+}
+
+fn trim_playback_queue_to_cap(queue: &mut VecDeque<i16>) -> usize {
+    if queue.len() <= MAX_PLAYBACK_QUEUE_SAMPLES {
+        return 0;
+    }
+
+    let drop_count = FRAME_SAMPLES.min(queue.len());
+    for _ in 0..drop_count {
+        let _ = queue.pop_front();
+    }
+    drop_count
+}
+
+struct PlaybackState {
+    src_cursor: f32,
+    last_sample: i16,
+    consecutive_underrun_samples: usize,
+    declared_output_rate_hz: f64,
+    measured_output_rate_hz: Option<f64>,
+    effective_output_rate_hz: f64,
+    output_clock_unstable: bool,
+    output_rate_window_started: Instant,
+    output_rate_window_frames: u64,
+}
+
+impl PlaybackState {
+    fn new(declared_output_rate_hz: u32) -> Self {
+        let declared_output_rate_hz = declared_output_rate_hz as f64;
+        Self {
+            src_cursor: 0.0,
+            last_sample: 0,
+            consecutive_underrun_samples: 0,
+            declared_output_rate_hz,
+            measured_output_rate_hz: None,
+            effective_output_rate_hz: declared_output_rate_hz,
+            output_clock_unstable: false,
+            output_rate_window_started: Instant::now(),
+            output_rate_window_frames: 0,
+        }
+    }
+
+    fn note_output_callback_samples(&mut self, sample_count: usize, channels: usize) {
+        if channels == 0 {
+            return;
+        }
+        self.note_output_callback(sample_count / channels);
+    }
+
+    fn note_output_callback(&mut self, frame_count: usize) {
+        self.output_rate_window_frames = self
+            .output_rate_window_frames
+            .saturating_add(frame_count as u64);
+
+        let elapsed = self.output_rate_window_started.elapsed();
+        if elapsed < PLAYBACK_RATE_MEASURE_INTERVAL {
+            return;
+        }
+
+        let measured = self.output_rate_window_frames as f64 / elapsed.as_secs_f64().max(0.001);
+        self.output_rate_window_started = Instant::now();
+        self.output_rate_window_frames = 0;
+
+        if !(MIN_PLAUSIBLE_OUTPUT_RATE_HZ..=MAX_PLAUSIBLE_OUTPUT_RATE_HZ).contains(&measured) {
+            return;
+        }
+
+        self.measured_output_rate_hz = Some(measured);
+        self.output_clock_unstable = ((measured - self.declared_output_rate_hz).abs()
+            / self.declared_output_rate_hz)
+            > OUTPUT_CLOCK_UNSTABLE_THRESHOLD;
+        self.effective_output_rate_hz = self.declared_output_rate_hz;
+    }
+
+    fn declared_output_rate_hz(&self) -> f64 {
+        self.declared_output_rate_hz
+    }
+
+    fn measured_output_rate_hz(&self) -> Option<f64> {
+        self.measured_output_rate_hz
+    }
+
+    fn effective_output_rate_hz(&self) -> f64 {
+        self.effective_output_rate_hz
+    }
+
+    fn output_clock_unstable(&self) -> bool {
+        self.output_clock_unstable
+    }
+
+    fn conceal_sample(&mut self) -> i16 {
+        let sample = if self.consecutive_underrun_samples < CONCEALMENT_SAMPLES {
+            let fade_pos = self
+                .consecutive_underrun_samples
+                .saturating_sub(CONCEALMENT_HOLD_SAMPLES);
+            let fade_len = CONCEALMENT_SAMPLES.saturating_sub(CONCEALMENT_HOLD_SAMPLES);
+            let remaining = fade_len.saturating_sub(fade_pos);
+            let gain = if fade_len == 0 {
+                0.0
+            } else {
+                remaining as f32 / fade_len as f32
+            };
+            (self.last_sample as f32 * gain) as i16
+        } else {
+            0
+        };
+        self.consecutive_underrun_samples = self.consecutive_underrun_samples.saturating_add(1);
+        sample
+    }
+
+    fn note_played_sample(&mut self, sample: i16) {
+        self.last_sample = sample;
+        self.consecutive_underrun_samples = 0;
+    }
+}
+
+fn playback_step(effective_output_rate_hz: f64, queued_samples: usize) -> f32 {
+    let base = TARGET_RATE as f32 / effective_output_rate_hz.max(1.0) as f32;
+    let correction = if queued_samples > PLAYBACK_TARGET_QUEUE_SAMPLES {
+        1.015
+    } else if queued_samples < PLAYBACK_LOW_QUEUE_SAMPLES {
+        0.985
+    } else {
+        1.0
+    };
+    base * correction
+}
+
+struct PlaybackRenderStats {
+    underruns: u64,
+    consumed_samples: usize,
+}
+
+fn render_playback_mono_samples(
+    frame_count: usize,
+    queue: &mut VecDeque<i16>,
+    state: &mut PlaybackState,
+    out: &mut Vec<i16>,
+) -> PlaybackRenderStats {
+    out.clear();
+    out.reserve(frame_count);
+    let step = playback_step(state.effective_output_rate_hz(), queue.len());
+    let mut underruns = 0u64;
+    for _ in 0..frame_count {
+        let src_idx = state.src_cursor.floor() as usize;
+        let sample = match queue.get(src_idx).copied() {
+            Some(sample) => {
+                state.note_played_sample(sample);
+                sample
+            }
+            None => {
+                underruns += 1;
+                state.conceal_sample()
+            }
+        };
+        state.src_cursor += step;
+        out.push(sample);
+    }
+
+    let desired_consumed = state.src_cursor.floor() as usize;
+    let actual_consumed = desired_consumed.min(queue.len());
+    for _ in 0..actual_consumed {
+        let _ = queue.pop_front();
+    }
+    state.src_cursor -= desired_consumed as f32;
+    PlaybackRenderStats {
+        underruns,
+        consumed_samples: actual_consumed,
+    }
+}
+
+fn write_output_frames_i16(
+    data: &mut [i16],
+    channels: usize,
+    queue: &mut VecDeque<i16>,
+    playback_state: &mut PlaybackState,
+    mono: &mut Vec<i16>,
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+) {
+    if channels == 0 {
+        return;
+    }
+    let frame_count = data.len() / channels;
+    playback_state.note_output_callback_samples(data.len(), channels);
+    let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
+    if render_stats.consumed_samples > 0 {
+        echo_guard.mark_playback_activity(mono, Instant::now());
+    }
+    for frame_idx in 0..frame_count {
+        let sample = mono[frame_idx];
+        for ch in 0..channels {
+            data[frame_idx * channels + ch] = sample;
+        }
+    }
+    with_audio_stats(stats, |s| {
+        s.playback_callbacks += 1;
+        s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
+        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
+        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
+        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
+        s.output_clock_unstable = playback_state.output_clock_unstable();
+        s.playback_samples_consumed = s
+            .playback_samples_consumed
+            .saturating_add(render_stats.consumed_samples as u64);
+        s.playback_underruns += render_stats.underruns;
+        s.playback_concealed_samples = s
+            .playback_concealed_samples
+            .saturating_add(render_stats.underruns);
+        s.current_playback_queue_samples = queue.len();
+        s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue.len());
+    });
+}
+
+fn write_output_frames_f32(
+    data: &mut [f32],
+    channels: usize,
+    queue: &mut VecDeque<i16>,
+    playback_state: &mut PlaybackState,
+    mono: &mut Vec<i16>,
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+) {
+    if channels == 0 {
+        return;
+    }
+    let frame_count = data.len() / channels;
+    playback_state.note_output_callback_samples(data.len(), channels);
+    let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
+    if render_stats.consumed_samples > 0 {
+        echo_guard.mark_playback_activity(mono, Instant::now());
+    }
+    for frame_idx in 0..frame_count {
+        let f = i16_to_f32(mono[frame_idx]);
+        for ch in 0..channels {
+            data[frame_idx * channels + ch] = f;
+        }
+    }
+    with_audio_stats(stats, |s| {
+        s.playback_callbacks += 1;
+        s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
+        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
+        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
+        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
+        s.output_clock_unstable = playback_state.output_clock_unstable();
+        s.playback_samples_consumed = s
+            .playback_samples_consumed
+            .saturating_add(render_stats.consumed_samples as u64);
+        s.playback_underruns += render_stats.underruns;
+        s.playback_concealed_samples = s
+            .playback_concealed_samples
+            .saturating_add(render_stats.underruns);
+        s.current_playback_queue_samples = queue.len();
+        s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue.len());
+    });
+}
+
+fn write_output_frames_u16(
+    data: &mut [u16],
+    channels: usize,
+    queue: &mut VecDeque<i16>,
+    playback_state: &mut PlaybackState,
+    mono: &mut Vec<i16>,
+    stats: &Arc<Mutex<VoiceAudioStats>>,
+    echo_guard: &EchoGuard,
+) {
+    if channels == 0 {
+        return;
+    }
+    let frame_count = data.len() / channels;
+    playback_state.note_output_callback_samples(data.len(), channels);
+    let render_stats = render_playback_mono_samples(frame_count, queue, playback_state, mono);
+    if render_stats.consumed_samples > 0 {
+        echo_guard.mark_playback_activity(mono, Instant::now());
+    }
+    for frame_idx in 0..frame_count {
+        let u = i16_to_u16(mono[frame_idx]);
+        for ch in 0..channels {
+            data[frame_idx * channels + ch] = u;
+        }
+    }
+    with_audio_stats(stats, |s| {
+        s.playback_callbacks += 1;
+        s.output_device_frames = s.output_device_frames.saturating_add(frame_count as u64);
+        s.playback_declared_rate_hz = playback_state.declared_output_rate_hz();
+        s.playback_measured_rate_hz = playback_state.measured_output_rate_hz().unwrap_or(0.0);
+        s.playback_effective_rate_hz = playback_state.effective_output_rate_hz();
+        s.output_clock_unstable = playback_state.output_clock_unstable();
+        s.playback_samples_consumed = s
+            .playback_samples_consumed
+            .saturating_add(render_stats.consumed_samples as u64);
+        s.playback_underruns += render_stats.underruns;
+        s.playback_concealed_samples = s
+            .playback_concealed_samples
+            .saturating_add(render_stats.underruns);
+        s.current_playback_queue_samples = queue.len();
+        s.max_playback_queue_samples = s.max_playback_queue_samples.max(queue.len());
+    });
+}
+
+fn samples_to_ms(samples: usize) -> f32 {
+    samples as f32 * 1000.0 / TARGET_RATE as f32
+}
+
+fn f32_to_i16(v: f32) -> i16 {
+    let clamped = v.clamp(-1.0, 1.0);
+    (clamped * (i16::MAX as f32)) as i16
+}
+
+fn i16_to_f32(v: i16) -> f32 {
+    (v as f32) / (i16::MAX as f32)
+}
+
+fn u16_to_i16(v: u16) -> i16 {
+    (v as i32 - 32768) as i16
+}
+
+fn i16_to_u16(v: i16) -> u16 {
+    (v as i32 + 32768) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ramp(len: usize) -> Vec<i16> {
+        (0..len)
+            .map(|idx| ((idx % 1000) as i16).saturating_sub(500))
+            .collect()
+    }
+
+    #[test]
+    fn voice_resampler_bypasses_when_input_is_already_48khz() {
+        let mut resampler = VoiceResampler::new(TARGET_RATE).expect("resampler");
+        let input = ramp(FRAME_SAMPLES * 3);
+        let output = resampler.push_mono_i16(&input);
+
+        assert_eq!(output, input);
+        assert!(resampler.uses_bypass());
+    }
+
+    #[test]
+    fn voice_frame_assembler_emits_20ms_frames_at_48khz() {
+        assert_eq!(TARGET_RATE, 48_000);
+        assert_eq!(FRAME_SAMPLES, 960);
+        let mut assembler = VoiceFrameAssembler::new(TARGET_RATE).expect("assembler");
+        let frames = assembler.push_samples(&ramp(FRAME_SAMPLES * 2 + 17));
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| frame.len() == FRAME_SAMPLES));
+    }
+
+    #[test]
+    fn voice_frame_assembler_produces_stable_frames_from_48khz() {
+        let mut assembler = VoiceFrameAssembler::new(48_000).expect("assembler");
+        let frames = assembler.push_samples(&ramp(960 * 6));
+
+        assert_eq!(frames.len(), 6);
+        assert!(frames.iter().all(|frame| frame.len() == FRAME_SAMPLES));
+    }
+
+    #[test]
+    fn voice_frame_assembler_produces_frames_from_44100hz_without_callback_drift() {
+        let mut assembler = VoiceFrameAssembler::new(44_100).expect("assembler");
+        let mut frames = Vec::new();
+
+        for chunk in ramp(441 * 12).chunks(147) {
+            frames.extend(assembler.push_samples(chunk));
+        }
+
+        assert_eq!(frames.len(), 5);
+        assert!(frames.iter().all(|frame| frame.len() == FRAME_SAMPLES));
+    }
+
+    #[test]
+    fn playback_queue_drops_one_frame_at_a_time() {
+        let mut queue: VecDeque<i16> = (0..(FRAME_SAMPLES * 40)).map(|idx| idx as i16).collect();
+
+        let dropped = trim_playback_queue_to_cap(&mut queue);
+
+        assert_eq!(dropped, FRAME_SAMPLES);
+        assert_eq!(queue.len(), FRAME_SAMPLES * 39);
+    }
+
+    #[test]
+    fn playback_output_conceals_short_underruns_with_last_sample() {
+        let mut queue = VecDeque::new();
+        let mut state = PlaybackState::new(44_100);
+        state.last_sample = 1234;
+        let mut out = Vec::new();
+
+        let render_stats = render_playback_mono_samples(8, &mut queue, &mut state, &mut out);
+
+        assert_eq!(render_stats.underruns, 8);
+        assert_eq!(out, vec![1234; 8]);
+    }
+
+    #[test]
+    fn playback_render_reports_only_samples_removed_from_queue() {
+        let mut queue: VecDeque<i16> = vec![1, 2].into();
+        let mut state = PlaybackState::new(16_000);
+        let mut out = Vec::new();
+
+        let render_stats = render_playback_mono_samples(32, &mut queue, &mut state, &mut out);
+
+        assert_eq!(render_stats.consumed_samples, 2);
+        assert!(queue.is_empty());
+        assert!(render_stats.underruns > 0);
+    }
+
+    #[test]
+    fn echo_guard_suppresses_capture_after_recent_remote_playback() {
+        let guard = EchoGuard::new();
+        guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], Instant::now());
+
+        assert!(guard.should_suppress_capture(Instant::now()));
+    }
+
+    #[test]
+    fn echo_guard_ignores_quiet_or_stale_playback() {
+        let guard = EchoGuard::new();
+        let now = Instant::now();
+        guard.mark_playback_activity(&vec![8; FRAME_SAMPLES], now);
+        assert!(!guard.should_suppress_capture(now));
+
+        guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
+        assert!(
+            !guard.should_suppress_capture(now + ECHO_SUPPRESSION_HOLD + Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn echo_guard_replaces_capture_with_silence_when_remote_playback_is_active() {
+        let guard = EchoGuard::new();
+        let now = Instant::now();
+        guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
+        let mut samples = vec![1_234; FRAME_SAMPLES / 2];
+
+        assert!(guard.apply_to_capture(&mut samples, now));
+        assert!(samples.iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn voice_aec_processor_counts_processed_frames() {
+        let mut processor = VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
+        );
+        let frame = vec![0; FRAME_SAMPLES];
+
+        processor
+            .process_render_frame(&frame)
+            .expect("render frame accepted");
+        let processed = processor
+            .process_capture_frame(&frame)
+            .expect("capture frame accepted");
+        let stats = processor.stats();
+
+        assert_eq!(processed.len(), FRAME_SAMPLES);
+        assert_eq!(stats.render_frames, 1);
+        assert_eq!(stats.capture_frames, 1);
+        assert!(!stats.fallback_active);
+    }
+
+    #[test]
+    fn voice_aec_processor_activates_fallback_after_errors() {
+        let mut processor = VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
+        );
+
+        for _ in 0..AEC_FALLBACK_ERROR_THRESHOLD {
+            processor.note_error();
+        }
+
+        assert!(processor.fallback_active());
+        assert_eq!(
+            processor.stats().errors,
+            AEC_FALLBACK_ERROR_THRESHOLD as u64
+        );
+    }
+
+    #[test]
+    fn aec_lock_contention_suppresses_capture_during_playback() {
+        let processor = Arc::new(Mutex::new(VoiceAecProcessor::new(
+            rchat_audio_processing::RchatEchoCanceller::new_48khz_mono().expect("aec starts"),
+        )));
+        let _held = processor.lock().expect("processor lock held");
+        let stats = Arc::new(Mutex::new(VoiceAudioStats::default()));
+        let echo_guard = EchoGuard::new();
+        let now = Instant::now();
+        echo_guard.mark_playback_activity(&vec![2_000; FRAME_SAMPLES], now);
+
+        assert!(aec_fallback_active(Some(&processor)));
+
+        let processed = process_aec_capture_frame(
+            Some(&processor),
+            vec![1_234; FRAME_SAMPLES],
+            &stats,
+            &echo_guard,
+        );
+
+        assert!(processed.iter().all(|sample| *sample == 0));
+        assert_eq!(
+            stats
+                .lock()
+                .expect("stats available")
+                .capture_echo_suppressed_samples,
+            FRAME_SAMPLES as u64
+        );
+    }
+
+    #[test]
+    fn playback_tracks_measured_output_rate_without_changing_render_rate() {
+        let mut state = PlaybackState::new(44_100);
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+
+        state.note_output_callback(22_000);
+
+        let measured = state.measured_output_rate_hz().expect("measured output");
+        assert!((measured - 22_000.0).abs() < 100.0);
+        assert_eq!(state.effective_output_rate_hz(), 44_100.0);
+        assert!(state.output_clock_unstable());
+        assert!(
+            playback_step(
+                state.effective_output_rate_hz(),
+                PLAYBACK_TARGET_QUEUE_SAMPLES
+            ) > 1.0
+        );
+    }
+
+    #[test]
+    fn playback_falls_back_to_declared_rate_when_measured_rate_is_implausible() {
+        let mut state = PlaybackState::new(44_100);
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+
+        state.note_output_callback(1_000);
+
+        assert!(state.measured_output_rate_hz().is_none());
+        assert_eq!(state.effective_output_rate_hz(), 44_100.0);
+    }
+
+    #[test]
+    fn output_clock_unstable_detects_large_declared_measured_divergence() {
+        let mut state = PlaybackState::new(44_100);
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+
+        state.note_output_callback(22_000);
+
+        assert!(state.output_clock_unstable());
+
+        let mut stable = PlaybackState::new(44_100);
+        stable.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+        stable.note_output_callback(42_000);
+
+        assert!(!stable.output_clock_unstable());
+    }
+
+    #[test]
+    fn measured_output_rate_counts_frames_not_channels() {
+        let mut state = PlaybackState::new(44_100);
+
+        for _ in 0..99 {
+            state.note_output_callback_samples(882, 2);
+        }
+        state.output_rate_window_started = Instant::now() - PLAYBACK_RATE_MEASURE_INTERVAL;
+        state.note_output_callback_samples(882, 2);
+
+        let measured = state.measured_output_rate_hz().expect("measured output");
+        assert!((measured - 44_100.0).abs() < 100.0);
+    }
+
+    #[test]
+    fn voice_output_config_prefers_48khz_when_supported() {
+        let default = SupportedStreamConfig::new(
+            2,
+            SampleRate(44_100),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        );
+        let ranges = vec![SupportedStreamConfigRange::new(
+            2,
+            SampleRate(8_000),
+            SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )];
+
+        let selection = select_voice_output_config(default, ranges, None);
+
+        assert_eq!(
+            selection.reason,
+            OutputConfigSelectionReason::PreferredVoiceRate
+        );
+        assert_eq!(selection.config.sample_rate().0, 48_000);
+    }
+
+    #[test]
+    fn voice_output_config_uses_override_when_supported() {
+        let default = SupportedStreamConfig::new(
+            2,
+            SampleRate(44_100),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        );
+        let ranges = vec![SupportedStreamConfigRange::new(
+            2,
+            SampleRate(8_000),
+            SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )];
+
+        let selection = select_voice_output_config(default, ranges, Some(22_050));
+
+        assert_eq!(selection.reason, OutputConfigSelectionReason::EnvOverride);
+        assert_eq!(selection.config.sample_rate().0, 22_050);
+    }
+
+    #[test]
+    fn voice_output_config_falls_back_to_default_when_rates_are_unsupported() {
+        let default = SupportedStreamConfig::new(
+            2,
+            SampleRate(44_100),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        );
+        let ranges = vec![SupportedStreamConfigRange::new(
+            2,
+            SampleRate(96_000),
+            SampleRate(96_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )];
+
+        let selection = select_voice_output_config(default, ranges, Some(16_000));
+
+        assert_eq!(
+            selection.reason,
+            OutputConfigSelectionReason::DefaultOutputConfig
+        );
+        assert_eq!(selection.config.sample_rate().0, 44_100);
+    }
+
+    #[test]
+    fn measured_input_rate_does_not_mutate_capture_resampler_ratio() {
+        let mut assembler = VoiceFrameAssembler::new(44_100).expect("assembler");
+        assembler.rate_window_started = Instant::now() - CAPTURE_RATE_MEASURE_INTERVAL;
+        assembler.rate_window_input_samples = 26_000;
+        let before = assembler.resampler_ratio().expect("rubato ratio");
+
+        assembler.update_measured_input_rate(0);
+
+        let measured = assembler.measured_input_rate_hz().expect("measured rate");
+        assert!((measured - 13_000.0).abs() < 50.0);
+        assert_eq!(assembler.resampler_ratio(), Some(before));
+    }
+}

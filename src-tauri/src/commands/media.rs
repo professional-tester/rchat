@@ -355,6 +355,27 @@ pub async fn send_image_message(
         .map_err(|e| format!("Failed to store image: {}", e))?
     };
 
+    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
+    if matches!(chat_kind, ChatKind::Group) {
+        let msg_id = crate::chat::group::send_group_media_reference(
+            &app_state,
+            &net_state,
+            canonical_peer_id,
+            GroupContentType::Image,
+            file_hash.clone(),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!("[Backend] Image message sent: hash={}", file_hash);
+        return Ok(SentMediaResult {
+            msg_id,
+            file_hash,
+            file_name,
+        });
+    }
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -363,7 +384,6 @@ pub async fn send_image_message(
     let id_suffix: u32 = rand::random();
     let msg_id = format!("{}-{}", timestamp, id_suffix);
 
-    let chat_kind = chat_kind::parse_chat_kind(&canonical_peer_id);
     let is_temporary = matches!(
         chat_kind,
         ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
@@ -562,6 +582,29 @@ pub async fn send_document_message(
         storage::object::create(&conn, &file_data, Some(&file_name), Some(mime_type), None)
             .map_err(|e| format!("Failed to store document: {}", e))?
     };
+
+    if matches!(chat_kind, ChatKind::Group) {
+        let msg_id = crate::chat::group::send_group_media_reference(
+            &app_state,
+            &net_state,
+            canonical_peer_id,
+            GroupContentType::Document,
+            file_hash.clone(),
+            Some(file_name.clone()),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!(
+            "[Backend] Document message sent: hash={}, name={}",
+            file_hash, file_name
+        );
+        return Ok(SentMediaResult {
+            msg_id,
+            file_hash,
+            file_name: Some(file_name),
+        });
+    }
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

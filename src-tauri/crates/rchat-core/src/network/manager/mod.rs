@@ -1,0 +1,1538 @@
+use crate::network::behaviour::{RChatBehaviour, RChatBehaviourEvent};
+use crate::network::command::NetworkCommand;
+use crate::network::gossip::GroupMessageEnvelope;
+use crate::{
+    events::{CoreEvent, SharedCoreEventSink},
+    AppState, NetworkState,
+};
+use futures::StreamExt;
+use libp2p::{
+    swarm::{ConnectionId, SwarmEvent},
+    Multiaddr, PeerId, Swarm,
+};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use tokio::sync::mpsc::Receiver;
+
+#[path = "../../live/broadcast/manager.rs"]
+mod broadcast;
+mod persistence;
+mod punching;
+mod run_loop;
+mod swarm_events;
+mod transfer;
+mod ui_commands;
+#[path = "../../live/video/manager.rs"]
+mod video_call;
+#[path = "../../live/voice/manager.rs"]
+mod voice_call;
+
+#[cfg(test)]
+mod tests;
+
+const NAT_KEEPALIVE_ADDR: &str = "/ip4/1.1.1.1/udp/9/quic-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveCallPhase {
+    OutgoingRinging,
+    IncomingRinging,
+    Active,
+}
+
+#[derive(Clone)]
+struct ActiveCall {
+    call_id: String,
+    kind: crate::app_state::CallKind,
+    peer_chat_id: String,
+    remote_peer_id: PeerId,
+    phase: ActiveCallPhase,
+    ring_deadline: Option<std::time::Instant>,
+    ring_expires_at: Option<i64>,
+    started_at: Option<i64>,
+    muted: bool,
+    camera_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveBroadcastPhase {
+    OutgoingRinging,
+    IncomingRinging,
+    Active,
+}
+
+#[derive(Clone)]
+struct ActiveBroadcast {
+    session_id: String,
+    peer_chat_id: String,
+    remote_peer_id: PeerId,
+    phase: ActiveBroadcastPhase,
+    ring_deadline: Option<std::time::Instant>,
+    ring_expires_at: Option<i64>,
+    started_at: Option<i64>,
+    is_host: bool,
+    profile: rchat_screen_capture::ScreenCaptureProfile,
+}
+
+#[derive(Debug, Default)]
+struct VoiceNetworkStats {
+    outbound_frames: u64,
+    inbound_frames: u64,
+    inbound_seq_gaps: u64,
+    inbound_out_of_order_frames: u64,
+    outbound_failures: u64,
+    inbound_failures: u64,
+    rejected_responses: u64,
+    opus_encode_errors: u64,
+    opus_decode_errors: u64,
+    opus_out_bytes: u64,
+    opus_in_bytes: u64,
+}
+
+impl VoiceNetworkStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+enum VoiceStreamEvent {
+    InboundFrame {
+        peer: PeerId,
+        call_id: String,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    InboundFailure {
+        peer: PeerId,
+        call_id: Option<String>,
+        error: String,
+    },
+    OutboundFailure {
+        peer: PeerId,
+        call_id: String,
+        error: String,
+    },
+}
+
+#[derive(Debug, Default)]
+struct VideoNetworkStats {
+    capture_start_failures: u64,
+    submitted_frames: u64,
+    raw_frames_dropped: u64,
+    encoded_frames: u64,
+    keyframes: u64,
+    delta_frames: u64,
+    outbound_bytes: u64,
+    inbound_frames: u64,
+    inbound_bytes: u64,
+    inbound_seq_gaps: u64,
+    inbound_out_of_order_frames: u64,
+    outbound_failures: u64,
+    inbound_failures: u64,
+    encode_errors: u64,
+    encoded_queue_drops: u64,
+    local_rendered_frames: u64,
+    local_dropped_frames: u64,
+    local_decode_errors: u64,
+    receiver_received_frames: u64,
+    receiver_rendered_frames: u64,
+    receiver_dropped_frames: u64,
+    receiver_decode_errors: u64,
+    quality_changes: u64,
+    last_encoded_width: Option<u32>,
+    last_encoded_height: Option<u32>,
+}
+
+impl VideoNetworkStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, Default)]
+struct VideoWindowCounters {
+    submitted_frames: u64,
+    raw_frames_dropped: u64,
+    encoded_frames: u64,
+    encoded_queue_drops: u64,
+    inbound_frames: u64,
+    receiver_received_frames: u64,
+    receiver_rendered_frames: u64,
+    receiver_dropped_frames: u64,
+    receiver_decode_errors: u64,
+    encode_micros: Vec<u64>,
+}
+
+impl VideoWindowCounters {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn encode_p95_ms(&self) -> f64 {
+        if self.encode_micros.is_empty() {
+            return 0.0;
+        }
+        let mut values = self.encode_micros.clone();
+        values.sort_unstable();
+        let index = ((values.len() - 1) as f64 * 0.95).round() as usize;
+        values[index] as f64 / 1000.0
+    }
+}
+
+#[derive(Debug, Default)]
+struct ScreenBroadcastStats {
+    capture_start_failures: u64,
+    inbound_frames: u64,
+    inbound_bytes: u64,
+    stream_queue_drops: u64,
+    outbound_failures: u64,
+    inbound_failures: u64,
+    rejected_responses: u64,
+}
+
+impl ScreenBroadcastStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+enum VideoStreamEvent {
+    InboundRecord {
+        peer: PeerId,
+        call_id: String,
+        record: crate::live::video::protocol::VideoStreamRecord,
+    },
+    InboundFailure {
+        peer: PeerId,
+        call_id: Option<String>,
+        error: String,
+    },
+    OutboundFailure {
+        peer: PeerId,
+        call_id: String,
+        error: String,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PeerTransportState {
+    quic_connections: usize,
+    tcp_connections: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct PeerTransportRegistry {
+    by_peer: HashMap<PeerId, PeerTransportState>,
+    quic_connections_by_peer: HashMap<PeerId, Vec<ConnectionId>>,
+    tcp_connections_by_peer: HashMap<PeerId, Vec<ConnectionId>>,
+}
+
+impl PeerTransportRegistry {
+    fn is_quic_addr(addr: &Multiaddr) -> bool {
+        let raw = addr.to_string();
+        raw.contains("/quic-v1") || raw.contains("/quic/")
+    }
+
+    fn is_tcp_addr(addr: &Multiaddr) -> bool {
+        addr.to_string().contains("/tcp/")
+    }
+
+    fn record_connected(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remote_addr: &Multiaddr,
+    ) {
+        let state = self.by_peer.entry(peer_id).or_default();
+        if Self::is_quic_addr(remote_addr) {
+            state.quic_connections = state.quic_connections.saturating_add(1);
+            let ids = self.quic_connections_by_peer.entry(peer_id).or_default();
+            ids.retain(|id| *id != connection_id);
+            ids.push(connection_id);
+        } else if Self::is_tcp_addr(remote_addr) {
+            state.tcp_connections = state.tcp_connections.saturating_add(1);
+            let ids = self.tcp_connections_by_peer.entry(peer_id).or_default();
+            ids.retain(|id| *id != connection_id);
+            ids.push(connection_id);
+        }
+    }
+
+    fn record_disconnected(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remote_addr: &Multiaddr,
+    ) -> bool {
+        let Some(state) = self.by_peer.get_mut(&peer_id) else {
+            return false;
+        };
+        let had_quic = state.quic_connections > 0;
+
+        if Self::is_quic_addr(remote_addr) {
+            state.quic_connections = state.quic_connections.saturating_sub(1);
+        } else if Self::is_tcp_addr(remote_addr) {
+            state.tcp_connections = state.tcp_connections.saturating_sub(1);
+        }
+        if let Some(quic_ids) = self.quic_connections_by_peer.get_mut(&peer_id) {
+            quic_ids.retain(|id| *id != connection_id);
+            if quic_ids.is_empty() {
+                self.quic_connections_by_peer.remove(&peer_id);
+            }
+        }
+        if let Some(tcp_ids) = self.tcp_connections_by_peer.get_mut(&peer_id) {
+            tcp_ids.retain(|id| *id != connection_id);
+            if tcp_ids.is_empty() {
+                self.tcp_connections_by_peer.remove(&peer_id);
+            }
+        }
+
+        let has_quic = state.quic_connections > 0;
+        if state.quic_connections == 0 && state.tcp_connections == 0 {
+            self.by_peer.remove(&peer_id);
+        }
+        had_quic && !has_quic
+    }
+
+    fn has_quic(&self, peer_id: &PeerId) -> bool {
+        self.by_peer
+            .get(peer_id)
+            .map(|state| state.quic_connections > 0)
+            .unwrap_or(false)
+    }
+
+    fn quic_connection_count(&self, peer_id: &PeerId) -> usize {
+        self.by_peer
+            .get(peer_id)
+            .map(|state| state.quic_connections)
+            .unwrap_or(0)
+    }
+
+    fn tcp_connection_count(&self, peer_id: &PeerId) -> usize {
+        self.by_peer
+            .get(peer_id)
+            .map(|state| state.tcp_connections)
+            .unwrap_or(0)
+    }
+
+    fn newest_quic_connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.quic_connections_by_peer
+            .get(peer_id)
+            .and_then(|ids| ids.last().copied())
+    }
+}
+
+pub(super) fn quic_addresses_for_peer(
+    local_peers: &HashMap<PeerId, Vec<Multiaddr>>,
+    peer_id: &PeerId,
+) -> Vec<Multiaddr> {
+    local_peers
+        .get(peer_id)
+        .into_iter()
+        .flat_map(|addrs| addrs.iter())
+        .filter(|addr| PeerTransportRegistry::is_quic_addr(addr))
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutgoingDialSource {
+    NatKeepalive,
+    Mdns,
+    Gist,
+    Punch,
+    VoiceQuic,
+    Unknown,
+}
+
+impl OutgoingDialSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NatKeepalive => "nat_keepalive",
+            Self::Mdns => "mdns",
+            Self::Gist => "gist",
+            Self::Punch => "punch",
+            Self::VoiceQuic => "voice_quic",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecentDial {
+    source: OutgoingDialSource,
+    at: std::time::Instant,
+}
+
+fn extract_candidate_multiaddr_from_error_debug(error_debug: &str) -> Option<String> {
+    let start = error_debug.find("/ip")?;
+    let tail = &error_debug[start..];
+    let end = tail
+        .find(',')
+        .or_else(|| tail.find(')'))
+        .unwrap_or(tail.len());
+    let candidate = tail[..end].trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    candidate
+        .parse::<Multiaddr>()
+        .ok()
+        .map(|_| candidate.to_string())
+}
+
+fn classify_outgoing_error_source(
+    error_debug: &str,
+    candidate_addr: Option<&str>,
+    recent_dials: &HashMap<String, RecentDial>,
+    peer_present: bool,
+    peer_known_mdns: bool,
+    peer_inflight_mdns: bool,
+    now: std::time::Instant,
+) -> OutgoingDialSource {
+    if error_debug.contains(NAT_KEEPALIVE_ADDR) {
+        return OutgoingDialSource::NatKeepalive;
+    }
+
+    if let Some(addr) = candidate_addr {
+        if let Some(recent) = recent_dials.get(addr) {
+            if now.duration_since(recent.at) <= std::time::Duration::from_secs(30) {
+                return recent.source;
+            }
+        }
+    }
+
+    if peer_present && (peer_known_mdns || peer_inflight_mdns) {
+        return OutgoingDialSource::Mdns;
+    }
+
+    OutgoingDialSource::Unknown
+}
+
+pub struct NetworkManager {
+    // The P2P Node itself
+    swarm: Swarm<RChatBehaviour>,
+    // The channel to receive commands FROM the UI
+    crx: Receiver<NetworkCommand>,
+    // Shared UI-agnostic app/runtime state.
+    app_state: AppState,
+    network_state: NetworkState,
+    // The boundary used to send events to the adapter.
+    event_sink: SharedCoreEventSink,
+    disc_rx: Receiver<Multiaddr>,
+    // Channel for mDNS-SD discovery
+    mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
+    // Sender to pass to mDNS service when starting it
+    mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns::MdnsPeer>,
+    // Flag to ensure we only start mDNS once
+    mdns_started: bool,
+    // Lifecycle handle for mDNS service threads.
+    mdns_handle: Option<crate::network::mdns::MdnsServiceHandle>,
+    // Track local peers discovered via mDNS
+    local_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    // Per-peer in-flight mDNS dial timestamps.
+    mdns_dial_inflight: HashMap<PeerId, std::time::Instant>,
+    // Per-peer next-allowed mDNS dial instant (debounce + backoff).
+    mdns_backoff_until: HashMap<PeerId, std::time::Instant>,
+    // Per-peer consecutive mDNS dial failures.
+    mdns_dial_failures: HashMap<PeerId, u32>,
+    // Recent dial origins keyed by multiaddr string for error attribution.
+    recent_dials: HashMap<String, RecentDial>,
+    // Trusted peers eligible for automatic reconnect on discovery.
+    trusted_peer_ids: HashSet<PeerId>,
+    // Per-peer in-flight auto-connect attempt start timestamps.
+    auto_connect_inflight: HashMap<PeerId, std::time::Instant>,
+    // Per-peer next-allowed auto-connect attempt instant (cooldown + backoff).
+    auto_connect_backoff_until: HashMap<PeerId, std::time::Instant>,
+    // Per-peer consecutive auto-connect failures.
+    auto_connect_failures: HashMap<PeerId, u32>,
+    // Track our outgoing connection requests (peers we pressed Connect on)
+    pending_requests: HashSet<PeerId>,
+    // Track incoming connection requests from others
+    incoming_requests: HashSet<PeerId>,
+    // Pending GitHub mappings: multiaddr → (inviter_username, my_username) for connection events
+    pending_github_mappings: HashMap<String, (String, String)>,
+    // Pending shadow polls: invitee_username → (password, my_username, created_at)
+    // Used to poll invitee's Gist for shadow invite (bidirectional hole punch)
+    pending_shadow_polls: HashMap<String, (String, String, u64)>,
+    // Active punch targets: target_name → (Multiaddr, start_time)
+    // Continuous 500ms punching for 30 seconds
+    active_punch_targets: HashMap<String, (Multiaddr, std::time::Instant)>,
+    // Joined group IDs we are currently subscribed to
+    subscribed_group_ids: HashSet<String>,
+    // Fast lookup cache: GitHub username -> PeerId string
+    peer_id_by_github: HashMap<String, String>,
+    // Reverse lookup cache: PeerId string -> GitHub username
+    github_by_peer_id: HashMap<String, String>,
+    // Temporary chat routing cache: temp chat id -> peer id
+    temp_peer_by_chat_id: HashMap<String, String>,
+    // Reverse temporary routing cache: peer id -> temp chat id
+    temp_chat_by_peer_id: HashMap<String, String>,
+    // Connection transport capability registry per peer.
+    peer_transport_registry: PeerTransportRegistry,
+    // Transfer per-file ordering/emit state.
+    transfer_states: HashMap<String, transfer::TransferState>,
+    // Transfer worker queue sender.
+    transfer_task_tx: tokio::sync::mpsc::Sender<transfer::TransferTask>,
+    // Transfer worker queue result receiver.
+    transfer_result_rx: Receiver<transfer::TransferResult>,
+    // Graceful shutdown signal for transfer workers.
+    transfer_worker_shutdown: Arc<AtomicBool>,
+    // Whether transfer queue accepts new tasks.
+    transfer_accepting_tasks: Arc<AtomicBool>,
+    // Transfer queue counters.
+    transfer_pending_tasks: Arc<AtomicUsize>,
+    transfer_inflight_tasks: Arc<AtomicUsize>,
+    // Worker handles owned by manager for lifecycle control.
+    transfer_worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    // Persistence worker queue sender.
+    persistence_task_tx: tokio::sync::mpsc::Sender<persistence::PersistenceTask>,
+    // Graceful shutdown signal for persistence workers.
+    persistence_worker_shutdown: Arc<AtomicBool>,
+    // Whether persistence queue accepts new tasks.
+    persistence_accepting_tasks: Arc<AtomicBool>,
+    // Persistence queue counters.
+    persistence_pending_tasks: Arc<AtomicUsize>,
+    persistence_inflight_tasks: Arc<AtomicUsize>,
+    // Worker handles owned by manager for lifecycle control.
+    persistence_worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    // Current DM call runtime state (single-call invariant across voice+video).
+    active_call: Option<ActiveCall>,
+    // Current DM broadcast runtime state (single broadcast session).
+    active_broadcast: Option<ActiveBroadcast>,
+    // Screen broadcast stream task events returned to the network manager loop.
+    screen_broadcast_stream_event_rx:
+        tokio::sync::mpsc::Receiver<broadcast::ScreenBroadcastStreamEvent>,
+    // Screen broadcast stream task event sender cloned into accept/writer tasks.
+    screen_broadcast_stream_event_tx:
+        tokio::sync::mpsc::Sender<broadcast::ScreenBroadcastStreamEvent>,
+    // Current active outbound screen broadcast stream writer.
+    screen_broadcast_stream_tx:
+        Option<tokio::sync::mpsc::Sender<crate::live::broadcast::protocol::BroadcastStreamRecord>>,
+    // Session id currently owned by the outbound screen broadcast stream writer.
+    screen_broadcast_stream_session_id: Option<String>,
+    // Current active outbound screen broadcast stream writer task.
+    screen_broadcast_stream_writer_handle: Option<tokio::task::JoinHandle<()>>,
+    // Screen broadcast capture/encode worker events.
+    screen_broadcast_worker_event_rx:
+        tokio::sync::mpsc::Receiver<broadcast::ScreenBroadcastWorkerEvent>,
+    // Screen broadcast capture/encode worker event sender.
+    screen_broadcast_worker_event_tx:
+        tokio::sync::mpsc::Sender<broadcast::ScreenBroadcastWorkerEvent>,
+    // Current active screen broadcast capture/encode worker task.
+    screen_broadcast_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    // Control channel for the active screen broadcast capture/encode worker.
+    screen_broadcast_worker_control_tx:
+        Option<tokio::sync::mpsc::Sender<broadcast::ScreenBroadcastWorkerCommand>>,
+    // Session id currently owned by the capture/encode worker.
+    screen_broadcast_worker_session_id: Option<String>,
+    // Last stats snapshot reported by the capture/encode worker.
+    screen_broadcast_worker_stats: broadcast::ScreenBroadcastWorkerStats,
+    // Pending native screen-capture startup task; polled from the broadcast tick.
+    screen_capture_start_task: Option<broadcast::ScreenCaptureStartTask>,
+    // Native screen capture for the active host broadcast.
+    screen_capture_session: Option<rchat_screen_capture::ScreenCaptureSession>,
+    // Capture session metadata for diagnostics.
+    screen_capture_info: Option<rchat_screen_capture::ScreenCaptureSessionInfo>,
+    // Last capture stats snapshot, retained after stopping.
+    screen_capture_last_stats: rchat_screen_capture::ScreenCaptureSessionStats,
+    // Start time for the current native screen-capture session.
+    screen_capture_started_at: Option<std::time::Instant>,
+    // VP8 encoder for outbound screen-broadcast frames.
+    screen_broadcast_vp8_encoder: Option<broadcast::ScreenBroadcastVp8Encoder>,
+    // Sequence number for outgoing screen-broadcast VP8 frames.
+    screen_broadcast_next_seq: u32,
+    // Force next screen-broadcast packet to be a keyframe.
+    screen_broadcast_force_next_keyframe: bool,
+    // Aggregated screen-broadcast diagnostics.
+    screen_broadcast_stats: ScreenBroadcastStats,
+    // Last time screen-broadcast diagnostics were printed.
+    screen_broadcast_last_summary_at: Option<std::time::Instant>,
+    // Backend audio engine for current active call.
+    voice_audio_engine: Option<crate::live::voice::voice::VoiceAudioEngine>,
+    // Captured local PCM16 frames from audio engine.
+    voice_capture_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    // Voice stream task events returned to the network manager loop.
+    voice_stream_event_rx: tokio::sync::mpsc::Receiver<VoiceStreamEvent>,
+    // Voice stream task event sender cloned into accept/writer tasks.
+    voice_stream_event_tx: tokio::sync::mpsc::Sender<VoiceStreamEvent>,
+    // Current active outbound voice stream writer queue.
+    voice_stream_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::live::voice::protocol::VoiceFrameRequest>>,
+    // Call id currently owned by the outbound voice stream writer.
+    voice_stream_call_id: Option<String>,
+    // Current active outbound voice stream writer task.
+    voice_stream_writer_handle: Option<tokio::task::JoinHandle<()>>,
+    // Sequence number for outgoing voice frames.
+    voice_next_seq: u32,
+    // Sequence-aware jitter buffer for inbound voice frames.
+    voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer,
+    // Opus encoder for outbound 16kHz mono voice frames.
+    voice_opus_encoder: Option<crate::live::voice::codec::VoiceOpusEncoder>,
+    // Opus decoder for inbound 16kHz mono voice frames.
+    voice_opus_decoder: Option<crate::live::voice::codec::VoiceOpusDecoder>,
+    // Expected next inbound voice sequence for diagnostics.
+    voice_expected_inbound_seq: Option<u32>,
+    // Aggregated voice transport diagnostics.
+    voice_network_stats: VoiceNetworkStats,
+    // Last time voice transport diagnostics were printed.
+    voice_last_summary_at: Option<std::time::Instant>,
+    // Video stream task events returned to the network manager loop.
+    video_stream_event_rx: tokio::sync::mpsc::Receiver<VideoStreamEvent>,
+    // Video stream task event sender cloned into accept/writer tasks.
+    video_stream_event_tx: tokio::sync::mpsc::Sender<VideoStreamEvent>,
+    // Current active outbound video stream writer queue.
+    video_stream_tx:
+        Option<tokio::sync::mpsc::Sender<crate::live::video::protocol::VideoStreamRecord>>,
+    // Call id currently owned by the outbound video stream writer.
+    video_stream_call_id: Option<String>,
+    // Current active outbound video stream writer task.
+    video_stream_writer_handle: Option<tokio::task::JoinHandle<()>>,
+    // Sequence number for outgoing VP8 frames.
+    video_next_seq: u32,
+    // Force the next successfully queued VP8 frame to be a keyframe.
+    video_force_next_keyframe: bool,
+    // Expected next inbound video sequence for diagnostics.
+    video_expected_inbound_seq: Option<u32>,
+    // Generation token for discarding stale encoded frames after stream/camera resets.
+    video_encode_generation: u64,
+    // Outbound camera encode worker queue; keeps heavy VP8 work off the network manager loop.
+    video_encode_tx: tokio::sync::mpsc::Sender<video_call::OutboundVideoEncodeTask>,
+    // Outbound camera encode worker events returned to the network manager loop.
+    video_encode_event_rx: tokio::sync::mpsc::Receiver<video_call::OutboundVideoEncodeEvent>,
+    // Outbound camera encode worker task.
+    video_encode_worker_handle: tokio::task::JoinHandle<()>,
+    // Pending native camera startup task; polled from the video tick without blocking the network loop.
+    video_capture_start_task: Option<video_call::VideoCaptureStartTask>,
+    // Native local camera capture for active video calls.
+    video_capture_session: Option<rchat_video_capture::VideoCaptureSession>,
+    // Capture session metadata for diagnostics.
+    video_capture_info: Option<rchat_video_capture::CaptureSessionInfo>,
+    // Last capture session stats snapshot, retained after stopping.
+    video_capture_last_stats: rchat_video_capture::CaptureSessionStats,
+    // Start time for current local capture session.
+    video_capture_started_at: Option<std::time::Instant>,
+    // Local video quality/adaptation controller.
+    video_quality_controller: crate::live::video::codec::VideoQualityController,
+    // Receiver-requested cap for the outbound camera encoder.
+    video_remote_requested_profile: crate::live::video::codec::VideoProfile,
+    // Local receiver preference sent to the remote sender.
+    video_receiver_preference_controller:
+        crate::live::video::codec::VideoReceiverPreferenceController,
+    // Rust-side inbound frame delta used for receiver reports.
+    video_receiver_report_pending_inbound_frames: u64,
+    // Aggregated video transport diagnostics.
+    video_network_stats: VideoNetworkStats,
+    // Per-adaptation-window counters.
+    video_window_counters: VideoWindowCounters,
+    // Start time for the current adaptation window.
+    video_window_started_at: Option<std::time::Instant>,
+    // Last time video transport diagnostics were printed.
+    video_last_summary_at: Option<std::time::Instant>,
+}
+
+fn build_incoming_dm_db_message(
+    request: &crate::network::direct_message::DirectMessageRequest,
+    chat_id: String,
+) -> crate::storage::db::Message {
+    use crate::network::direct_message::DirectMessageKind;
+
+    let text_content = match request.msg_type {
+        DirectMessageKind::Text => request.text_content.clone(),
+        DirectMessageKind::Image => None,
+        DirectMessageKind::Sticker => None,
+        DirectMessageKind::Document => Some(
+            request
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "document".to_string()),
+        ),
+        DirectMessageKind::Video => Some(
+            request
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "video".to_string()),
+        ),
+        DirectMessageKind::Audio => Some(
+            request
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "audio".to_string()),
+        ),
+        _ => request.text_content.clone(),
+    };
+
+    let file_hash = match request.msg_type {
+        DirectMessageKind::Text => None,
+        _ => request.file_hash.clone(),
+    };
+
+    crate::storage::db::Message {
+        id: request.id.clone(),
+        chat_id,
+        peer_id: request.sender_id.clone(),
+        timestamp: request.timestamp,
+        content_type: request.msg_type.as_str().to_string(),
+        text_content,
+        file_hash,
+        status: "delivered".to_string(),
+        content_metadata: None,
+        sender_alias: request.sender_alias.clone(),
+    }
+}
+
+fn build_incoming_group_db_message(envelope: &GroupMessageEnvelope) -> crate::storage::db::Message {
+    let text_content = match envelope.content_type {
+        crate::network::gossip::GroupContentType::Text => envelope.text_content.clone(),
+        crate::network::gossip::GroupContentType::Image => None,
+        crate::network::gossip::GroupContentType::Sticker => None,
+        crate::network::gossip::GroupContentType::Document => Some(
+            envelope
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "document".to_string()),
+        ),
+        crate::network::gossip::GroupContentType::Video => Some(
+            envelope
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "video".to_string()),
+        ),
+        crate::network::gossip::GroupContentType::Audio => Some(
+            envelope
+                .text_content
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "audio".to_string()),
+        ),
+    };
+
+    let file_hash = match envelope.content_type {
+        crate::network::gossip::GroupContentType::Text => None,
+        _ => envelope.file_hash.clone(),
+    };
+
+    crate::storage::db::Message {
+        id: envelope.id.clone(),
+        chat_id: envelope.group_id.clone(),
+        peer_id: envelope.sender_id.clone(),
+        timestamp: envelope.timestamp,
+        content_type: envelope.content_type.as_str().to_string(),
+        text_content,
+        file_hash,
+        status: "delivered".to_string(),
+        content_metadata: None,
+        sender_alias: envelope.sender_alias.clone(),
+    }
+}
+
+impl NetworkManager {
+    const MDNS_DIAL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+    const MDNS_DIAL_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+    const MDNS_DIAL_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+    const RECENT_DIAL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    const AUTO_CONNECT_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    const AUTO_CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub(super) fn emit(&self, event: CoreEvent) {
+        self.event_sink.emit(event);
+    }
+
+    pub fn new(
+        mut swarm: Swarm<RChatBehaviour>,
+        crx: Receiver<NetworkCommand>,
+        disc_rx: Receiver<Multiaddr>,
+        mdns_rx: Receiver<crate::network::mdns::MdnsPeer>,
+        mdns_tx: tokio::sync::mpsc::Sender<crate::network::mdns::MdnsPeer>,
+        app_state: AppState,
+        network_state: NetworkState,
+        event_sink: SharedCoreEventSink,
+    ) -> Self {
+        let (
+            transfer_task_tx,
+            transfer_result_rx,
+            transfer_worker_shutdown,
+            transfer_accepting_tasks,
+            transfer_pending_tasks,
+            transfer_inflight_tasks,
+            transfer_worker_handles,
+        ) = transfer::start_transfer_workers(app_state.clone());
+        let (
+            persistence_task_tx,
+            persistence_worker_shutdown,
+            persistence_accepting_tasks,
+            persistence_pending_tasks,
+            persistence_inflight_tasks,
+            persistence_worker_handles,
+        ) = persistence::start_persistence_workers(app_state.clone());
+
+        let (voice_stream_event_tx, voice_stream_event_rx) = tokio::sync::mpsc::channel(512);
+        if let Some(incoming) = swarm.behaviour_mut().voice_call.take_incoming() {
+            voice_call::start_voice_stream_accept_loop(incoming, voice_stream_event_tx.clone());
+        } else {
+            eprintln!("[Voice] Voice stream incoming receiver was already taken");
+        }
+        let (video_stream_event_tx, video_stream_event_rx) = tokio::sync::mpsc::channel(512);
+        if let Some(incoming) = swarm.behaviour_mut().video_call.take_incoming() {
+            video_call::start_video_stream_accept_loop(incoming, video_stream_event_tx.clone());
+        } else {
+            eprintln!("[Video] Video stream incoming receiver was already taken");
+        }
+        let (screen_broadcast_stream_event_tx, screen_broadcast_stream_event_rx) =
+            tokio::sync::mpsc::channel(512);
+        if let Some(incoming) = swarm.behaviour_mut().broadcast_stream.take_incoming() {
+            broadcast::start_screen_broadcast_stream_accept_loop(
+                incoming,
+                screen_broadcast_stream_event_tx.clone(),
+            );
+        } else {
+            eprintln!("[Broadcast] Screen broadcast stream incoming receiver was already taken");
+        }
+        let (screen_broadcast_worker_event_tx, screen_broadcast_worker_event_rx) =
+            tokio::sync::mpsc::channel(512);
+        let (video_encode_tx, video_encode_event_rx, video_encode_worker_handle) =
+            video_call::start_outbound_video_encode_worker();
+
+        Self {
+            swarm,
+            crx,
+            disc_rx,
+            mdns_rx,
+            mdns_tx,
+            mdns_started: false,
+            mdns_handle: None,
+            app_state,
+            network_state,
+            event_sink,
+            local_peers: HashMap::new(),
+            mdns_dial_inflight: HashMap::new(),
+            mdns_backoff_until: HashMap::new(),
+            mdns_dial_failures: HashMap::new(),
+            recent_dials: HashMap::new(),
+            trusted_peer_ids: HashSet::new(),
+            auto_connect_inflight: HashMap::new(),
+            auto_connect_backoff_until: HashMap::new(),
+            auto_connect_failures: HashMap::new(),
+            pending_requests: HashSet::new(),
+            incoming_requests: HashSet::new(),
+            pending_github_mappings: HashMap::new(),
+            pending_shadow_polls: HashMap::new(),
+            active_punch_targets: HashMap::new(),
+            subscribed_group_ids: HashSet::new(),
+            peer_id_by_github: HashMap::new(),
+            github_by_peer_id: HashMap::new(),
+            temp_peer_by_chat_id: HashMap::new(),
+            temp_chat_by_peer_id: HashMap::new(),
+            peer_transport_registry: PeerTransportRegistry::default(),
+            transfer_states: HashMap::new(),
+            transfer_task_tx,
+            transfer_result_rx,
+            transfer_worker_shutdown,
+            transfer_accepting_tasks,
+            transfer_pending_tasks,
+            transfer_inflight_tasks,
+            transfer_worker_handles,
+            persistence_task_tx,
+            persistence_worker_shutdown,
+            persistence_accepting_tasks,
+            persistence_pending_tasks,
+            persistence_inflight_tasks,
+            persistence_worker_handles,
+            active_call: None,
+            active_broadcast: None,
+            screen_broadcast_stream_event_rx,
+            screen_broadcast_stream_event_tx,
+            screen_broadcast_stream_tx: None,
+            screen_broadcast_stream_session_id: None,
+            screen_broadcast_stream_writer_handle: None,
+            screen_broadcast_worker_event_rx,
+            screen_broadcast_worker_event_tx,
+            screen_broadcast_worker_handle: None,
+            screen_broadcast_worker_control_tx: None,
+            screen_broadcast_worker_session_id: None,
+            screen_broadcast_worker_stats: broadcast::ScreenBroadcastWorkerStats::default(),
+            screen_capture_start_task: None,
+            screen_capture_session: None,
+            screen_capture_info: None,
+            screen_capture_last_stats: rchat_screen_capture::ScreenCaptureSessionStats::default(),
+            screen_capture_started_at: None,
+            screen_broadcast_vp8_encoder: None,
+            screen_broadcast_next_seq: 0,
+            screen_broadcast_force_next_keyframe: true,
+            screen_broadcast_stats: ScreenBroadcastStats::default(),
+            screen_broadcast_last_summary_at: None,
+            voice_audio_engine: None,
+            voice_capture_rx: None,
+            voice_stream_event_rx,
+            voice_stream_event_tx,
+            voice_stream_tx: None,
+            voice_stream_call_id: None,
+            voice_stream_writer_handle: None,
+            voice_next_seq: 0,
+            voice_jitter_buffer: crate::live::voice::jitter::VoiceJitterBuffer::new(),
+            voice_opus_encoder: None,
+            voice_opus_decoder: None,
+            voice_expected_inbound_seq: None,
+            voice_network_stats: VoiceNetworkStats::default(),
+            voice_last_summary_at: None,
+            video_stream_event_rx,
+            video_stream_event_tx,
+            video_stream_tx: None,
+            video_stream_call_id: None,
+            video_stream_writer_handle: None,
+            video_next_seq: 0,
+            video_force_next_keyframe: true,
+            video_expected_inbound_seq: None,
+            video_encode_generation: 0,
+            video_encode_tx,
+            video_encode_event_rx,
+            video_encode_worker_handle,
+            video_capture_start_task: None,
+            video_capture_session: None,
+            video_capture_info: None,
+            video_capture_last_stats: rchat_video_capture::CaptureSessionStats::default(),
+            video_capture_started_at: None,
+            video_quality_controller: crate::live::video::codec::VideoQualityController::new(
+                crate::live::video::codec::VideoQualityMode::Auto,
+            ),
+            video_remote_requested_profile: crate::live::video::codec::VideoProfile::P720,
+            video_receiver_preference_controller:
+                crate::live::video::codec::VideoReceiverPreferenceController::default(),
+            video_receiver_report_pending_inbound_frames: 0,
+            video_network_stats: VideoNetworkStats::default(),
+            video_window_counters: VideoWindowCounters::default(),
+            video_window_started_at: None,
+            video_last_summary_at: None,
+        }
+    }
+
+    fn prune_stale_mdns_dials(&mut self, now: std::time::Instant) {
+        self.mdns_dial_inflight
+            .retain(|_, started| now.duration_since(*started) <= Self::MDNS_DIAL_INFLIGHT_TIMEOUT);
+        self.mdns_backoff_until.retain(|_, until| *until > now);
+        self.recent_dials
+            .retain(|_, recent| now.duration_since(recent.at) <= Self::RECENT_DIAL_TTL);
+        self.auto_connect_inflight.retain(|peer_id, started| {
+            if now.duration_since(*started) <= Self::AUTO_CONNECT_INFLIGHT_TIMEOUT {
+                return true;
+            }
+            println!(
+                "[AutoConnect] Cleared stale in-flight attempt for {} (timed out)",
+                peer_id
+            );
+            false
+        });
+        self.auto_connect_backoff_until
+            .retain(|_, until| *until > now);
+    }
+
+    pub(super) fn record_outgoing_dial(&mut self, addr: &Multiaddr, source: OutgoingDialSource) {
+        let now = std::time::Instant::now();
+        self.recent_dials
+            .insert(addr.to_string(), RecentDial { source, at: now });
+        self.prune_stale_mdns_dials(now);
+    }
+
+    pub(super) fn classify_outgoing_error(
+        &mut self,
+        peer_id: Option<PeerId>,
+        error_debug: &str,
+    ) -> (OutgoingDialSource, Option<String>) {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+        let candidate_addr = extract_candidate_multiaddr_from_error_debug(error_debug);
+        let (peer_present, peer_known_mdns, peer_inflight_mdns) = if let Some(peer) = peer_id {
+            (
+                true,
+                self.local_peers.contains_key(&peer),
+                self.mdns_dial_inflight.contains_key(&peer),
+            )
+        } else {
+            (false, false, false)
+        };
+        let source = classify_outgoing_error_source(
+            error_debug,
+            candidate_addr.as_deref(),
+            &self.recent_dials,
+            peer_present,
+            peer_known_mdns,
+            peer_inflight_mdns,
+            now,
+        );
+        (source, candidate_addr)
+    }
+
+    pub(super) fn log_mdns_dial_skip(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+
+        if self.swarm.is_connected(&peer_id) {
+            println!("[mDNS] Dial skipped for {}: already connected", peer_id);
+            return;
+        }
+        if let Some(started) = self.mdns_dial_inflight.get(&peer_id) {
+            let elapsed_ms = now.duration_since(*started).as_millis();
+            println!(
+                "[mDNS] Dial skipped for {}: in-flight ({}ms elapsed)",
+                peer_id, elapsed_ms
+            );
+            return;
+        }
+        if let Some(until) = self.mdns_backoff_until.get(&peer_id) {
+            if *until > now {
+                let remaining = until.duration_since(now).as_secs_f32();
+                let attempts = self.mdns_dial_failures.get(&peer_id).copied().unwrap_or(0);
+                println!(
+                    "[mDNS] Dial skipped for {}: backoff active (attempt {}, retry in {:.1}s)",
+                    peer_id, attempts, remaining
+                );
+            }
+        }
+    }
+
+    pub(super) fn can_start_mdns_dial(&mut self, peer_id: PeerId) -> bool {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+
+        if self.swarm.is_connected(&peer_id) {
+            return false;
+        }
+        if self.mdns_dial_inflight.contains_key(&peer_id) {
+            return false;
+        }
+        if let Some(until) = self.mdns_backoff_until.get(&peer_id) {
+            if *until > now {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn note_mdns_dial_started(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.mdns_dial_inflight.insert(peer_id, now);
+        self.mdns_backoff_until
+            .insert(peer_id, now + Self::MDNS_DIAL_DEBOUNCE);
+    }
+
+    pub(super) fn note_mdns_dial_success(&mut self, peer_id: PeerId) {
+        self.mdns_dial_inflight.remove(&peer_id);
+        self.mdns_backoff_until.remove(&peer_id);
+        self.mdns_dial_failures.remove(&peer_id);
+        self.note_auto_connect_success(peer_id);
+    }
+
+    pub(super) fn note_mdns_dial_failure(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.mdns_dial_inflight.remove(&peer_id);
+        let attempts = self.mdns_dial_failures.entry(peer_id).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        let pow = std::cmp::min(*attempts, 5);
+        let secs = 1u64 << pow;
+        let backoff = std::cmp::min(
+            std::time::Duration::from_secs(secs),
+            Self::MDNS_DIAL_MAX_BACKOFF,
+        );
+        self.mdns_backoff_until.insert(peer_id, now + backoff);
+        println!(
+            "[mDNS] Dial failure recorded for {}: attempt {}, next retry in {:.1}s",
+            peer_id,
+            *attempts,
+            backoff.as_secs_f32()
+        );
+        self.note_auto_connect_failure(peer_id);
+    }
+
+    pub(super) fn cache_peer_mapping(&mut self, github_username: &str, peer_id: &str) {
+        self.peer_id_by_github
+            .insert(github_username.to_string(), peer_id.to_string());
+        self.github_by_peer_id
+            .insert(peer_id.to_string(), github_username.to_string());
+        self.remember_trusted_peer_id_str(peer_id);
+    }
+
+    pub(super) async fn refresh_peer_mapping_cache(&mut self) {
+        let mut next_peer_id_by_github: HashMap<String, String> = HashMap::new();
+        let mut next_github_by_peer_id: HashMap<String, String> = HashMap::new();
+
+        let state = &self.app_state;
+        let mgr = state.config_manager.lock().await;
+        if let Ok(config) = mgr.load().await {
+            for (gh_user, peer_id) in config.user.github_peer_mapping {
+                next_peer_id_by_github.insert(gh_user.clone(), peer_id.clone());
+                next_github_by_peer_id.insert(peer_id, gh_user);
+            }
+        }
+
+        self.peer_id_by_github = next_peer_id_by_github;
+        self.github_by_peer_id = next_github_by_peer_id;
+    }
+
+    pub(super) async fn refresh_trusted_peer_registry(&mut self) {
+        let mut trusted = HashSet::new();
+
+        let state = &self.app_state;
+        if let Ok(conn) = state.db_conn.lock() {
+            if let Ok(peers) = crate::storage::db::get_all_peers(&conn) {
+                for peer in peers {
+                    if peer.id == "Me" {
+                        continue;
+                    }
+                    if let Ok(peer_id) = peer.id.parse::<PeerId>() {
+                        trusted.insert(peer_id);
+                    }
+                }
+            }
+        }
+
+        let mgr = state.config_manager.lock().await;
+        if let Ok(config) = mgr.load().await {
+            for peer_id_str in config.user.github_peer_mapping.values() {
+                if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
+                    trusted.insert(peer_id);
+                }
+            }
+        }
+
+        self.trusted_peer_ids = trusted;
+        println!(
+            "[AutoConnect] Trusted peer registry loaded: {} peer(s)",
+            self.trusted_peer_ids.len()
+        );
+    }
+
+    pub(super) fn remember_trusted_peer_id(&mut self, peer_id: PeerId) {
+        self.trusted_peer_ids.insert(peer_id);
+    }
+
+    pub(super) fn remember_trusted_peer_id_str(&mut self, peer_id: &str) {
+        if let Ok(parsed) = peer_id.parse::<PeerId>() {
+            self.remember_trusted_peer_id(parsed);
+        }
+    }
+
+    fn note_auto_connect_started(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.auto_connect_inflight.insert(peer_id, now);
+        self.auto_connect_backoff_until
+            .insert(peer_id, now + Self::MDNS_DIAL_DEBOUNCE);
+    }
+
+    fn note_auto_connect_success(&mut self, peer_id: PeerId) {
+        self.auto_connect_inflight.remove(&peer_id);
+        self.auto_connect_backoff_until.remove(&peer_id);
+        self.auto_connect_failures.remove(&peer_id);
+    }
+
+    fn note_auto_connect_failure(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        if self.auto_connect_inflight.remove(&peer_id).is_none() {
+            return;
+        }
+        let attempts = self.auto_connect_failures.entry(peer_id).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        let pow = std::cmp::min(*attempts, 6);
+        let secs = 1u64 << pow;
+        let backoff = std::cmp::min(
+            std::time::Duration::from_secs(secs),
+            Self::AUTO_CONNECT_MAX_BACKOFF,
+        );
+        self.auto_connect_backoff_until
+            .insert(peer_id, now + backoff);
+        println!(
+            "[AutoConnect] Attempt failed for {} (attempt {}), retry in {:.1}s",
+            peer_id,
+            *attempts,
+            backoff.as_secs_f32()
+        );
+    }
+
+    pub(super) async fn maybe_auto_connect_trusted_peer(&mut self, peer_id: PeerId) {
+        let now = std::time::Instant::now();
+        self.prune_stale_mdns_dials(now);
+
+        if !self.trusted_peer_ids.contains(&peer_id) {
+            println!("[AutoConnect] Skipped unknown peer {}", peer_id);
+            return;
+        }
+        if self.swarm.is_connected(&peer_id) {
+            self.note_auto_connect_success(peer_id);
+            println!("[AutoConnect] Skipped {} (already connected)", peer_id);
+            return;
+        }
+        if self.pending_requests.contains(&peer_id) || self.incoming_requests.contains(&peer_id) {
+            println!(
+                "[AutoConnect] Skipped {} (request already in-flight)",
+                peer_id
+            );
+            return;
+        }
+        if self.auto_connect_inflight.contains_key(&peer_id) {
+            println!(
+                "[AutoConnect] Skipped {} (auto-connect attempt in-flight)",
+                peer_id
+            );
+            return;
+        }
+        if let Some(until) = self.auto_connect_backoff_until.get(&peer_id) {
+            if *until > now {
+                println!(
+                    "[AutoConnect] Skipped {} (cooldown {:.1}s)",
+                    peer_id,
+                    until.duration_since(now).as_secs_f32()
+                );
+                return;
+            }
+        }
+
+        println!("[AutoConnect] Auto-requesting trusted peer {}", peer_id);
+        self.note_auto_connect_started(peer_id);
+        self.handle_connection_request(&peer_id.to_string()).await;
+    }
+
+    pub(super) async fn resolve_peer_id(
+        &mut self,
+        target_peer_id: &str,
+        context: &str,
+    ) -> Option<PeerId> {
+        let actual_peer_id_str =
+            if let Some(mapped_peer_id) = self.temp_peer_by_chat_id.get(target_peer_id) {
+                mapped_peer_id.clone()
+            } else if target_peer_id.starts_with("gh:") || target_peer_id.starts_with("lh:") {
+                if let Some(peer_id_string) =
+                    crate::chat_identity::resolve_peer_id_for_direct_chat_id(target_peer_id)
+                {
+                    peer_id_string
+                } else {
+                    eprintln!(
+                        "[{}] ❌ Invalid canonical direct chat id {}. Message queued.",
+                        context, target_peer_id
+                    );
+                    return None;
+                }
+            } else {
+                target_peer_id.to_string()
+            };
+
+        match actual_peer_id_str.parse::<PeerId>() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "[{}] ❌ Invalid peer_id: {} ({})",
+                    context, actual_peer_id_str, e
+                );
+                None
+            }
+        }
+    }
+
+    pub(super) async fn resolve_chat_id_for_sender(
+        &mut self,
+        sender_peer_id: &str,
+        sender_alias: Option<&str>,
+    ) -> String {
+        if let Some(temp_chat_id) = self.temp_chat_by_peer_id.get(sender_peer_id) {
+            return temp_chat_id.clone();
+        }
+
+        if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
+            return crate::chat_identity::build_github_chat_id(gh_user, sender_peer_id);
+        }
+
+        self.refresh_peer_mapping_cache().await;
+        if let Some(gh_user) = self.github_by_peer_id.get(sender_peer_id) {
+            return crate::chat_identity::build_github_chat_id(gh_user, sender_peer_id);
+        }
+
+        let state = &self.app_state;
+        if let Ok(conn) = state.db_conn.lock() {
+            if let Ok(Some(existing_chat_id)) =
+                crate::storage::db::find_existing_direct_chat_id_for_peer(&conn, sender_peer_id)
+            {
+                return existing_chat_id;
+            }
+
+            let discovered_name = sender_alias
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    crate::storage::db::get_peer_alias(&conn, sender_peer_id)
+                        .ok()
+                        .flatten()
+                        .filter(|name| !name.trim().is_empty() && name != sender_peer_id)
+                })
+                .unwrap_or_else(|| "peer".to_string());
+            return crate::chat_identity::build_local_chat_id(&discovered_name, sender_peer_id);
+        }
+
+        sender_peer_id.to_string()
+    }
+
+    pub(super) fn cache_temporary_mapping(&mut self, chat_id: &str, peer_id: &str) {
+        self.temp_peer_by_chat_id
+            .insert(chat_id.to_string(), peer_id.to_string());
+        self.temp_chat_by_peer_id
+            .insert(peer_id.to_string(), chat_id.to_string());
+    }
+
+    pub(super) fn remove_temporary_by_chat_id(&mut self, chat_id: &str) {
+        if let Some(peer_id) = self.temp_peer_by_chat_id.remove(chat_id) {
+            self.temp_chat_by_peer_id.remove(&peer_id);
+        }
+    }
+
+    pub(super) fn remove_temporary_by_peer_id(&mut self, peer_id: &str) -> Option<String> {
+        let chat_id = self.temp_chat_by_peer_id.remove(peer_id)?;
+        self.temp_peer_by_chat_id.remove(&chat_id);
+        Some(chat_id)
+    }
+
+    pub(super) fn emit_connected_chat_ids_updated(&self) {
+        let state = self.network_state.clone();
+        let event_sink = self.event_sink.clone();
+        tokio::spawn(async move {
+            let mut connected_ids: Vec<String> = {
+                let connected = state.connected_chat_ids.lock().await;
+                connected.iter().cloned().collect()
+            };
+            connected_ids.sort_unstable();
+            event_sink.emit(CoreEvent::ConnectedChatIdsUpdated(connected_ids));
+        });
+    }
+
+    pub(super) async fn mark_connected_chat_id(&mut self, chat_id: String) {
+        let state = &self.network_state;
+        let mut connected = state.connected_chat_ids.lock().await;
+        let changed = connected.insert(chat_id);
+        drop(connected);
+        if changed {
+            self.emit_connected_chat_ids_updated();
+        }
+    }
+
+    pub(super) async fn unmark_connected_chat_id(&mut self, chat_id: &str) {
+        let state = &self.network_state;
+        let mut connected = state.connected_chat_ids.lock().await;
+        let changed = connected.remove(chat_id);
+        drop(connected);
+        if changed {
+            self.emit_connected_chat_ids_updated();
+        }
+    }
+
+    pub(super) async fn note_chat_connection_established(
+        &mut self,
+        chat_id: &str,
+        remote_addr: &str,
+        connected_at: i64,
+    ) -> bool {
+        let state = &self.network_state;
+        let mut runtime = state.chat_connections.lock().await;
+        let entry = runtime.entry(chat_id.to_string()).or_default();
+        let was_connected = entry.connected;
+        entry.connected = true;
+        entry.remote_addr = Some(remote_addr.to_string());
+        entry.last_connected_at = Some(connected_at);
+        if !was_connected {
+            entry.connected_since = Some(connected_at);
+        }
+        !was_connected
+    }
+
+    pub(super) async fn note_chat_connection_closed(&mut self, chat_id: &str) {
+        let state = &self.network_state;
+        let mut runtime = state.chat_connections.lock().await;
+        let entry = runtime.entry(chat_id.to_string()).or_default();
+        entry.connected = false;
+        entry.connected_since = None;
+    }
+
+    pub(super) async fn set_voice_call_state(
+        &mut self,
+        mut next: crate::app_state::VoiceCallState,
+        reason: Option<String>,
+    ) {
+        if reason.is_some() {
+            next.reason = reason;
+        }
+        let state = &self.network_state;
+        {
+            let mut shared = state.voice_call_state.lock().await;
+            *shared = next.clone();
+        }
+        self.emit(CoreEvent::VoiceCallStateUpdated(next));
+    }
+
+    pub(super) async fn set_broadcast_state(
+        &mut self,
+        mut next: crate::app_state::BroadcastState,
+        reason: Option<String>,
+    ) {
+        if reason.is_some() {
+            next.reason = reason;
+        }
+        let state = &self.network_state;
+        {
+            let mut shared = state.broadcast_state.lock().await;
+            *shared = next.clone();
+        }
+        self.emit(CoreEvent::BroadcastStateUpdated(next));
+    }
+
+    pub(super) fn note_peer_transport_connected(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remote_addr: &Multiaddr,
+    ) {
+        self.peer_transport_registry
+            .record_connected(peer_id, connection_id, remote_addr);
+    }
+
+    pub(super) fn note_peer_transport_disconnected(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remote_addr: &Multiaddr,
+    ) -> bool {
+        self.peer_transport_registry
+            .record_disconnected(peer_id, connection_id, remote_addr)
+    }
+
+    pub(super) fn peer_has_quic_path(&self, peer_id: &PeerId) -> bool {
+        self.peer_transport_registry.has_quic(peer_id)
+    }
+
+    pub(super) fn peer_transport_counts(&self, peer_id: &PeerId) -> (usize, usize) {
+        (
+            self.peer_transport_registry.quic_connection_count(peer_id),
+            self.peer_transport_registry.tcp_connection_count(peer_id),
+        )
+    }
+
+    pub(super) fn voice_quic_connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.peer_transport_registry
+            .newest_quic_connection_id(peer_id)
+    }
+
+    pub(super) fn dial_known_voice_quic_addresses(&mut self, peer_id: &PeerId) -> usize {
+        let addrs = quic_addresses_for_peer(&self.local_peers, peer_id);
+        for addr in &addrs {
+            self.record_outgoing_dial(addr, OutgoingDialSource::VoiceQuic);
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                eprintln!(
+                    "[Voice][QUIC] Dial failed for {} at {}: {}",
+                    peer_id, addr, e
+                );
+            } else {
+                eprintln!("[Voice][QUIC] Dialing {} at {}", peer_id, addr);
+            }
+        }
+        addrs.len()
+    }
+
+    pub(super) fn ensure_voice_quic_path(&mut self, peer_id: &PeerId) -> bool {
+        let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
+        if quic_count > 0 {
+            eprintln!(
+                "[Voice][QUIC] peer={} quic_connections={}, tcp_connections={}",
+                peer_id, quic_count, tcp_count
+            );
+            return true;
+        }
+
+        let dial_count = self.dial_known_voice_quic_addresses(peer_id);
+        eprintln!(
+            "[Voice][QUIC] peer={} missing QUIC path, tcp_connections={}, quic_candidates_dialed={}",
+            peer_id, tcp_count, dial_count
+        );
+        false
+    }
+
+    pub(super) fn reset_voice_network_diagnostics(&mut self) {
+        self.voice_network_stats.reset();
+        self.voice_expected_inbound_seq = None;
+        self.voice_last_summary_at = Some(std::time::Instant::now());
+    }
+
+    pub(super) fn log_voice_network_summary(&mut self, label: &str, peer_id: &PeerId) {
+        let (quic_count, tcp_count) = self.peer_transport_counts(peer_id);
+        let avg_opus_out_bytes = if self.voice_network_stats.outbound_frames == 0 {
+            0.0
+        } else {
+            self.voice_network_stats.opus_out_bytes as f64
+                / self.voice_network_stats.outbound_frames as f64
+        };
+        let avg_opus_in_bytes = if self.voice_network_stats.inbound_frames == 0 {
+            0.0
+        } else {
+            self.voice_network_stats.opus_in_bytes as f64
+                / self.voice_network_stats.inbound_frames as f64
+        };
+        eprintln!(
+            "[Voice][Network][{}] peer={}, quic_connections={}, tcp_connections={}, outbound_frames={}, inbound_frames={}, inbound_seq_gaps={}, inbound_out_of_order_frames={}, outbound_failures={}, inbound_failures={}, rejected_responses={}, opus_encode_errors={}, opus_decode_errors={}, opus_out_bytes={}, opus_in_bytes={}, avg_opus_out_bytes={:.1}, avg_opus_in_bytes={:.1}",
+            label,
+            peer_id,
+            quic_count,
+            tcp_count,
+            self.voice_network_stats.outbound_frames,
+            self.voice_network_stats.inbound_frames,
+            self.voice_network_stats.inbound_seq_gaps,
+            self.voice_network_stats.inbound_out_of_order_frames,
+            self.voice_network_stats.outbound_failures,
+            self.voice_network_stats.inbound_failures,
+            self.voice_network_stats.rejected_responses,
+            self.voice_network_stats.opus_encode_errors,
+            self.voice_network_stats.opus_decode_errors,
+            self.voice_network_stats.opus_out_bytes,
+            self.voice_network_stats.opus_in_bytes,
+            avg_opus_out_bytes,
+            avg_opus_in_bytes,
+        );
+    }
+
+    pub(super) fn current_connectivity_settings(
+        &self,
+    ) -> crate::storage::config::ConnectivitySettings {
+        let state = &self.network_state;
+        let settings = match state.connectivity.try_lock() {
+            Ok(settings) => settings.clone(),
+            Err(_) => crate::storage::config::ConnectivitySettings::default(),
+        };
+        settings
+    }
+
+    pub(super) fn is_mdns_enabled(&self) -> bool {
+        self.current_connectivity_settings().mdns_enabled
+    }
+
+    pub(super) fn is_github_sync_enabled(&self) -> bool {
+        self.current_connectivity_settings().github_sync_enabled
+    }
+
+    pub(super) fn is_nat_keepalive_enabled(&self) -> bool {
+        self.current_connectivity_settings().nat_keepalive_enabled
+    }
+
+    pub(super) fn is_punch_assist_enabled(&self) -> bool {
+        self.current_connectivity_settings().punch_assist_enabled
+    }
+}
+
+impl Drop for NetworkManager {
+    fn drop(&mut self) {
+        self.video_encode_worker_handle.abort();
+        self.shutdown_transfer_workers_gracefully(std::time::Duration::from_secs(5));
+        self.shutdown_persistence_workers_gracefully(std::time::Duration::from_secs(5));
+
+        if let Some(mut mdns_handle) = self.mdns_handle.take() {
+            mdns_handle.stop();
+        }
+    }
+}
