@@ -232,31 +232,13 @@ pub async fn create_group_chat(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<GroupChatResult, String> {
-    let chat_id = chat_kind::generate_group_chat_id();
-    let resolved_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| chat_kind::default_group_name(&chat_id));
-
-    {
-        let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-        storage::db::upsert_chat(&conn, &chat_id, &resolved_name, true)
-            .map_err(|e| e.to_string())?;
-        storage::db::add_chat_member(&conn, &chat_id, "Me", "admin").map_err(|e| e.to_string())?;
-    }
-
-    if let Some(net_state) = app_handle.try_state::<NetworkState>() {
-        let tx = net_state.sender.lock().await;
-        let _ = tx
-            .send(NetworkCommand::SubscribeGroup {
-                group_id: chat_id.clone(),
-            })
-            .await;
-    }
-
+    let net_state = app_handle.try_state::<NetworkState>();
+    let result = crate::chat::group::create_group(&state, net_state.as_deref(), name)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(GroupChatResult {
-        chat_id,
-        name: resolved_name,
+        chat_id: result.chat_id,
+        name: result.name,
     })
 }
 
@@ -267,34 +249,13 @@ pub async fn join_group_chat(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<GroupChatResult, String> {
-    if !chat_kind::is_group_chat_id(&chat_id) {
-        return Err("Invalid group id. Expected format group:<uuid>".to_string());
-    }
-
-    let resolved_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| chat_kind::default_group_name(&chat_id));
-
-    {
-        let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-        storage::db::upsert_chat(&conn, &chat_id, &resolved_name, true)
-            .map_err(|e| e.to_string())?;
-        storage::db::add_chat_member(&conn, &chat_id, "Me", "member").map_err(|e| e.to_string())?;
-    }
-
-    if let Some(net_state) = app_handle.try_state::<NetworkState>() {
-        let tx = net_state.sender.lock().await;
-        let _ = tx
-            .send(NetworkCommand::SubscribeGroup {
-                group_id: chat_id.clone(),
-            })
-            .await;
-    }
-
+    let net_state = app_handle.try_state::<NetworkState>();
+    let result = crate::chat::group::join_group_legacy(&state, net_state.as_deref(), chat_id, name)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(GroupChatResult {
-        chat_id,
-        name: resolved_name,
+        chat_id: result.chat_id,
+        name: result.name,
     })
 }
 
@@ -304,26 +265,65 @@ pub async fn leave_group_chat(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    if !chat_kind::is_group_chat_id(&chat_id) {
-        return Err("Invalid group id. Expected format group:<uuid>".to_string());
-    }
+    let Some(net_state) = app_handle.try_state::<NetworkState>() else {
+        return Err("Network is not started".to_string());
+    };
+    crate::chat::group::leave_group(&state, &net_state, chat_id)
+        .await
+        .map_err(|e| e.to_string())
+}
 
-    {
-        let conn = state.db_conn.lock().map_err(|e| e.to_string())?;
-        let _ = storage::db::remove_chat_member(&conn, &chat_id, "Me");
-        storage::db::delete_group_chat(&conn, &chat_id).map_err(|e| e.to_string())?;
-    }
+#[tauri::command]
+pub async fn invite_group_member(
+    group_id: String,
+    peer_id: String,
+    state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<String, String> {
+    crate::chat::group::invite_member(&state, &net_state, group_id, peer_id)
+        .await
+        .map_err(|e| e.to_string())
+}
 
-    if let Some(net_state) = app_handle.try_state::<NetworkState>() {
-        let tx = net_state.sender.lock().await;
-        let _ = tx
-            .send(NetworkCommand::UnsubscribeGroup {
-                group_id: chat_id.clone(),
-            })
-            .await;
-    }
+#[tauri::command]
+pub async fn accept_group_invite(
+    invite_id: String,
+    state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<String, String> {
+    crate::chat::group::accept_invite(&state, &net_state, invite_id)
+        .await
+        .map_err(|e| e.to_string())
+}
 
-    Ok(())
+#[tauri::command]
+pub async fn reject_group_invite(
+    invite_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::chat::group::reject_invite(&state, &invite_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rename_group_chat(
+    group_id: String,
+    name: String,
+    state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    crate::chat::group::rename_group(&state, &net_state, group_id, name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sync_group_chat(
+    group_id: String,
+    net_state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    crate::chat::group::sync_group(&net_state, group_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -404,6 +404,18 @@ pub async fn send_message(
     let is_archived = matches!(chat_kind, ChatKind::Archived);
     if is_archived {
         return Err("Archived chats are read-only".to_string());
+    }
+
+    if matches!(chat_kind, ChatKind::Group) {
+        return crate::chat::group::send_group_text(
+            &app_state,
+            &net_state,
+            canonical_peer_id,
+            message,
+            my_alias,
+        )
+        .await
+        .map_err(|e| e.to_string());
     }
 
     let (msg_id, timestamp, outgoing_msg) = {
@@ -556,6 +568,8 @@ pub async fn send_message(
                 content_type: GroupContentType::Text,
                 text_content: Some(message),
                 file_hash: None,
+                protocol_version: None,
+                signed_record_id: None,
             };
             tx.send(NetworkCommand::PublishGroup { envelope })
                 .await
@@ -669,7 +683,15 @@ pub async fn mark_messages_read(
 
     println!("[Backend] Marked {} messages as read", marked_ids.len());
 
-    if !marked_ids.is_empty() && matches!(chat_kind, ChatKind::Direct | ChatKind::TemporaryDirect) {
+    if !marked_ids.is_empty() && matches!(chat_kind, ChatKind::Group) {
+        if let Err(e) =
+            crate::chat::group::mark_read(&state, &net_state, resolved_chat_id.clone(), marked_ids.clone()).await
+        {
+            eprintln!("[Backend] Failed to publish group read receipt: {}", e);
+        }
+    } else if !marked_ids.is_empty()
+        && matches!(chat_kind, ChatKind::Direct | ChatKind::TemporaryDirect)
+    {
         let target_peer_id = resolve_peer_id_for_chat(&state, &resolved_chat_id)
             .await
             .unwrap_or_else(|| resolved_chat_id.clone());

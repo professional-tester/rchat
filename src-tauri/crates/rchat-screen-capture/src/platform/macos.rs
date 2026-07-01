@@ -2,7 +2,8 @@ use crate::{
     bgra_to_i420, clamp_to_profile, i420_to_preview_rgba, now_timestamp_us, scale_i420_nearest,
     CaptureStatsAtomic, I420ScreenFrame, PreviewFrame, ScreenCaptureBackend, ScreenCaptureConfig,
     ScreenCaptureCursorMode, ScreenCaptureError, ScreenCaptureFormatInfo, ScreenCaptureSessionInfo,
-    ScreenCaptureSessionStats, ScreenCaptureSupport, PREVIEW_INTERVAL,
+    ScreenCaptureSessionStats, ScreenCaptureSourceSelection, ScreenCaptureSupport,
+    PREVIEW_INTERVAL,
 };
 use screencapturekit::async_api::{AsyncSCContentSharingPicker, AsyncSCStream};
 use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCFrameStatus};
@@ -10,7 +11,9 @@ use screencapturekit::content_sharing_picker::{
     SCContentSharingPickerConfiguration, SCContentSharingPickerMode, SCPickerOutcome,
 };
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+use screencapturekit::shareable_content::SCShareableContent;
 use screencapturekit::stream::configuration::{PixelFormat, SCStreamConfiguration};
+use screencapturekit::stream::content_filter::SCContentFilter;
 use screencapturekit::stream::output_type::SCStreamOutputType;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -266,6 +269,15 @@ pub async fn screen_capture_support() -> ScreenCaptureSupport {
 pub async fn start_session(
     config: ScreenCaptureConfig,
 ) -> Result<PlatformScreenCaptureSession, ScreenCaptureError> {
+    match config.source_selection {
+        ScreenCaptureSourceSelection::Picker => start_picker_session(config).await,
+        ScreenCaptureSourceSelection::PrimaryDisplay => start_primary_display_session(config).await,
+    }
+}
+
+async fn start_picker_session(
+    config: ScreenCaptureConfig,
+) -> Result<PlatformScreenCaptureSession, ScreenCaptureError> {
     let mut picker_config = SCContentSharingPickerConfiguration::default_from_system();
     picker_config.set_allowed_picker_modes(&[
         SCContentSharingPickerMode::SingleDisplay,
@@ -312,6 +324,66 @@ pub async fn start_session(
     let info = ScreenCaptureSessionInfo {
         backend: ScreenCaptureBackend::MacosScreenCaptureKit,
         source_label: format!("macOS picker source {}x{}", picked_width, picked_height),
+        requested_profile: config.profile.label().to_string(),
+        format: ScreenCaptureFormatInfo {
+            width: target_width,
+            height: target_height,
+            fps: config.profile.fps(),
+            format: PixelFormat::BGRA.to_string(),
+        },
+    };
+
+    Ok(PlatformScreenCaptureSession {
+        info,
+        stream,
+        stats: CaptureStatsAtomic::default(),
+        preview_slot: crate::LatestSlot::default(),
+        last_preview_at: None,
+    })
+}
+
+async fn start_primary_display_session(
+    config: ScreenCaptureConfig,
+) -> Result<PlatformScreenCaptureSession, ScreenCaptureError> {
+    let content = SCShareableContent::get()
+        .map_err(|error| ScreenCaptureError::PermissionOrSourceUnavailable(error.to_string()))?;
+    let display = content.displays().into_iter().next().ok_or_else(|| {
+        ScreenCaptureError::PermissionOrSourceUnavailable("no display found".to_string())
+    })?;
+    let picked_width = display.width();
+    let picked_height = display.height();
+    let display_id = display.display_id();
+    let filter = SCContentFilter::create()
+        .with_display(&display)
+        .with_excluding_windows(&[])
+        .build();
+
+    let (target_width, target_height) = config.profile.dimensions();
+    let frame_interval = CMTime {
+        value: 1,
+        timescale: config.profile.fps() as i32,
+        flags: 0,
+        epoch: 0,
+    };
+    let stream_config = SCStreamConfiguration::new()
+        .with_width(target_width)
+        .with_height(target_height)
+        .with_pixel_format(PixelFormat::BGRA)
+        .with_shows_cursor(config.cursor_mode == ScreenCaptureCursorMode::Embedded)
+        .with_minimum_frame_interval(&frame_interval);
+
+    let stream = AsyncSCStream::new(&filter, &stream_config, 3, SCStreamOutputType::Screen);
+    stream
+        .start_capture()
+        .await
+        .map_err(|e| ScreenCaptureError::Backend(e.to_string()))?;
+
+    let info = ScreenCaptureSessionInfo {
+        backend: ScreenCaptureBackend::MacosScreenCaptureKit,
+        source_label: format!(
+            "macOS primary display {} {}x{}",
+            display_id, picked_width, picked_height
+        ),
         requested_profile: config.profile.label().to_string(),
         format: ScreenCaptureFormatInfo {
             width: target_width,

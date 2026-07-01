@@ -426,6 +426,8 @@ pub async fn send_image_message(
                     content_type: GroupContentType::Image,
                     text_content: None,
                     file_hash: Some(file_hash.clone()),
+                    protocol_version: None,
+                    signed_record_id: None,
                 };
                 tx.send(NetworkCommand::PublishGroup { envelope })
                     .await
@@ -632,6 +634,8 @@ pub async fn send_document_message(
                     content_type: GroupContentType::Document,
                     text_content: Some(file_name.clone()),
                     file_hash: Some(file_hash.clone()),
+                    protocol_version: None,
+                    signed_record_id: None,
                 };
                 tx.send(NetworkCommand::PublishGroup { envelope })
                     .await
@@ -775,6 +779,8 @@ pub async fn send_video_message(
                     content_type: GroupContentType::Video,
                     text_content: Some(file_name.clone()),
                     file_hash: Some(file_hash.clone()),
+                    protocol_version: None,
+                    signed_record_id: None,
                 };
                 tx.send(NetworkCommand::PublishGroup { envelope })
                     .await
@@ -921,6 +927,8 @@ pub async fn send_audio_message(
                     content_type: GroupContentType::Audio,
                     text_content: Some(file_name.clone()),
                     file_hash: Some(file_hash.clone()),
+                    protocol_version: None,
+                    signed_record_id: None,
                 };
                 tx.send(NetworkCommand::PublishGroup { envelope })
                     .await
@@ -1263,6 +1271,8 @@ pub async fn send_sticker_message(
                     content_type: GroupContentType::Sticker,
                     text_content: None,
                     file_hash: Some(file_hash.clone()),
+                    protocol_version: None,
+                    signed_record_id: None,
                 };
                 tx.send(NetworkCommand::PublishGroup { envelope })
                     .await

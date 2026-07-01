@@ -1,14 +1,10 @@
-mod app_state;
-mod chat;
-mod chat_identity;
-mod chat_kind;
 mod commands;
-mod live;
-mod network;
-mod oauth;
-mod storage;
+mod event_sink;
 
-pub use app_state::{AppState, NetworkState};
+pub use rchat_core::{
+    app_state, chat, chat_identity, chat_kind, live, network, oauth, storage, AppState,
+    NetworkState,
+};
 
 use crate::commands::auth::{
     check_auth_status, get_connectivity_settings, init_vault, poll_github_auth, reset_vault,
@@ -25,9 +21,10 @@ use crate::commands::call::{
     start_video_call, start_voice_call, submit_video_call_i420_frame,
 };
 use crate::commands::chat::{
-    create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list, get_unread_counts,
-    join_group_chat, leave_group_chat, mark_messages_read, save_temporary_chat_to_archive,
-    send_message, send_message_to_self,
+    accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times,
+    get_chat_list, get_unread_counts, invite_group_member, join_group_chat, leave_group_chat,
+    mark_messages_read, reject_group_invite, rename_group_chat, save_temporary_chat_to_archive,
+    send_message, send_message_to_self, sync_group_chat,
 };
 use crate::commands::chat_details::{
     drop_chat_connection, force_chat_reconnect, get_chat_details_overview, get_chat_stats,
@@ -56,6 +53,7 @@ use crate::commands::peer_profile::{
     toggle_pin_peer, update_custom_theme, update_theme, update_user_profile,
 };
 use crate::storage::config::ConfigManager;
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 #[cfg(target_os = "linux")]
@@ -151,8 +149,8 @@ pub fn run() {
                 storage::db::connect_to_db().expect("Failed to initialize database");
 
             app.manage(AppState {
-                config_manager: tokio::sync::Mutex::new(config_manager),
-                db_conn: std::sync::Mutex::new(db_connection),
+                config_manager: Arc::new(tokio::sync::Mutex::new(config_manager)),
+                db_conn: Arc::new(std::sync::Mutex::new(db_connection)),
                 app_dir: app_dir.clone(),
             });
 
@@ -239,6 +237,11 @@ pub fn run() {
             create_group_chat,
             join_group_chat,
             leave_group_chat,
+            invite_group_member,
+            accept_group_invite,
+            reject_group_invite,
+            rename_group_chat,
+            sync_group_chat,
             save_temporary_chat_to_archive,
             start_voice_call,
             accept_voice_call,

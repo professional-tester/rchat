@@ -80,6 +80,18 @@ impl Default for ScreenCaptureCursorMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenCaptureSourceSelection {
+    Picker,
+    PrimaryDisplay,
+}
+
+impl Default for ScreenCaptureSourceSelection {
+    fn default() -> Self {
+        Self::Picker
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenCaptureBackend {
     MacosScreenCaptureKit,
     LinuxPortalPipeWire,
@@ -102,6 +114,7 @@ impl ScreenCaptureBackend {
 pub struct ScreenCaptureConfig {
     pub profile: ScreenCaptureProfile,
     pub cursor_mode: ScreenCaptureCursorMode,
+    pub source_selection: ScreenCaptureSourceSelection,
 }
 
 impl ScreenCaptureConfig {
@@ -109,6 +122,15 @@ impl ScreenCaptureConfig {
         Self {
             profile,
             cursor_mode: ScreenCaptureCursorMode::Embedded,
+            source_selection: ScreenCaptureSourceSelection::Picker,
+        }
+    }
+
+    pub fn primary_display_for_profile(profile: ScreenCaptureProfile) -> Self {
+        Self {
+            profile,
+            cursor_mode: ScreenCaptureCursorMode::Embedded,
+            source_selection: ScreenCaptureSourceSelection::PrimaryDisplay,
         }
     }
 }
@@ -839,6 +861,21 @@ mod tests {
         assert_eq!(config.profile.fps(), 15);
         assert_eq!(config.profile.label(), "720p15");
         assert_eq!(config.cursor_mode, ScreenCaptureCursorMode::Embedded);
+        assert_eq!(
+            config.source_selection,
+            ScreenCaptureSourceSelection::Picker
+        );
+    }
+
+    #[test]
+    fn primary_display_config_keeps_profile_without_picker() {
+        let config = ScreenCaptureConfig::primary_display_for_profile(ScreenCaptureProfile::P480F30);
+        assert_eq!(config.profile, ScreenCaptureProfile::P480F30);
+        assert_eq!(config.cursor_mode, ScreenCaptureCursorMode::Embedded);
+        assert_eq!(
+            config.source_selection,
+            ScreenCaptureSourceSelection::PrimaryDisplay
+        );
     }
 
     #[test]

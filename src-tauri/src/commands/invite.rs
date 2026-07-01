@@ -228,7 +228,7 @@ pub async fn create_invite(
     }
 
     println!("[Backend] Publishing invite to Gist immediately...");
-    discovery::publish_peer_info(&token, vec![], app.clone())
+    discovery::publish_peer_info(&token, vec![], &app_state)
         .await
         .map_err(|e| format!("Failed to publish invite: {}", e))?;
 

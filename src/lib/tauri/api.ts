@@ -44,6 +44,11 @@ export const COMMANDS = {
   createGroupChat: "create_group_chat",
   joinGroupChat: "join_group_chat",
   leaveGroupChat: "leave_group_chat",
+  inviteGroupMember: "invite_group_member",
+  acceptGroupInvite: "accept_group_invite",
+  rejectGroupInvite: "reject_group_invite",
+  renameGroupChat: "rename_group_chat",
+  syncGroupChat: "sync_group_chat",
   sendMessageToSelf: "send_message_to_self",
   sendMessage: "send_message",
   getChatHistory: "get_chat_history",
@@ -510,6 +515,26 @@ type CommandSpec = {
     args: { chat_id: string };
     result: void;
   };
+  [COMMANDS.inviteGroupMember]: {
+    args: { group_id: string; peer_id: string };
+    result: string;
+  };
+  [COMMANDS.acceptGroupInvite]: {
+    args: { invite_id: string };
+    result: string;
+  };
+  [COMMANDS.rejectGroupInvite]: {
+    args: { invite_id: string };
+    result: void;
+  };
+  [COMMANDS.renameGroupChat]: {
+    args: { group_id: string; name: string };
+    result: void;
+  };
+  [COMMANDS.syncGroupChat]: {
+    args: { group_id: string };
+    result: void;
+  };
   [COMMANDS.sendMessageToSelf]: { args: { message: string }; result: void };
   [COMMANDS.sendMessage]: {
     args: { peer_id: string; message: string };
@@ -853,6 +878,19 @@ export const api = {
     invokeCommand(COMMANDS.joinGroupChat, { chat_id: chatId, name }),
   leaveGroupChat: (chatId: string) =>
     invokeCommand(COMMANDS.leaveGroupChat, { chat_id: chatId }),
+  inviteGroupMember: (groupId: string, peerId: string) =>
+    invokeCommand(COMMANDS.inviteGroupMember, {
+      group_id: groupId,
+      peer_id: peerId,
+    }),
+  acceptGroupInvite: (inviteId: string) =>
+    invokeCommand(COMMANDS.acceptGroupInvite, { invite_id: inviteId }),
+  rejectGroupInvite: (inviteId: string) =>
+    invokeCommand(COMMANDS.rejectGroupInvite, { invite_id: inviteId }),
+  renameGroupChat: (groupId: string, name: string) =>
+    invokeCommand(COMMANDS.renameGroupChat, { group_id: groupId, name }),
+  syncGroupChat: (groupId: string) =>
+    invokeCommand(COMMANDS.syncGroupChat, { group_id: groupId }),
   sendMessageToSelf: (message: string) =>
     invokeCommand(COMMANDS.sendMessageToSelf, { message }),
   sendMessage: (peerId: string, message: string) =>

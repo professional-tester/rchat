@@ -2,6 +2,7 @@ use tauri::{Emitter, Manager, State};
 
 use crate::storage::config::{Config, ConnectivityMode, ConnectivitySettings};
 use crate::{network, oauth, AppState, NetworkState};
+use std::sync::Arc;
 
 #[derive(serde::Serialize)]
 pub struct AuthStatus {
@@ -265,8 +266,12 @@ pub async fn start_network(app_handle: tauri::AppHandle) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    match network::init(app_handle.clone()).await {
-        Ok(_) => {
+    let core_app_state = app_handle.state::<AppState>().inner().clone();
+    let event_sink = Arc::new(crate::event_sink::TauriEventSink::new(app_handle.clone()));
+
+    match network::start(core_app_state, event_sink).await {
+        Ok(network_state) => {
+            app_handle.manage(network_state);
             println!("[Backend] Network started successfully!");
             let _ = app_handle.emit("auth-status", serde_json::json!({"unlocked": true}));
             Ok(())
