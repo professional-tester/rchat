@@ -151,7 +151,7 @@ pub fn connect_to_db() -> anyhow::Result<Connection> {
 }
 
 // Private helper to ensure tables exist
-fn create_tables(conn: &Connection) -> anyhow::Result<()> {
+pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     // --- Critical Performance & Safety Settings ---
     // Enable Write-Ahead Logging for concurrency (Readers don't block Writers)
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -882,6 +882,38 @@ pub fn add_chat_member(
     Ok(())
 }
 
+pub fn upsert_chat_member_state(
+    conn: &Connection,
+    chat_id: &str,
+    peer_id: &str,
+    role: &str,
+    membership_state: &str,
+    invited_by: Option<&str>,
+    last_event_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let joined_at = unix_now();
+    conn.execute(
+        "INSERT INTO chat_peers
+             (chat_id, peer_id, role, joined_at, membership_state, invited_by, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(chat_id, peer_id) DO UPDATE SET
+             role = excluded.role,
+             membership_state = excluded.membership_state,
+             invited_by = COALESCE(excluded.invited_by, chat_peers.invited_by),
+             last_event_id = COALESCE(excluded.last_event_id, chat_peers.last_event_id)",
+        (
+            chat_id,
+            peer_id,
+            role,
+            joined_at,
+            membership_state,
+            invited_by,
+            last_event_id,
+        ),
+    )?;
+    Ok(())
+}
+
 pub fn remove_chat_member(conn: &Connection, chat_id: &str, peer_id: &str) -> anyhow::Result<()> {
     conn.execute(
         "DELETE FROM chat_peers WHERE chat_id = ?1 AND peer_id = ?2",
@@ -970,9 +1002,9 @@ pub fn get_group_records_for_sync(
          FROM group_records
          WHERE group_id = ?1 AND verified = 1
          ORDER BY timestamp ASC
-         LIMIT ?2",
+        ",
     )?;
-    let rows = stmt.query_map((group_id, limit as i64), |row| {
+    let rows = stmt.query_map([group_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     let exclude: HashSet<&str> = exclude_ids.iter().map(String::as_str).collect();
@@ -983,6 +1015,9 @@ pub fn get_group_records_for_sync(
             continue;
         }
         out.push(serde_json::from_str(&json)?);
+        if out.len() >= limit {
+            break;
+        }
     }
     Ok(out)
 }
@@ -1067,8 +1102,16 @@ pub fn upsert_group_message_receipt(
         "INSERT INTO group_message_receipts (message_id, group_id, peer_id, status, timestamp)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(message_id, peer_id) DO UPDATE SET
-             status = excluded.status,
-             timestamp = excluded.timestamp",
+             status = CASE
+                 WHEN group_message_receipts.status = 'read' AND excluded.status = 'delivered'
+                 THEN group_message_receipts.status
+                 ELSE excluded.status
+             END,
+             timestamp = CASE
+                 WHEN group_message_receipts.status = 'read' AND excluded.status = 'delivered'
+                 THEN group_message_receipts.timestamp
+                 ELSE excluded.timestamp
+             END",
         (message_id, group_id, peer_id, status, timestamp),
     )?;
     Ok(())
@@ -1765,6 +1808,27 @@ pub fn delete_sticker(conn: &Connection, file_hash: &str) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::gossip::{GroupRecordBody, SignedGroupRecord};
+    use libp2p::identity;
+
+    fn signed_group_record(
+        keypair: &identity::Keypair,
+        group_id: &str,
+        id: &str,
+        timestamp: i64,
+    ) -> SignedGroupRecord {
+        SignedGroupRecord::new(
+            keypair,
+            group_id.to_string(),
+            id.to_string(),
+            timestamp,
+            Vec::new(),
+            GroupRecordBody::Head {
+                heads: vec![id.to_string()],
+            },
+        )
+        .expect("signed group record")
+    }
 
     #[test]
     fn legacy_general_rows_are_removed() {
@@ -1834,6 +1898,31 @@ mod tests {
         assert_eq!(second.first_connected_at, Some(10));
         assert_eq!(second.last_connected_at, Some(20));
         assert_eq!(second.reconnect_count, 1);
+    }
+
+    #[test]
+    fn group_sync_filters_known_records_before_applying_limit() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        let keypair = identity::Keypair::generate_ed25519();
+        let group_id = "group:test-sync-window";
+        let first = signed_group_record(&keypair, group_id, "record-1", 1);
+        let second = signed_group_record(&keypair, group_id, "record-2", 2);
+        let third = signed_group_record(&keypair, group_id, "record-3", 3);
+        insert_group_record(&conn, &first, true, false).expect("insert first");
+        insert_group_record(&conn, &second, true, false).expect("insert second");
+        insert_group_record(&conn, &third, true, false).expect("insert third");
+
+        let records = get_group_records_for_sync(
+            &conn,
+            group_id,
+            &[first.id().to_string(), second.id().to_string()],
+            1,
+        )
+        .expect("sync records");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id(), third.id());
     }
 
     #[test]

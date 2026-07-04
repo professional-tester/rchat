@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Context};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use libp2p::{identity, PeerId};
+use rusqlite::OptionalExtension;
 
 use crate::{
     chat_kind,
@@ -12,6 +15,7 @@ use crate::{
         command::NetworkCommand,
         gossip::{
             GroupContentType, GroupInvitePayload, GroupReceiptStatus, GroupRecordBody,
+            GroupSettings,
             SignedGroupRecord,
         },
     },
@@ -23,6 +27,20 @@ use crate::{
 pub struct GroupChatResult {
     pub chat_id: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupPolicy {
+    pub admin_peer_id: String,
+    pub settings: GroupSettings,
+    pub active_members: HashSet<String>,
+    pub invited_members: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordDisposition {
+    Apply,
+    PendingDependency,
 }
 
 pub async fn create_group(
@@ -41,6 +59,7 @@ pub async fn create_group(
         group_id.clone(),
         GroupRecordBody::GroupCreated {
             name: resolved_name.clone(),
+            settings: None,
         },
     )?;
 
@@ -73,41 +92,72 @@ pub async fn join_group_legacy(
     group_id: String,
     name: Option<String>,
 ) -> anyhow::Result<GroupChatResult> {
-    if !chat_kind::is_group_chat_id(&group_id) {
-        return Err(anyhow!("Invalid group id. Expected format group:<uuid>"));
-    }
-    let resolved_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| chat_kind::default_group_name(&group_id));
+    let _ = (app_state, network_state, group_id, name);
+    Err(anyhow!(
+        "Groups are invite-gated; accept an invite instead."
+    ))
+}
 
-    {
-        let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        db::upsert_chat(&conn, &group_id, &resolved_name, true)?;
-        db::add_chat_member(&conn, &group_id, "Me", "member")?;
+pub fn get_group_policy(app_state: &AppState, group_id: &str) -> anyhow::Result<GroupPolicy> {
+    let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+    let records = db::get_group_records_for_sync(&conn, group_id, &[], 10_000)?;
+    derive_group_policy(&records).ok_or_else(|| anyhow!("Group has no valid founder record"))
+}
+
+pub fn can_peer_sync_group_records(
+    app_state: &AppState,
+    group_id: &str,
+    peer_id: &str,
+) -> anyhow::Result<bool> {
+    let policy = get_group_policy(app_state, group_id)?;
+    Ok(policy.active_members.contains(peer_id))
+}
+
+pub async fn update_group_settings(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    group_id: String,
+    settings: GroupSettings,
+) -> anyhow::Result<()> {
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, &group_id)?;
+    if policy.admin_peer_id != local_peer_id {
+        return Err(anyhow!("Only the group admin can update group settings"));
     }
 
-    if let Some(network_state) = network_state {
-        send_network_command(
-            network_state,
-            NetworkCommand::SubscribeGroup {
-                group_id: group_id.clone(),
-            },
-        )
-        .await?;
-        send_network_command(
-            network_state,
-            NetworkCommand::SyncGroup {
-                group_id: group_id.clone(),
-            },
-        )
-        .await?;
+    let record = sign_record(
+        &keypair,
+        group_id,
+        GroupRecordBody::GroupSettingsUpdated { settings },
+    )?;
+    apply_signed_record(app_state, None, &record, true)?;
+    send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await
+}
+
+pub async fn remove_member(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    group_id: String,
+    peer_id: String,
+) -> anyhow::Result<()> {
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, &group_id)?;
+    if policy.admin_peer_id != local_peer_id {
+        return Err(anyhow!("Only the group admin can remove members"));
+    }
+    if peer_id == policy.admin_peer_id {
+        return Err(anyhow!("Admin removal is blocked until succession is implemented"));
     }
 
-    Ok(GroupChatResult {
-        chat_id: group_id,
-        name: resolved_name,
-    })
+    let record = sign_record(
+        &keypair,
+        group_id,
+        GroupRecordBody::MemberRemoved { peer_id },
+    )?;
+    apply_signed_record(app_state, None, &record, true)?;
+    send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await
 }
 
 pub async fn invite_member(
@@ -122,6 +172,10 @@ pub async fn invite_member(
 
     let keypair = load_or_create_local_keypair(app_state).await?;
     let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, &group_id)?;
+    if !can_invite(&policy, &local_peer_id) {
+        return Err(anyhow!("Only the group admin can invite members"));
+    }
     let (group_name, related_records) = {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         let group_name = db::get_chat_list(&conn)?
@@ -193,6 +247,12 @@ pub async fn accept_invite(
         return Err(anyhow!("Group invite signature could not be verified"));
     }
 
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    if invite.invitee_peer_id != local_peer_id {
+        return Err(anyhow!("Group invite was not addressed to this peer"));
+    }
+
     for record in invite
         .related_records
         .iter()
@@ -201,7 +261,6 @@ pub async fn accept_invite(
         apply_signed_record(app_state, None, record, true)?;
     }
 
-    let keypair = load_or_create_local_keypair(app_state).await?;
     let joined_record = sign_record(
         &keypair,
         invite.group_id.clone(),
@@ -253,11 +312,16 @@ pub async fn leave_group(
     group_id: String,
 ) -> anyhow::Result<()> {
     let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, &group_id)?;
+    if policy.admin_peer_id == local_peer_id {
+        return Err(anyhow!("Admin leave is blocked until succession is implemented"));
+    }
     let record = sign_record(
         &keypair,
         group_id.clone(),
         GroupRecordBody::MemberLeft {
-            peer_id: PeerId::from_public_key(&keypair.public()).to_string(),
+            peer_id: local_peer_id,
         },
     )?;
     {
@@ -288,6 +352,11 @@ pub async fn rename_group(
         return Err(anyhow!("Group name cannot be empty"));
     }
     let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, &group_id)?;
+    if policy.admin_peer_id != local_peer_id {
+        return Err(anyhow!("Only the group admin can rename the group"));
+    }
     let record = sign_record(
         &keypair,
         group_id.clone(),
@@ -358,17 +427,294 @@ pub async fn mark_read(
     if message_ids.is_empty() {
         return Ok(());
     }
-    let keypair = load_or_create_local_keypair(app_state).await?;
-    let record = sign_record(
-        &keypair,
+    let record = create_receipt_record(
+        app_state,
         group_id.clone(),
-        GroupRecordBody::Receipt {
-            message_ids,
-            status: GroupReceiptStatus::Read,
-        },
-    )?;
+        message_ids,
+        GroupReceiptStatus::Read,
+    )
+    .await?;
     apply_signed_record(app_state, None, &record, true)?;
     send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await
+}
+
+pub async fn create_receipt_record(
+    app_state: &AppState,
+    group_id: String,
+    message_ids: Vec<String>,
+    status: GroupReceiptStatus,
+) -> anyhow::Result<SignedGroupRecord> {
+    if message_ids.is_empty() {
+        return Err(anyhow!("Group receipt requires at least one message id"));
+    }
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    sign_record(
+        &keypair,
+        group_id,
+        GroupRecordBody::Receipt {
+            message_ids,
+            status,
+        },
+    )
+}
+
+fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
+    let mut ordered = records.to_vec();
+    ordered.sort_by(|a, b| {
+        a.timestamp()
+            .cmp(&b.timestamp())
+            .then_with(|| a.id().cmp(b.id()))
+    });
+
+    let mut admin_peer_id = None;
+    let mut settings = GroupSettings::default();
+    let mut active_members = HashSet::new();
+    let mut invited_members = HashSet::new();
+
+    for record in ordered {
+        match record.body() {
+            GroupRecordBody::GroupCreated {
+                settings: group_settings,
+                ..
+            } => {
+                if admin_peer_id.is_none() {
+                    let author = record.author_peer_id().to_string();
+                    admin_peer_id = Some(author.clone());
+                    active_members.insert(author);
+                    settings = group_settings.clone().unwrap_or_default();
+                }
+            }
+            GroupRecordBody::MemberInvited { peer_id, .. } => {
+                if let Some(admin) = admin_peer_id.as_deref() {
+                    if record.author_peer_id() == admin
+                        || (settings.members_can_invite
+                            && active_members.contains(record.author_peer_id()))
+                    {
+                        invited_members.insert(peer_id.clone());
+                    }
+                }
+            }
+            GroupRecordBody::MemberJoined { peer_id } => {
+                if record.author_peer_id() == peer_id && invited_members.contains(peer_id) {
+                    active_members.insert(peer_id.clone());
+                    invited_members.remove(peer_id);
+                }
+            }
+            GroupRecordBody::MemberLeft { peer_id } => {
+                if record.author_peer_id() == peer_id
+                    && Some(peer_id.as_str()) != admin_peer_id.as_deref()
+                {
+                    active_members.remove(peer_id);
+                    invited_members.remove(peer_id);
+                }
+            }
+            GroupRecordBody::MemberRemoved { peer_id } => {
+                if Some(record.author_peer_id()) == admin_peer_id.as_deref()
+                    && Some(peer_id.as_str()) != admin_peer_id.as_deref()
+                {
+                    active_members.remove(peer_id);
+                    invited_members.remove(peer_id);
+                }
+            }
+            GroupRecordBody::GroupSettingsUpdated {
+                settings: updated_settings,
+            } => {
+                if Some(record.author_peer_id()) == admin_peer_id.as_deref() {
+                    settings = updated_settings.clone();
+                }
+            }
+            GroupRecordBody::GroupRenamed { .. }
+            | GroupRecordBody::Message { .. }
+            | GroupRecordBody::Receipt { .. }
+            | GroupRecordBody::Head { .. }
+            | GroupRecordBody::FileAvailability { .. } => {}
+        }
+    }
+
+    admin_peer_id.map(|admin_peer_id| GroupPolicy {
+        admin_peer_id,
+        settings,
+        active_members,
+        invited_members,
+    })
+}
+
+fn record_precedes(candidate: &SignedGroupRecord, existing: &SignedGroupRecord) -> bool {
+    existing.timestamp() < candidate.timestamp()
+        || (existing.timestamp() == candidate.timestamp() && existing.id() < candidate.id())
+}
+
+fn derive_group_policy_before(
+    records: &[SignedGroupRecord],
+    candidate: &SignedGroupRecord,
+) -> Option<GroupPolicy> {
+    let prior_records: Vec<SignedGroupRecord> = records
+        .iter()
+        .filter(|record| record_precedes(candidate, record))
+        .cloned()
+        .collect();
+    derive_group_policy(&prior_records)
+}
+
+fn can_invite(policy: &GroupPolicy, peer_id: &str) -> bool {
+    policy.admin_peer_id == peer_id
+        || (policy.settings.members_can_invite && policy.active_members.contains(peer_id))
+}
+
+fn group_record_state(
+    conn: &rusqlite::Connection,
+    record_id: &str,
+) -> anyhow::Result<Option<(bool, bool)>> {
+    conn.query_row(
+        "SELECT verified, pending FROM group_records WHERE id = ?1",
+        [record_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn mark_group_record_verified(
+    conn: &rusqlite::Connection,
+    record_id: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE group_records SET verified = 1, pending = 0 WHERE id = ?1",
+        [record_id],
+    )?;
+    Ok(())
+}
+
+fn pending_group_records(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+) -> anyhow::Result<Vec<SignedGroupRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT payload_json FROM group_records
+         WHERE group_id = ?1 AND pending = 1
+         ORDER BY timestamp ASC",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(serde_json::from_str(&row?)?);
+    }
+    Ok(records)
+}
+
+fn validate_group_record(
+    conn: &rusqlite::Connection,
+    record: &SignedGroupRecord,
+) -> anyhow::Result<RecordDisposition> {
+    let existing_records = db::get_group_records_for_sync(conn, record.group_id(), &[], 10_000)?;
+    let current_policy = derive_group_policy(&existing_records);
+    let policy_before_record = derive_group_policy_before(&existing_records, record);
+
+    match record.body() {
+        GroupRecordBody::GroupCreated { .. } => {
+            if current_policy.is_some() {
+                return Err(anyhow!("Group already has a founder record"));
+            }
+            Ok(RecordDisposition::Apply)
+        }
+        GroupRecordBody::MemberInvited { .. } => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if can_invite(&policy, record.author_peer_id()) {
+                Ok(RecordDisposition::Apply)
+            } else if policy.active_members.contains(record.author_peer_id()) {
+                Err(anyhow!("Members cannot invite unless group settings allow it"))
+            } else {
+                Ok(RecordDisposition::PendingDependency)
+            }
+        }
+        GroupRecordBody::MemberJoined { peer_id } => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if record.author_peer_id() != peer_id {
+                return Err(anyhow!("MemberJoined author must match joined peer"));
+            }
+            if policy.invited_members.contains(peer_id) {
+                Ok(RecordDisposition::Apply)
+            } else {
+                Ok(RecordDisposition::PendingDependency)
+            }
+        }
+        GroupRecordBody::MemberLeft { peer_id } => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if record.author_peer_id() != peer_id {
+                return Err(anyhow!("Members can only leave for themselves"));
+            }
+            if policy.admin_peer_id == *peer_id {
+                return Err(anyhow!(
+                    "Admin leave is blocked until succession is implemented"
+                ));
+            }
+            if policy.active_members.contains(peer_id) {
+                Ok(RecordDisposition::Apply)
+            } else {
+                Ok(RecordDisposition::PendingDependency)
+            }
+        }
+        GroupRecordBody::GroupRenamed { .. }
+        | GroupRecordBody::GroupSettingsUpdated { .. }
+        | GroupRecordBody::MemberRemoved { .. } => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if policy.admin_peer_id != record.author_peer_id() {
+                return Err(anyhow!("Only the group admin can apply this record"));
+            }
+            if let GroupRecordBody::MemberRemoved { peer_id } = record.body() {
+                if policy.admin_peer_id == *peer_id {
+                    return Err(anyhow!(
+                        "Admin removal is blocked until succession is implemented"
+                    ));
+                }
+            }
+            Ok(RecordDisposition::Apply)
+        }
+        GroupRecordBody::Message { .. }
+        | GroupRecordBody::Receipt { .. }
+        | GroupRecordBody::Head { .. }
+        | GroupRecordBody::FileAvailability { .. } => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if policy.active_members.contains(record.author_peer_id()) {
+                Ok(RecordDisposition::Apply)
+            } else {
+                Ok(RecordDisposition::PendingDependency)
+            }
+        }
+    }
+}
+
+fn retry_pending_group_records(
+    app_state: &AppState,
+    event_sink: Option<&SharedCoreEventSink>,
+    group_id: &str,
+) {
+    let pending = {
+        let Ok(conn) = app_state.db_conn.lock() else {
+            return;
+        };
+        pending_group_records(&conn, group_id).unwrap_or_default()
+    };
+
+    for record in pending {
+        if let Err(err) = apply_signed_record(app_state, event_sink, &record, true) {
+            eprintln!(
+                "[Group] Failed to retry pending record {}: {}",
+                record.id(),
+                err
+            );
+        }
+    }
 }
 
 pub fn apply_signed_record(
@@ -383,19 +729,48 @@ pub fn apply_signed_record(
     let record_applied;
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        if db::group_record_exists(&conn, record.id()) {
+        if !verified {
+            if db::group_record_exists(&conn, record.id()) {
+                return Ok(false);
+            }
+            return db::insert_group_record(&conn, record, false, true);
+        }
+
+        let existing_state = group_record_state(&conn, record.id())?;
+        if let Some((_, false)) = existing_state {
             return Ok(false);
         }
-        record_applied = db::insert_group_record(&conn, record, verified, !verified)?;
-        if !verified {
-            return Ok(record_applied);
+
+        match validate_group_record(&conn, record)? {
+            RecordDisposition::Apply => {
+                if existing_state.is_some() {
+                    mark_group_record_verified(&conn, record.id())?;
+                    record_applied = true;
+                } else {
+                    record_applied = db::insert_group_record(&conn, record, true, false)?;
+                }
+            }
+            RecordDisposition::PendingDependency => {
+                if existing_state.is_none() {
+                    let _ = db::insert_group_record(&conn, record, false, true)?;
+                }
+                return Ok(false);
+            }
         }
 
         match record.body() {
-            GroupRecordBody::GroupCreated { name } => {
+            GroupRecordBody::GroupCreated { name, .. } => {
                 db::upsert_chat(&conn, record.group_id(), name, true)?;
                 ensure_peer(&conn, record.author_peer_id(), "group")?;
-                db::add_chat_member(&conn, record.group_id(), record.author_peer_id(), "admin")?;
+                db::upsert_chat_member_state(
+                    &conn,
+                    record.group_id(),
+                    record.author_peer_id(),
+                    "admin",
+                    "joined",
+                    None,
+                    Some(record.id()),
+                )?;
                 roster_event = Some(GroupRosterUpdatedEvent {
                     group_id: record.group_id().to_string(),
                     peer_id: record.author_peer_id().to_string(),
@@ -404,7 +779,15 @@ pub fn apply_signed_record(
             }
             GroupRecordBody::MemberInvited { peer_id, role } => {
                 ensure_peer(&conn, peer_id, "group")?;
-                db::add_chat_member(&conn, record.group_id(), peer_id, role)?;
+                db::upsert_chat_member_state(
+                    &conn,
+                    record.group_id(),
+                    peer_id,
+                    role,
+                    "invited",
+                    Some(record.author_peer_id()),
+                    Some(record.id()),
+                )?;
                 roster_event = Some(GroupRosterUpdatedEvent {
                     group_id: record.group_id().to_string(),
                     peer_id: peer_id.clone(),
@@ -413,7 +796,15 @@ pub fn apply_signed_record(
             }
             GroupRecordBody::MemberJoined { peer_id } => {
                 ensure_peer(&conn, peer_id, "group")?;
-                db::add_chat_member(&conn, record.group_id(), peer_id, "member")?;
+                db::upsert_chat_member_state(
+                    &conn,
+                    record.group_id(),
+                    peer_id,
+                    "member",
+                    "joined",
+                    None,
+                    Some(record.id()),
+                )?;
                 roster_event = Some(GroupRosterUpdatedEvent {
                     group_id: record.group_id().to_string(),
                     peer_id: peer_id.clone(),
@@ -430,6 +821,15 @@ pub fn apply_signed_record(
             }
             GroupRecordBody::GroupRenamed { name } => {
                 db::upsert_chat(&conn, record.group_id(), name, true)?;
+            }
+            GroupRecordBody::GroupSettingsUpdated { .. } => {}
+            GroupRecordBody::MemberRemoved { peer_id } => {
+                let _ = db::remove_chat_member(&conn, record.group_id(), peer_id);
+                roster_event = Some(GroupRosterUpdatedEvent {
+                    group_id: record.group_id().to_string(),
+                    peer_id: peer_id.clone(),
+                    membership_state: "removed".to_string(),
+                });
             }
             GroupRecordBody::Message {
                 content_type,
@@ -451,8 +851,24 @@ pub fn apply_signed_record(
                     &chat_kind::default_group_name(record.group_id()),
                     true,
                 )?;
-                db::add_chat_member(&conn, record.group_id(), "Me", "member")?;
-                db::add_chat_member(&conn, record.group_id(), record.author_peer_id(), "member")?;
+                db::upsert_chat_member_state(
+                    &conn,
+                    record.group_id(),
+                    "Me",
+                    "member",
+                    "joined",
+                    None,
+                    None,
+                )?;
+                db::upsert_chat_member_state(
+                    &conn,
+                    record.group_id(),
+                    record.author_peer_id(),
+                    "member",
+                    "joined",
+                    None,
+                    None,
+                )?;
                 if let Some(file_hash) = file_hash {
                     ensure_incomplete_file_row(&conn, file_hash)?;
                     db::upsert_group_file_source(&conn, record.group_id(), file_hash, record.author_peer_id())?;
@@ -520,6 +936,10 @@ pub fn apply_signed_record(
         }
     }
 
+    if record_applied {
+        retry_pending_group_records(app_state, event_sink, record.group_id());
+    }
+
     Ok(record_applied)
 }
 
@@ -558,6 +978,12 @@ async fn send_group_message_record(
     sender_alias: Option<String>,
 ) -> anyhow::Result<String> {
     let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    if let Ok(policy) = get_group_policy(app_state, &group_id) {
+        if !policy.active_members.contains(&local_peer_id) {
+            return Err(anyhow!("Only active group members can send group messages"));
+        }
+    }
     let record = sign_record(
         &keypair,
         group_id.clone(),
@@ -717,13 +1143,623 @@ fn ensure_incomplete_file_row(conn: &rusqlite::Connection, file_hash: &str) -> a
 mod tests {
     use super::*;
 
+    fn app_state() -> AppState {
+        let temp = tempfile::tempdir().expect("temp");
+        crate::runtime::create_app_state(temp.path().to_path_buf()).expect("app state")
+    }
+
+    fn keypair() -> identity::Keypair {
+        identity::Keypair::generate_ed25519()
+    }
+
+    fn peer_id(keypair: &identity::Keypair) -> String {
+        PeerId::from_public_key(&keypair.public()).to_string()
+    }
+
+    fn signed(
+        keypair: &identity::Keypair,
+        group_id: &str,
+        id: &str,
+        timestamp: i64,
+        body: GroupRecordBody,
+    ) -> SignedGroupRecord {
+        SignedGroupRecord::new(
+            keypair,
+            group_id.to_string(),
+            format!("test-{id}-{}", rand::random::<u64>()),
+            timestamp,
+            Vec::new(),
+            body,
+        )
+        .expect("record")
+    }
+
+    fn apply(app_state: &AppState, record: &SignedGroupRecord) -> anyhow::Result<bool> {
+        apply_signed_record(app_state, None, record, true)
+    }
+
     #[test]
     fn invite_gated_join_requires_existing_invite_payload() {
-        let temp = tempfile::tempdir().expect("temp");
-        let app_state = crate::runtime::create_app_state(temp.path().to_path_buf())
-            .expect("app state");
+        let app_state = app_state();
         let conn = app_state.db_conn.lock().expect("db");
         let missing = db::get_group_invite_payload(&conn, "missing").expect("query");
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn default_group_policy_makes_founder_admin_and_disables_member_invites() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let created = signed(
+            &founder,
+            &group_id,
+            "created",
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+            },
+        );
+
+        assert!(apply(&app_state, &created).expect("apply"));
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert_eq!(policy.admin_peer_id, peer_id(&founder));
+        assert!(!policy.settings.members_can_invite);
+    }
+
+    #[test]
+    fn non_admin_rename_is_rejected() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                2,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("invite");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("joined");
+
+        let result = apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "bad-rename",
+                4,
+                GroupRecordBody::GroupRenamed {
+                    name: "Owned".to_string(),
+                },
+            ),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn member_join_without_invite_is_pending_not_applied() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+
+        let joined = signed(
+            &member,
+            &group_id,
+            "member-joined",
+            2,
+            GroupRecordBody::MemberJoined {
+                peer_id: peer_id(&member),
+            },
+        );
+
+        assert!(!apply(&app_state, &joined).expect("pending"));
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(!policy.active_members.contains(&peer_id(&member)));
+    }
+
+    #[test]
+    fn member_invite_is_accepted_when_setting_allows_it() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let invited_by_member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: Some(GroupSettings {
+                        members_can_invite: true,
+                    }),
+                },
+            ),
+        )
+        .expect("created");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                2,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("founder invite");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("member joined");
+
+        assert!(apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-invite",
+                4,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&invited_by_member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("member invite"));
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(policy
+            .invited_members
+            .contains(&peer_id(&invited_by_member)));
+    }
+
+    #[test]
+    fn pending_join_applies_after_required_invite_arrives() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+        assert!(!apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                4,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("pending join"));
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                3,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("invite");
+
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(policy.active_members.contains(&peer_id(&member)));
+    }
+
+    #[test]
+    fn pre_join_message_remains_pending_after_member_later_joins() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let message = signed(
+            &member,
+            &group_id,
+            "pre-join-message",
+            2,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("too early".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        );
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+        assert!(!apply(&app_state, &message).expect("pending message"));
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                3,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("invite");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                4,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("joined");
+
+        let conn = app_state.db_conn.lock().expect("db");
+        assert_eq!(
+            group_record_state(&conn, message.id()).expect("state"),
+            Some((false, true))
+        );
+        let inserted: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+                [message.id()],
+                |row| row.get(0),
+            )
+            .expect("message exists query");
+        assert!(!inserted);
+    }
+
+    #[test]
+    fn only_active_members_can_sync_group_records() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let outsider = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                2,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("invite");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("joined");
+
+        assert!(can_peer_sync_group_records(&app_state, &group_id, &peer_id(&founder))
+            .expect("founder sync"));
+        assert!(can_peer_sync_group_records(&app_state, &group_id, &peer_id(&member))
+            .expect("member sync"));
+        assert!(!can_peer_sync_group_records(&app_state, &group_id, &peer_id(&outsider))
+            .expect("outsider sync"));
+    }
+
+    #[test]
+    fn admin_leave_is_blocked_until_succession_exists() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+
+        let result = apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "admin-left",
+                2,
+                GroupRecordBody::MemberLeft {
+                    peer_id: peer_id(&founder),
+                },
+            ),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn admin_member_removed_record_removes_active_member() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                2,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("invite");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("joined");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "member-removed",
+                4,
+                GroupRecordBody::MemberRemoved {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("removed");
+
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(!policy.active_members.contains(&peer_id(&member)));
+    }
+
+    #[test]
+    fn delivered_receipt_does_not_downgrade_read() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let message_id = "message-1".to_string();
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(),
+                    settings: None,
+                },
+            ),
+        )
+        .expect("created");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "invite-member",
+                2,
+                GroupRecordBody::MemberInvited {
+                    peer_id: peer_id(&member),
+                    role: "member".to_string(),
+                },
+            ),
+        )
+        .expect("invite");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "member-joined",
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            ),
+        )
+        .expect("joined");
+
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "read-receipt",
+                4,
+                GroupRecordBody::Receipt {
+                    message_ids: vec![message_id.clone()],
+                    status: GroupReceiptStatus::Read,
+                },
+            ),
+        )
+        .expect("read");
+        apply(
+            &app_state,
+            &signed(
+                &member,
+                &group_id,
+                "delivered-receipt",
+                5,
+                GroupRecordBody::Receipt {
+                    message_ids: vec![message_id.clone()],
+                    status: GroupReceiptStatus::Delivered,
+                },
+            ),
+        )
+        .expect("delivered");
+
+        let conn = app_state.db_conn.lock().expect("db");
+        let stored: String = conn
+            .query_row(
+                "SELECT status FROM group_message_receipts WHERE message_id = ?1 AND peer_id = ?2",
+                (&message_id, peer_id(&member)),
+                |row| row.get(0),
+            )
+            .expect("receipt");
+        assert_eq!(stored, "read");
     }
 }

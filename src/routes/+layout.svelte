@@ -11,7 +11,7 @@
   import {
     type ConnectivityMode,
   } from "$lib/tauri/api";
-  import { defaultGroupName, getChatKind } from "$lib/chatKind";
+  import { getChatKind } from "$lib/chatKind";
   import {
     appSession,
     applyConnectivitySettings,
@@ -24,7 +24,6 @@
     deleteEnvelope,
     ensureAppReady,
     initAppSession,
-    joinGroup,
     liveActions,
     liveState,
     markChatRead,
@@ -468,17 +467,6 @@
     }
   }
 
-  async function handleJoinGroup(chatId: string, name: string) {
-    try {
-      const fallback = name || defaultGroupName(chatId);
-      const result = await joinGroup(chatId, fallback);
-      showNewGroupModal = false;
-      goto(`/chat/${result.chat_id}`);
-    } catch (e) {
-      console.error("Join group failed:", e);
-    }
-  }
-
   async function handleTempGroupJoin(chatId: string, _name: string) {
     try {
       showNewGroupModal = false;
@@ -641,7 +629,6 @@
         show={showNewGroupModal}
         onclose={() => (showNewGroupModal = false)}
         oncreate={handleCreateGroup}
-        onjoin={handleJoinGroup}
         ontempjoin={handleTempGroupJoin}
       />
 

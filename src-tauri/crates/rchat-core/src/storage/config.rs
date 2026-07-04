@@ -105,11 +105,18 @@ impl ConnectivitySettings {
     }
 
     pub fn derive_mode(&self) -> ConnectivityMode {
-        if *self == Self::invisible() {
+        let same_flags = |other: Self| {
+            self.mdns_enabled == other.mdns_enabled
+                && self.github_sync_enabled == other.github_sync_enabled
+                && self.nat_keepalive_enabled == other.nat_keepalive_enabled
+                && self.punch_assist_enabled == other.punch_assist_enabled
+        };
+
+        if same_flags(Self::invisible()) {
             ConnectivityMode::Invisible
-        } else if *self == Self::lan() {
+        } else if same_flags(Self::lan()) {
             ConnectivityMode::Lan
-        } else if *self == Self::reachable() {
+        } else if same_flags(Self::reachable()) {
             ConnectivityMode::Reachable
         } else {
             ConnectivityMode::Custom

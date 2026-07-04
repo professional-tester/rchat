@@ -74,6 +74,10 @@ pub enum NetworkCommand {
         msg_id: String,
         timestamp: i64,
     },
+    RequestDirectFileMetadata {
+        target_peer_id: String,
+        file_hash: String,
+    },
     StartVoiceCall {
         peer_id: String,
     },

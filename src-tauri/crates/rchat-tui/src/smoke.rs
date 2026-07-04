@@ -30,9 +30,16 @@ impl SmokeFrameGenerator {
                 let dx = (x - marker_x).abs();
                 let dy = (y - marker_y).abs();
                 let active = dx < 24 && dy < 24;
-                rgba[index] = if active { 255 } else { ((x * 255) / self.width as i32) as u8 };
-                rgba[index + 1] =
-                    if active { 80 } else { ((y * 255) / self.height as i32) as u8 };
+                rgba[index] = if active {
+                    255
+                } else {
+                    ((x * 255) / self.width as i32) as u8
+                };
+                rgba[index + 1] = if active {
+                    80
+                } else {
+                    ((y * 255) / self.height as i32) as u8
+                };
                 rgba[index + 2] = if active { 40 } else { 110 };
                 rgba[index + 3] = 255;
             }

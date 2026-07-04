@@ -3,7 +3,7 @@ use tauri::{Manager, State};
 use crate::chat;
 use crate::chat_kind::{self, ChatKind};
 use crate::network::command::NetworkCommand;
-use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
+use crate::network::gossip::{GroupContentType, GroupMessageEnvelope, GroupSettings};
 use crate::storage;
 use crate::{AppState, NetworkState};
 
@@ -80,6 +80,16 @@ pub struct GroupChatResult {
 pub struct ArchivedChatResult {
     pub chat_id: String,
     pub name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct GroupPolicyResult {
+    pub admin_peer_id: String,
+    pub local_peer_id: String,
+    pub is_admin: bool,
+    pub members_can_invite: bool,
+    pub active_members: Vec<String>,
+    pub invited_members: Vec<String>,
 }
 
 #[tauri::command]
@@ -281,6 +291,60 @@ pub async fn invite_group_member(
     net_state: State<'_, NetworkState>,
 ) -> Result<String, String> {
     crate::chat::group::invite_member(&state, &net_state, group_id, peer_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_group_policy(
+    group_id: String,
+    state: State<'_, AppState>,
+) -> Result<GroupPolicyResult, String> {
+    let policy =
+        crate::chat::group::get_group_policy(&state, &group_id).map_err(|e| e.to_string())?;
+    let keypair = crate::chat::group::load_or_create_local_keypair(&state)
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_peer_id = libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+    let mut active_members: Vec<String> = policy.active_members.into_iter().collect();
+    let mut invited_members: Vec<String> = policy.invited_members.into_iter().collect();
+    active_members.sort();
+    invited_members.sort();
+    Ok(GroupPolicyResult {
+        is_admin: policy.admin_peer_id == local_peer_id,
+        admin_peer_id: policy.admin_peer_id,
+        local_peer_id,
+        members_can_invite: policy.settings.members_can_invite,
+        active_members,
+        invited_members,
+    })
+}
+
+#[tauri::command]
+pub async fn update_group_settings(
+    group_id: String,
+    members_can_invite: bool,
+    state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    crate::chat::group::update_group_settings(
+        &state,
+        &net_state,
+        group_id,
+        GroupSettings { members_can_invite },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn remove_group_member(
+    group_id: String,
+    peer_id: String,
+    state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    crate::chat::group::remove_member(&state, &net_state, group_id, peer_id)
         .await
         .map_err(|e| e.to_string())
 }

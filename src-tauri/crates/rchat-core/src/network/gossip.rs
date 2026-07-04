@@ -81,10 +81,26 @@ impl GroupReceiptStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupSettings {
+    #[serde(default)]
+    pub members_can_invite: bool,
+}
+
+impl Default for GroupSettings {
+    fn default() -> Self {
+        Self {
+            members_can_invite: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 pub enum GroupRecordBody {
     GroupCreated {
         name: String,
+        #[serde(default)]
+        settings: Option<GroupSettings>,
     },
     MemberInvited {
         peer_id: String,
@@ -98,6 +114,12 @@ pub enum GroupRecordBody {
     },
     GroupRenamed {
         name: String,
+    },
+    GroupSettingsUpdated {
+        settings: GroupSettings,
+    },
+    MemberRemoved {
+        peer_id: String,
     },
     Message {
         content_type: GroupContentType,
@@ -128,6 +150,8 @@ impl GroupRecordBody {
             Self::MemberJoined { .. } => "member_joined",
             Self::MemberLeft { .. } => "member_left",
             Self::GroupRenamed { .. } => "group_renamed",
+            Self::GroupSettingsUpdated { .. } => "group_settings_updated",
+            Self::MemberRemoved { .. } => "member_removed",
             Self::Message { .. } => "message",
             Self::Receipt { .. } => "receipt",
             Self::Head { .. } => "head",
@@ -321,6 +345,7 @@ mod tests {
             Vec::new(),
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
+                settings: None,
             },
         )
         .expect("sign");

@@ -1,20 +1,17 @@
 <script lang="ts">
   import { fade } from "svelte/transition";
-  import { isGroupChatId, isTemporaryGroupChatId } from "$lib/chatKind";
+  import { isTemporaryGroupChatId } from "$lib/chatKind";
   import { api } from "$lib/tauri/api";
 
   let {
     show = false,
     onclose = () => {},
     oncreate = (_name: string) => {},
-    onjoin = (_chatId: string, _name: string) => {},
     ontempjoin = (_chatId: string, _name: string) => {},
   } = $props();
 
-  let mode = $state<"create" | "join" | "temp-create" | "temp-redeem">("create");
+  let mode = $state<"create" | "temp-create" | "temp-redeem">("create");
   let createName = $state("");
-  let joinId = $state("");
-  let joinName = $state("");
   let tempGroupName = $state("");
   let tempInviteLink = $state("");
   let tempRedeemLink = $state("");
@@ -43,8 +40,6 @@
   function reset() {
     mode = "create";
     createName = "";
-    joinId = "";
-    joinName = "";
     tempGroupName = "";
     tempInviteLink = "";
     tempRedeemLink = "";
@@ -62,25 +57,6 @@
       reset();
     } catch (e: any) {
       error = e?.toString?.() || "Failed to create group";
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function submitJoin() {
-    if (busy) return;
-    const id = joinId.trim();
-    if (!isGroupChatId(id)) {
-      error = "Use a valid group id: group:<uuid>";
-      return;
-    }
-    busy = true;
-    error = null;
-    try {
-      await onjoin(id, joinName.trim());
-      reset();
-    } catch (e: any) {
-      error = e?.toString?.() || "Failed to join group";
     } finally {
       busy = false;
     }
@@ -201,15 +177,6 @@
           Create
         </button>
         <button
-          class={`px-3 py-2 rounded-lg text-sm transition-colors ${mode === "join" ? "bg-theme-base-700 text-white" : "bg-theme-base-800 text-theme-base-300 hover:text-white"}`}
-          onclick={() => {
-            mode = "join";
-            error = null;
-          }}
-        >
-          Join
-        </button>
-        <button
           class={`px-3 py-2 rounded-lg text-sm transition-colors ${mode === "temp-create" ? "bg-theme-base-700 text-white" : "bg-theme-base-800 text-theme-base-300 hover:text-white"}`}
           onclick={async () => {
             mode = "temp-create";
@@ -246,29 +213,6 @@
           <p class="text-xs text-theme-base-500">
             If empty, the app uses: <code>Group &lt;uuid-short&gt;</code>.
           </p>
-        </div>
-      {:else if mode === "join"}
-        <div class="space-y-3">
-          <label class="block text-xs text-theme-base-400 uppercase tracking-wide"
-            for="join-group-id">Group ID</label
-          >
-          <input
-            id="join-group-id"
-            type="text"
-            bind:value={joinId}
-            placeholder="group:550e8400-e29b-41d4-a716-446655440000"
-            class="w-full rounded-lg bg-theme-base-800 border border-theme-base-700 px-3 py-2 text-sm text-theme-base-100 focus:outline-none focus:border-theme-primary-500"
-          />
-          <label class="block text-xs text-theme-base-400 uppercase tracking-wide"
-            for="join-group-name">Local Display Name (optional)</label
-          >
-          <input
-            id="join-group-name"
-            type="text"
-            bind:value={joinName}
-            placeholder="Team Room"
-            class="w-full rounded-lg bg-theme-base-800 border border-theme-base-700 px-3 py-2 text-sm text-theme-base-100 focus:outline-none focus:border-theme-primary-500"
-          />
         </div>
       {:else if mode === "temp-create"}
         <div class="space-y-3">
@@ -350,11 +294,9 @@
           onclick={
             mode === "create"
               ? submitCreate
-              : mode === "join"
-                ? submitJoin
-                : mode === "temp-create"
-                  ? submitTempCreate
-                  : submitTempRedeem
+              : mode === "temp-create"
+                ? submitTempCreate
+                : submitTempRedeem
           }
           class="px-4 py-2 text-sm rounded-lg bg-theme-primary-600 hover:bg-theme-primary-500 text-white disabled:opacity-60"
           disabled={busy}
@@ -363,8 +305,6 @@
             Working...
           {:else if mode === "create"}
             Create Group
-          {:else if mode === "join"}
-            Join Group
           {:else if mode === "temp-create"}
             Create Temp Invite
           {:else}

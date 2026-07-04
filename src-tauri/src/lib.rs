@@ -2,7 +2,7 @@ mod commands;
 mod event_sink;
 
 pub use rchat_core::{
-    app_state, chat, chat_identity, chat_kind, live, network, oauth, storage, AppState,
+    app_state, chat, chat_identity, chat_kind, live, network, oauth, settings, storage, AppState,
     NetworkState,
 };
 
@@ -22,9 +22,10 @@ use crate::commands::call::{
 };
 use crate::commands::chat::{
     accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list,
-    get_unread_counts, invite_group_member, join_group_chat, leave_group_chat, mark_messages_read,
-    reject_group_invite, rename_group_chat, save_temporary_chat_to_archive, send_message,
-    send_message_to_self, sync_group_chat,
+    get_group_policy, get_unread_counts, invite_group_member, join_group_chat, leave_group_chat,
+    mark_messages_read, reject_group_invite, remove_group_member, rename_group_chat,
+    save_temporary_chat_to_archive, send_message, send_message_to_self, sync_group_chat,
+    update_group_settings,
 };
 use crate::commands::chat_details::{
     drop_chat_connection, force_chat_reconnect, get_chat_details_overview, get_chat_stats,
@@ -238,6 +239,9 @@ pub fn run() {
             join_group_chat,
             leave_group_chat,
             invite_group_member,
+            get_group_policy,
+            update_group_settings,
+            remove_group_member,
             accept_group_invite,
             reject_group_invite,
             rename_group_chat,

@@ -91,6 +91,45 @@ impl NetworkManager {
         }
     }
 
+    pub(in crate::network::manager) async fn publish_group_delivered_receipt(
+        &mut self,
+        group_id: &str,
+        message_id: &str,
+    ) {
+        let record = match crate::chat::group::create_receipt_record(
+            &self.app_state,
+            group_id.to_string(),
+            vec![message_id.to_string()],
+            crate::network::gossip::GroupReceiptStatus::Delivered,
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                eprintln!(
+                    "[Group] Failed to create delivered receipt for {}: {}",
+                    message_id, err
+                );
+                return;
+            }
+        };
+
+        match crate::chat::group::apply_signed_record(
+            &self.app_state,
+            Some(&self.event_sink),
+            &record,
+            true,
+        ) {
+            Ok(true) => self.publish_group_record(&record),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "[Group] Failed to apply delivered receipt {}: {}",
+                record.id(),
+                err
+            ),
+        }
+    }
+
     pub(super) async fn send_group_invite(
         &mut self,
         target_peer_id: String,

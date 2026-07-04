@@ -142,4 +142,47 @@ impl NetworkManager {
             println!("[{}] ✅ Direct request sent to {}", context, peer_id);
         }
     }
+
+    pub(super) async fn request_direct_file_metadata(
+        &mut self,
+        target_peer_id: String,
+        file_hash: String,
+    ) {
+        println!(
+            "[File] 📤 Retrying metadata request for {} from {}",
+            file_hash, target_peer_id
+        );
+
+        if let Some(peer_id) = self.resolve_peer_id(&target_peer_id, "FileRetry").await {
+            use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
+            let request = DirectMessageRequest {
+                id: format!(
+                    "file-metadata-retry-{}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    rand::random::<u32>()
+                ),
+                sender_id: self.swarm.local_peer_id().to_string(),
+                msg_type: DirectMessageKind::FileMetadataRequest,
+                text_content: None,
+                file_hash: Some(file_hash),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+                chunk_hash: None,
+                chunk_data: None,
+                chunk_list: None,
+                sender_alias: None,
+            };
+
+            self.swarm
+                .behaviour_mut()
+                .direct_message
+                .send_request(&peer_id, request);
+            println!("[File] ✅ Metadata retry sent to {}", peer_id);
+        }
+    }
 }

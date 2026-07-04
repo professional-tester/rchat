@@ -17,11 +17,12 @@
     type BroadcastChunkType,
     type BroadcastState,
     type VideoProfile,
-    type VideoQualityMode,
-    type VideoChunkType,
-    type SentMediaResult,
-    type VoiceCallState,
-  } from "$lib/tauri/api";
+	    type VideoQualityMode,
+	    type VideoChunkType,
+	    type SentMediaResult,
+	    type VoiceCallState,
+	    type GroupPolicy,
+	  } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
   import { presencePeerKey } from "$lib/stores/presence";
   import {
@@ -82,9 +83,58 @@
   export let message = "";
   export let showAttachments = false;
 
-  $: chatKind = getChatKind(activePeer);
-  $: isGroupChat = chatKind === "group";
-  $: isArchivedChat = chatKind === "archived";
+	  $: chatKind = getChatKind(activePeer);
+	  $: isGroupChat = chatKind === "group";
+	  $: isArchivedChat = chatKind === "archived";
+	  let groupPolicy: GroupPolicy | null = null;
+	  let groupPolicyChatId: string | null = null;
+	  let showGroupSettings = false;
+	  let groupSettingsSaving = false;
+	  let groupSettingsError: string | null = null;
+
+	  async function refreshGroupPolicy(chatId = activePeer) {
+	    try {
+	      const policy = await api.getGroupPolicy(chatId);
+	      if (activePeer === chatId) {
+	        groupPolicy = policy;
+	        groupSettingsError = null;
+	      }
+	    } catch (e: any) {
+	      if (activePeer === chatId) {
+	        groupPolicy = null;
+	        groupSettingsError = e?.toString?.() || "Unable to load group settings";
+	      }
+	    }
+	  }
+
+	  async function setMembersCanInvite(membersCanInvite: boolean) {
+	    if (!isGroupChat || groupSettingsSaving) return;
+	    groupSettingsSaving = true;
+	    groupSettingsError = null;
+	    try {
+	      await api.updateGroupSettings(activePeer, membersCanInvite);
+	      await refreshGroupPolicy(activePeer);
+	    } catch (e: any) {
+	      groupSettingsError = e?.toString?.() || "Unable to update group settings";
+	    } finally {
+	      groupSettingsSaving = false;
+	    }
+	  }
+
+	  $: if (isGroupChat && groupPolicyChatId !== activePeer) {
+	    groupPolicyChatId = activePeer;
+	    groupPolicy = null;
+	    showGroupSettings = false;
+	    groupSettingsError = null;
+	    refreshGroupPolicy(activePeer);
+	  }
+
+	  $: if (!isGroupChat && groupPolicyChatId !== null) {
+	    groupPolicyChatId = null;
+	    groupPolicy = null;
+	    showGroupSettings = false;
+	    groupSettingsError = null;
+	  }
 
   // Helper to truncate ID
   function truncateId(id: string, maxLen = 15): string {
@@ -1824,9 +1874,49 @@
     {/if}
   </div>
 
-  <div class="flex items-center gap-3">
-    {#if callMatchesActivePeer}
-      <div class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-200 flex items-center gap-2">
+	  <div class="flex items-center gap-3">
+	    {#if isGroupChat && groupPolicy?.is_admin}
+	      <div class="relative">
+	        <button
+	          onclick={() => (showGroupSettings = !showGroupSettings)}
+	          class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-200 hover:bg-theme-base-800"
+	          title="Group settings"
+	          aria-label="Group settings"
+	        >
+	          Group Settings
+	        </button>
+	        {#if showGroupSettings}
+	          <div
+	            class="absolute right-0 top-10 z-40 w-64 rounded-xl border border-theme-base-700 bg-theme-base-900 p-3 shadow-2xl"
+	          >
+	            <label class="flex items-start gap-3 text-xs text-theme-base-200">
+	              <input
+	                type="checkbox"
+	                checked={groupPolicy.members_can_invite}
+	                disabled={groupSettingsSaving}
+	                onchange={(event) =>
+	                  setMembersCanInvite(
+	                    (event.currentTarget as HTMLInputElement).checked,
+	                  )}
+	                class="mt-0.5 rounded border-theme-base-600 bg-theme-base-800 text-theme-primary-500"
+	              />
+	              <span>
+	                <span class="block font-medium text-theme-base-100">Members can invite</span>
+	                <span class="block text-theme-base-500">
+	                  When off, only the founder can invite new members.
+	                </span>
+	              </span>
+	            </label>
+	            {#if groupSettingsError}
+	              <p class="mt-2 text-xs text-theme-error-400">{groupSettingsError}</p>
+	            {/if}
+	          </div>
+	        {/if}
+	      </div>
+	    {/if}
+
+	    {#if callMatchesActivePeer}
+	      <div class="rounded-lg border border-theme-base-700 bg-theme-base-900/60 px-3 py-1.5 text-xs text-theme-base-200 flex items-center gap-2">
         {#if voiceCallState.phase === "outgoing_ringing"}
           <span>{activeCallKind === "video" ? "Video calling…" : "Calling…"} {formatDuration(ringCountdownSec)}</span>
         {:else if voiceCallState.phase === "incoming_ringing"}

@@ -7,6 +7,7 @@ pub mod live;
 pub mod network;
 pub mod oauth;
 pub mod runtime;
+pub mod settings;
 pub mod storage;
 
 pub use app_state::{AppState, NetworkState};

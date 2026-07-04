@@ -33,14 +33,22 @@ fn configure_macos_dev_swift_runtime_rpath() {
 fn find_swift_runtime_dir() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("RCHAT_SWIFT_RUNTIME_DIR")
         .map(PathBuf::from)
-        .filter(|dir| contains_swift_concurrency(dir))
+        .filter(|dir| is_usable_swift_runtime_dir(dir))
     {
         return Some(dir);
     }
 
+    // ScreenCaptureKit pulls Swift runtime load commands into dev binaries.
+    // Prefer the system Swift runtime in dyld's shared cache; falling back to
+    // CommandLineTools swift-5.5 loads a second libswift_Concurrency image and
+    // prints duplicate Objective-C class warnings.
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos") {
+        return Some(PathBuf::from("/usr/lib/swift"));
+    }
+
     swift_runtime_candidates()
         .into_iter()
-        .find(|dir| contains_swift_concurrency(dir))
+        .find(|dir| is_usable_swift_runtime_dir(dir))
 }
 
 fn swift_runtime_candidates() -> Vec<PathBuf> {
@@ -74,8 +82,8 @@ fn push_swift_usr_candidates(candidates: &mut Vec<PathBuf>, usr_dir: &Path) {
     candidates.push(usr_dir.join("lib/swift-5.5/macosx"));
 }
 
-fn contains_swift_concurrency(dir: &Path) -> bool {
-    dir.join("libswift_Concurrency.dylib").is_file()
+fn is_usable_swift_runtime_dir(dir: &Path) -> bool {
+    dir == Path::new("/usr/lib/swift") || dir.join("libswift_Concurrency.dylib").is_file()
 }
 
 fn command_output(command: &str, args: &[&str]) -> Option<String> {

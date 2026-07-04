@@ -1,137 +1,15 @@
 use tauri::{Emitter, Manager, State};
 
-use crate::app_state::{
-    ActiveTemporaryInvite, TemporaryChatKind, TemporaryChatSession, TemporaryInvitePayload,
-};
+use crate::chat::temporary::{TemporaryChatResult, TemporaryInviteView};
+use crate::chat::{direct, temporary};
 use crate::network::command::NetworkCommand;
 use crate::storage;
 use crate::{AppState, NetworkState};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use std::io::{Read, Write};
-
-const TEMP_INVITE_SCHEME_PREFIX: &str = "rchat://temp/";
-const TEMP_INVITE_TTL_SECS: u64 = 120;
-const TEMP_INVITE_VERSION: u8 = 1;
-
-#[derive(serde::Serialize, Clone)]
-pub struct TemporaryInviteView {
-    pub deep_link: String,
-    pub payload: TemporaryInvitePayload,
-    pub remaining_seconds: u64,
-}
-
-#[derive(serde::Serialize)]
-pub struct TemporaryChatResult {
-    pub chat_id: String,
-    pub name: String,
-    pub kind: String,
-    pub expires_at: u64,
-    pub peer_id: Option<String>,
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn parse_temp_kind(kind: &str) -> Result<TemporaryChatKind, String> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "dm" => Ok(TemporaryChatKind::Dm),
-        "group" => Ok(TemporaryChatKind::Group),
-        _ => Err("Invalid temporary chat kind. Use 'dm' or 'group'".to_string()),
-    }
-}
-
-fn temp_kind_label(kind: &TemporaryChatKind) -> String {
-    match kind {
-        TemporaryChatKind::Dm => "dm".to_string(),
-        TemporaryChatKind::Group => "group".to_string(),
-    }
-}
-
-fn encode_temporary_payload(payload: &TemporaryInvitePayload) -> Result<String, String> {
-    let json =
-        serde_json::to_vec(payload).map_err(|e| format!("Failed to encode payload: {}", e))?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&json)
-        .map_err(|e| format!("Failed to gzip payload: {}", e))?;
-    let compressed = encoder
-        .finish()
-        .map_err(|e| format!("Failed to finalize gzip payload: {}", e))?;
-    Ok(URL_SAFE_NO_PAD.encode(compressed))
-}
-
-fn decode_temporary_payload(encoded: &str) -> Result<TemporaryInvitePayload, String> {
-    let gzipped = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| format!("Invalid temporary invite payload: {}", e))?;
-    let mut decoder = GzDecoder::new(gzipped.as_slice());
-    let mut json = Vec::new();
-    decoder
-        .read_to_end(&mut json)
-        .map_err(|e| format!("Failed to gunzip temporary invite payload: {}", e))?;
-    let payload: TemporaryInvitePayload = serde_json::from_slice(&json)
-        .map_err(|e| format!("Failed to parse temporary invite payload: {}", e))?;
-    Ok(payload)
-}
-
-fn extract_temporary_payload_token(input: &str) -> Result<String, String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("Temporary invite link is empty".to_string());
-    }
-    if let Some(token) = trimmed.strip_prefix(TEMP_INVITE_SCHEME_PREFIX) {
-        if token.is_empty() {
-            return Err("Temporary invite link payload is empty".to_string());
-        }
-        return Ok(token.to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-async fn resolve_current_public_address(net_state: &NetworkState) -> Result<String, String> {
-    let v4_stun = net_state.public_address_v4.lock().await.clone();
-    let stun_port = *net_state.stun_external_port.lock().await;
-
-    if let (Some(ip), Some(port)) = (v4_stun, stun_port) {
-        return Ok(format!("/ip4/{}/udp/{}/quic-v1", ip, port));
-    }
-
-    let addrs = net_state.listening_addresses.lock().await;
-    addrs
-        .iter()
-        .find(|a| {
-            a.contains("/udp/")
-                && a.contains("/quic-v1")
-                && !a.contains("127.0.0.1")
-                && !a.contains("::1")
-        })
-        .or_else(|| {
-            addrs
-                .iter()
-                .find(|a| a.contains("/tcp/") && !a.contains("127.0.0.1") && !a.contains("::1"))
-        })
-        .or_else(|| addrs.first())
-        .cloned()
-        .ok_or("No listening address available. Is the network started?".to_string())
-}
-
-fn canonical_temp_dm_chat_id(a: &str, b: &str) -> String {
-    if a <= b {
-        a.to_string()
-    } else {
-        b.to_string()
-    }
-}
 
 /// Generate a 14-character password for invitations
 #[tauri::command]
 pub async fn generate_invite_password() -> Result<String, String> {
-    Ok(rvault_core::crypto::generate_password(14, false))
+    Ok(direct::generate_invite_password())
 }
 
 /// Create an invitation for a friend
@@ -477,122 +355,26 @@ pub async fn create_temporary_invite(
     app_state: State<'_, AppState>,
     net_state: State<'_, NetworkState>,
 ) -> Result<TemporaryInviteView, String> {
-    let temp_kind = parse_temp_kind(&kind)?;
-    let chat_id = match temp_kind {
-        TemporaryChatKind::Dm => crate::chat_kind::generate_temp_direct_chat_id(),
-        TemporaryChatKind::Group => crate::chat_kind::generate_temp_group_chat_id(),
-    };
-    let session_name = name
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| match temp_kind {
-            TemporaryChatKind::Dm => crate::chat_kind::default_temp_direct_name(&chat_id),
-            TemporaryChatKind::Group => crate::chat_kind::default_temp_group_name(&chat_id),
-        });
-
-    let inviter_peer_id = net_state
-        .local_peer_id
-        .lock()
+    let temp_kind = temporary::parse_temporary_chat_kind(&kind).map_err(|e| e.to_string())?;
+    temporary::create_temporary_invite(&app_state, &net_state, temp_kind, name.as_deref())
         .await
-        .clone()
-        .ok_or("Network is not started yet")?;
-    let inviter_addr = resolve_current_public_address(&net_state).await?;
-    let inviter_username = {
-        let mgr = app_state.config_manager.lock().await;
-        let config = mgr.load().await.map_err(|e| e.to_string())?;
-        config
-            .system
-            .github_username
-            .clone()
-            .or(config.user.profile.alias.clone())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-
-    let created_at = now_unix_secs();
-    let expires_at = created_at + TEMP_INVITE_TTL_SECS;
-    let payload = TemporaryInvitePayload {
-        version: TEMP_INVITE_VERSION,
-        kind: temp_kind.clone(),
-        chat_id: chat_id.clone(),
-        inviter_peer_id,
-        inviter_username,
-        inviter_addr,
-        created_at,
-        expires_at,
-    };
-    let encoded = encode_temporary_payload(&payload)?;
-    let deep_link = format!("{}{}", TEMP_INVITE_SCHEME_PREFIX, encoded);
-
-    {
-        let mut temp_state = net_state.temporary_state.lock().await;
-        temp_state.active_invite = Some(ActiveTemporaryInvite {
-            deep_link: deep_link.clone(),
-            payload: payload.clone(),
-        });
-        temp_state.chats.insert(
-            chat_id.clone(),
-            TemporaryChatSession {
-                chat_id: chat_id.clone(),
-                name: session_name,
-                kind: temp_kind,
-                expires_at,
-                peer_id: None,
-                archived: false,
-            },
-        );
-        temp_state.messages.entry(chat_id).or_default();
-    }
-
-    Ok(TemporaryInviteView {
-        deep_link,
-        payload,
-        remaining_seconds: TEMP_INVITE_TTL_SECS,
-    })
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_active_temporary_invite(
     net_state: State<'_, NetworkState>,
 ) -> Result<Option<TemporaryInviteView>, String> {
-    let now = now_unix_secs();
-    let mut temp_state = net_state.temporary_state.lock().await;
-
-    if let Some(active) = temp_state.active_invite.as_ref() {
-        if active.payload.expires_at <= now {
-            temp_state.active_invite = None;
-            return Ok(None);
-        }
-    }
-
-    Ok(temp_state
-        .active_invite
-        .as_ref()
-        .map(|active| TemporaryInviteView {
-            deep_link: active.deep_link.clone(),
-            payload: active.payload.clone(),
-            remaining_seconds: active.payload.expires_at.saturating_sub(now),
-        }))
+    temporary::get_active_temporary_invite(&net_state)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn cancel_temporary_invite(net_state: State<'_, NetworkState>) -> Result<(), String> {
-    let mut temp_state = net_state.temporary_state.lock().await;
-    if let Some(active) = temp_state.active_invite.take() {
-        if let Some(session) = temp_state.chats.get(&active.payload.chat_id).cloned() {
-            let has_messages = temp_state
-                .messages
-                .get(&active.payload.chat_id)
-                .map(|m| !m.is_empty())
-                .unwrap_or(false);
-            if session.peer_id.is_none() && !has_messages {
-                temp_state.chats.remove(&active.payload.chat_id);
-                temp_state.messages.remove(&active.payload.chat_id);
-            }
-        }
-    }
-    Ok(())
+    temporary::cancel_temporary_invite(&net_state)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -600,89 +382,7 @@ pub async fn redeem_temporary_invite(
     deep_link: String,
     net_state: State<'_, NetworkState>,
 ) -> Result<TemporaryChatResult, String> {
-    let token = extract_temporary_payload_token(&deep_link)?;
-    let payload = decode_temporary_payload(&token)?;
-    if payload.version != TEMP_INVITE_VERSION {
-        return Err(format!(
-            "Unsupported temporary invite version: {}",
-            payload.version
-        ));
-    }
-
-    let now = now_unix_secs();
-    if payload.expires_at <= now {
-        return Err("Temporary invite has expired".to_string());
-    }
-
-    let mut temp_state = net_state.temporary_state.lock().await;
-    let Some(local_active) = temp_state.active_invite.clone() else {
-        return Err("Create a temporary invite first before redeeming one".to_string());
-    };
-    if local_active.payload.expires_at <= now {
-        temp_state.active_invite = None;
-        return Err("Your temporary invite has expired. Create a new one first".to_string());
-    }
-    if local_active.payload.kind != payload.kind {
-        return Err("Temporary invite kind mismatch (dm/group)".to_string());
-    }
-
-    let is_group = matches!(payload.kind, TemporaryChatKind::Group);
-    let resolved_chat_id = if is_group {
-        payload.chat_id.clone()
-    } else {
-        canonical_temp_dm_chat_id(&local_active.payload.chat_id, &payload.chat_id)
-    };
-    let expires_at = local_active.payload.expires_at.min(payload.expires_at);
-    let resolved_name = if is_group {
-        crate::chat_kind::default_temp_group_name(&resolved_chat_id)
-    } else {
-        crate::chat_kind::default_temp_direct_name(&resolved_chat_id)
-    };
-
-    if local_active.payload.chat_id != resolved_chat_id {
-        temp_state.chats.remove(&local_active.payload.chat_id);
-        temp_state.messages.remove(&local_active.payload.chat_id);
-    }
-
-    let entry = temp_state
-        .chats
-        .entry(resolved_chat_id.clone())
-        .or_insert_with(|| TemporaryChatSession {
-            chat_id: resolved_chat_id.clone(),
-            name: resolved_name.clone(),
-            kind: payload.kind.clone(),
-            expires_at,
-            peer_id: Some(payload.inviter_peer_id.clone()),
-            archived: false,
-        });
-    entry.name = resolved_name.clone();
-    entry.kind = payload.kind.clone();
-    entry.expires_at = expires_at;
-    entry.peer_id = Some(payload.inviter_peer_id.clone());
-    entry.archived = false;
-    temp_state
-        .messages
-        .entry(resolved_chat_id.clone())
-        .or_default();
-    drop(temp_state);
-
-    {
-        let tx = net_state.sender.lock().await;
-        tx.send(NetworkCommand::RegisterTemporarySession {
-            chat_id: resolved_chat_id.clone(),
-            peer_id: payload.inviter_peer_id.clone(),
-            multiaddr: payload.inviter_addr.clone(),
-            is_group,
-        })
+    temporary::redeem_temporary_invite(&net_state, &deep_link)
         .await
-        .map_err(|e| format!("Failed to start temporary session: {}", e))?;
-    }
-
-    Ok(TemporaryChatResult {
-        chat_id: resolved_chat_id,
-        name: resolved_name,
-        kind: temp_kind_label(&payload.kind),
-        expires_at,
-        peer_id: Some(payload.inviter_peer_id),
-    })
+        .map_err(|e| e.to_string())
 }

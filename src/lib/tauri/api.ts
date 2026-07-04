@@ -45,6 +45,9 @@ export const COMMANDS = {
   joinGroupChat: "join_group_chat",
   leaveGroupChat: "leave_group_chat",
   inviteGroupMember: "invite_group_member",
+  getGroupPolicy: "get_group_policy",
+  updateGroupSettings: "update_group_settings",
+  removeGroupMember: "remove_group_member",
   acceptGroupInvite: "accept_group_invite",
   rejectGroupInvite: "reject_group_invite",
   renameGroupChat: "rename_group_chat",
@@ -266,6 +269,15 @@ export type ChatFileRow = {
 export type GroupChatResult = {
   chat_id: string;
   name: string;
+};
+
+export type GroupPolicy = {
+  admin_peer_id: string;
+  local_peer_id: string;
+  is_admin: boolean;
+  members_can_invite: boolean;
+  active_members: string[];
+  invited_members: string[];
 };
 
 export type ArchivedChatResult = {
@@ -518,6 +530,18 @@ type CommandSpec = {
   [COMMANDS.inviteGroupMember]: {
     args: { group_id: string; peer_id: string };
     result: string;
+  };
+  [COMMANDS.getGroupPolicy]: {
+    args: { group_id: string };
+    result: GroupPolicy;
+  };
+  [COMMANDS.updateGroupSettings]: {
+    args: { group_id: string; members_can_invite: boolean };
+    result: void;
+  };
+  [COMMANDS.removeGroupMember]: {
+    args: { group_id: string; peer_id: string };
+    result: void;
   };
   [COMMANDS.acceptGroupInvite]: {
     args: { invite_id: string };
@@ -880,6 +904,18 @@ export const api = {
     invokeCommand(COMMANDS.leaveGroupChat, { chat_id: chatId }),
   inviteGroupMember: (groupId: string, peerId: string) =>
     invokeCommand(COMMANDS.inviteGroupMember, {
+      group_id: groupId,
+      peer_id: peerId,
+    }),
+  getGroupPolicy: (groupId: string) =>
+    invokeCommand(COMMANDS.getGroupPolicy, { group_id: groupId }),
+  updateGroupSettings: (groupId: string, membersCanInvite: boolean) =>
+    invokeCommand(COMMANDS.updateGroupSettings, {
+      group_id: groupId,
+      members_can_invite: membersCanInvite,
+    }),
+  removeGroupMember: (groupId: string, peerId: string) =>
+    invokeCommand(COMMANDS.removeGroupMember, {
       group_id: groupId,
       peer_id: peerId,
     }),

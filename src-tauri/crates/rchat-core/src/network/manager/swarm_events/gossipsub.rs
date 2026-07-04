@@ -52,6 +52,10 @@ impl NetworkManager {
             if record.author_peer_id() == self.swarm.local_peer_id().to_string() {
                 return;
             }
+            let applied_message = matches!(
+                record.body(),
+                crate::network::gossip::GroupRecordBody::Message { .. }
+            );
             match crate::chat::group::apply_signed_record(
                 &self.app_state,
                 Some(&self.event_sink),
@@ -70,6 +74,10 @@ impl NetworkManager {
                             record.author_peer_id(),
                         )
                         .await;
+                    }
+                    if applied_message {
+                        self.publish_group_delivered_receipt(record.group_id(), record.id())
+                            .await;
                     }
                 }
                 Ok(false) => {}

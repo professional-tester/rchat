@@ -1,5 +1,6 @@
 use tauri::{Emitter, Manager, State};
 
+use crate::settings::connectivity;
 use crate::storage::config::{Config, ConnectivityMode, ConnectivitySettings};
 use crate::{network, oauth, AppState, NetworkState};
 use std::sync::Arc;
@@ -13,33 +14,16 @@ pub struct AuthStatus {
     connectivity: ConnectivitySettings,
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct ConnectivitySettingsPatch {
-    pub mdns_enabled: Option<bool>,
-    pub github_sync_enabled: Option<bool>,
-    pub nat_keepalive_enabled: Option<bool>,
-    pub punch_assist_enabled: Option<bool>,
-}
-
-fn normalize_connectivity(settings: ConnectivitySettings) -> ConnectivitySettings {
-    settings.with_derived_mode()
-}
+pub use crate::settings::connectivity::ConnectivitySettingsPatch;
 
 fn unlocked_auth_status(config: &Config) -> AuthStatus {
-    let connectivity = normalize_connectivity(config.user.connectivity.clone());
+    let connectivity = connectivity::normalize_connectivity(config.user.connectivity.clone());
     AuthStatus {
         is_setup: true,
         is_unlocked: true,
         is_github_connected: config.system.github_token.is_some(),
         is_online: connectivity.github_sync_enabled,
         connectivity,
-    }
-}
-
-async fn sync_runtime_connectivity(app_handle: &tauri::AppHandle, settings: &ConnectivitySettings) {
-    if let Some(network_state) = app_handle.try_state::<NetworkState>() {
-        let mut runtime = network_state.connectivity.lock().await;
-        *runtime = settings.clone();
     }
 }
 
@@ -74,7 +58,7 @@ pub async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus,
 
     let connectivity = if mgr.is_unlocked() {
         if let Ok(config) = mgr.load().await {
-            normalize_connectivity(config.user.connectivity)
+            connectivity::normalize_connectivity(config.user.connectivity)
         } else {
             ConnectivitySettings::default()
         }
@@ -125,31 +109,19 @@ pub async fn toggle_online_status(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Compatibility wrapper for legacy clients.
-    let mapped = if online {
-        ConnectivitySettings::from_mode(ConnectivityMode::Reachable)
-    } else {
-        ConnectivitySettings::from_mode(ConnectivityMode::Invisible)
-    };
-
-    let mgr = state.config_manager.lock().await;
-    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
-    config.user.connectivity = mapped.clone();
-    config.user.is_online = mapped.github_sync_enabled;
-    mgr.save(&config).await.map_err(|e| e.to_string())?;
-    drop(mgr);
-
-    sync_runtime_connectivity(&app_handle, &mapped).await;
-    Ok(())
+    let runtime = app_handle.try_state::<NetworkState>();
+    connectivity::toggle_online_status(&state, runtime.as_ref().map(|value| value.inner()), online)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn get_connectivity_settings(
     state: State<'_, AppState>,
 ) -> Result<ConnectivitySettings, String> {
-    let mgr = state.config_manager.lock().await;
-    let config = mgr.load().await.map_err(|e| e.to_string())?;
-    Ok(normalize_connectivity(config.user.connectivity))
+    connectivity::get_connectivity_settings(&state)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -158,23 +130,10 @@ pub async fn set_connectivity_mode(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ConnectivitySettings, String> {
-    let mgr = state.config_manager.lock().await;
-    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
-
-    let next = match mode {
-        ConnectivityMode::Invisible => ConnectivitySettings::from_mode(ConnectivityMode::Invisible),
-        ConnectivityMode::Lan => ConnectivitySettings::from_mode(ConnectivityMode::Lan),
-        ConnectivityMode::Reachable => ConnectivitySettings::from_mode(ConnectivityMode::Reachable),
-        ConnectivityMode::Custom => normalize_connectivity(config.user.connectivity.clone()),
-    };
-
-    config.user.connectivity = next.clone();
-    config.user.is_online = next.github_sync_enabled;
-    mgr.save(&config).await.map_err(|e| e.to_string())?;
-    drop(mgr);
-
-    sync_runtime_connectivity(&app_handle, &next).await;
-    Ok(next)
+    let runtime = app_handle.try_state::<NetworkState>();
+    connectivity::set_connectivity_mode(&state, runtime.as_ref().map(|value| value.inner()), mode)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -183,31 +142,14 @@ pub async fn update_connectivity_settings(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ConnectivitySettings, String> {
-    let mgr = state.config_manager.lock().await;
-    let mut config = mgr.load().await.map_err(|e| e.to_string())?;
-    let mut next = config.user.connectivity.clone();
-
-    if let Some(v) = patch.mdns_enabled {
-        next.mdns_enabled = v;
-    }
-    if let Some(v) = patch.github_sync_enabled {
-        next.github_sync_enabled = v;
-    }
-    if let Some(v) = patch.nat_keepalive_enabled {
-        next.nat_keepalive_enabled = v;
-    }
-    if let Some(v) = patch.punch_assist_enabled {
-        next.punch_assist_enabled = v;
-    }
-    next = normalize_connectivity(next);
-
-    config.user.connectivity = next.clone();
-    config.user.is_online = next.github_sync_enabled;
-    mgr.save(&config).await.map_err(|e| e.to_string())?;
-    drop(mgr);
-
-    sync_runtime_connectivity(&app_handle, &next).await;
-    Ok(next)
+    let runtime = app_handle.try_state::<NetworkState>();
+    connectivity::update_connectivity_settings(
+        &state,
+        runtime.as_ref().map(|value| value.inner()),
+        patch,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

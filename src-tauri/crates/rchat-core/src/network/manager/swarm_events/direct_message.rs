@@ -325,6 +325,16 @@ impl NetworkManager {
             .ok_or_else(|| "missing group sync request payload".to_string())?;
         let sync_request: crate::network::gossip::GroupSyncRequest =
             serde_json::from_str(payload).map_err(|e| format!("invalid group sync request: {e}"))?;
+        let requester_peer_id = peer.to_string();
+        let can_sync = crate::chat::group::can_peer_sync_group_records(
+            &self.app_state,
+            &sync_request.group_id,
+            &requester_peer_id,
+        )
+        .map_err(|e| e.to_string())?;
+        if !can_sync {
+            return Err("peer is not an active group member".to_string());
+        }
         let records = {
             let conn = self
                 .app_state
@@ -393,13 +403,23 @@ impl NetworkManager {
                 );
                 continue;
             }
+            let applied_remote_message = matches!(
+                record.body(),
+                crate::network::gossip::GroupRecordBody::Message { .. }
+            ) && record.author_peer_id() != self.swarm.local_peer_id().to_string();
             match crate::chat::group::apply_signed_record(
                 &self.app_state,
                 Some(&self.event_sink),
                 record,
                 true,
             ) {
-                Ok(true) => applied += 1,
+                Ok(true) => {
+                    applied += 1;
+                    if applied_remote_message {
+                        self.publish_group_delivered_receipt(record.group_id(), record.id())
+                            .await;
+                    }
+                }
                 Ok(false) => {}
                 Err(err) => eprintln!("[Group] Failed to apply synced record {}: {}", record.id(), err),
             }

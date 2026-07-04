@@ -88,3 +88,11 @@ pub async fn poll_for_token(device_code: &str) -> Result<String> {
         None => Err(anyhow!("No access token in response")),
     }
 }
+
+pub async fn fetch_github_username(token: &str) -> Result<String> {
+    let octocrab = octocrab::Octocrab::builder()
+        .personal_token(token.to_string())
+        .build()?;
+    let user: octocrab::models::Author = octocrab.get("/user", None::<&()>).await?;
+    Ok(user.login)
+}

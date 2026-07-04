@@ -84,6 +84,13 @@ impl NetworkManager {
                 )
                 .await;
             }
+            NetworkCommand::RequestDirectFileMetadata {
+                target_peer_id,
+                file_hash,
+            } => {
+                self.request_direct_file_metadata(target_peer_id, file_hash)
+                    .await;
+            }
             NetworkCommand::StartVoiceCall { peer_id } => {
                 self.handle_start_voice_call(peer_id).await;
             }
