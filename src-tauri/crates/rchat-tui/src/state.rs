@@ -5,7 +5,10 @@ use rchat_core::{
     storage::config::{ConnectivityMode, ConnectivitySettings},
     storage::db::{ChatFileRow, Message},
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiChat {
@@ -711,14 +714,26 @@ impl SettingsModalState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentModalField {
     Kind,
-    Path,
+    Picker,
     Send,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentFileEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentModalState {
     pub kind: MediaKind,
     pub path: String,
+    pub picker_root: PathBuf,
+    pub picker_query: String,
+    pub picker_entries: Vec<AttachmentFileEntry>,
+    pub selected_entry_index: usize,
     pub focus: AttachmentModalField,
     pub status: Option<String>,
     pub error: Option<String>,
@@ -729,7 +744,11 @@ impl Default for AttachmentModalState {
         Self {
             kind: MediaKind::Image,
             path: String::new(),
-            focus: AttachmentModalField::Kind,
+            picker_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            picker_query: String::new(),
+            picker_entries: Vec::new(),
+            selected_entry_index: 0,
+            focus: AttachmentModalField::Picker,
             status: None,
             error: None,
         }
@@ -739,8 +758,8 @@ impl Default for AttachmentModalState {
 impl AttachmentModalState {
     pub fn cycle_focus(&mut self) {
         self.focus = match self.focus {
-            AttachmentModalField::Kind => AttachmentModalField::Path,
-            AttachmentModalField::Path => AttachmentModalField::Send,
+            AttachmentModalField::Kind => AttachmentModalField::Picker,
+            AttachmentModalField::Picker => AttachmentModalField::Send,
             AttachmentModalField::Send => AttachmentModalField::Kind,
         };
     }
@@ -760,14 +779,162 @@ impl AttachmentModalState {
     }
 
     pub fn push_char(&mut self, ch: char) {
-        if self.focus == AttachmentModalField::Path {
-            self.path.push(ch);
+        if self.focus == AttachmentModalField::Picker {
+            self.picker_query.push(ch);
+            self.selected_entry_index = 0;
         }
     }
 
     pub fn pop_char(&mut self) {
-        if self.focus == AttachmentModalField::Path {
-            self.path.pop();
+        if self.focus == AttachmentModalField::Picker {
+            self.picker_query.pop();
+            self.selected_entry_index = 0;
+        }
+    }
+
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path.display().to_string();
+        self.status = Some("file selected".to_string());
+        self.error = None;
+    }
+
+    pub fn set_picker_entries(&mut self, entries: Vec<AttachmentFileEntry>) {
+        self.picker_entries = entries;
+        if self.selected_entry_index >= self.visible_entries().len() {
+            self.selected_entry_index = 0;
+        }
+    }
+
+    pub fn move_entry_selection(&mut self, delta: isize) {
+        let len = self.visible_entries().len();
+        self.selected_entry_index = next_index(self.selected_entry_index, delta, len);
+    }
+
+    pub fn selected_entry(&self) -> Option<&AttachmentFileEntry> {
+        self.visible_entries()
+            .get(self.selected_entry_index)
+            .copied()
+    }
+
+    pub fn visible_entries(&self) -> Vec<&AttachmentFileEntry> {
+        let query = self.picker_query.trim().to_lowercase();
+        let mut entries = self
+            .picker_entries
+            .iter()
+            .filter(|entry| query.is_empty() || fuzzy_match(&entry.name, &query))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+        entries
+    }
+
+    pub fn selected_preview_path(&self) -> Option<&str> {
+        if !self.path.trim().is_empty() {
+            return Some(self.path.trim());
+        }
+        self.selected_entry()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path.to_str())
+            .flatten()
+    }
+}
+
+fn fuzzy_match(candidate: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let candidate = candidate.to_lowercase();
+    if candidate.contains(query) {
+        return true;
+    }
+    let mut chars = candidate.chars();
+    query
+        .chars()
+        .all(|needle| chars.by_ref().any(|candidate| candidate == needle))
+}
+
+#[cfg(test)]
+pub fn attachment_file_entry(path: impl Into<PathBuf>, is_dir: bool) -> AttachmentFileEntry {
+    let path = path.into();
+    AttachmentFileEntry {
+        name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        path,
+        is_dir,
+        size_bytes: None,
+    }
+}
+
+#[cfg(test)]
+fn attachment_file_entry_named(
+    name: impl Into<String>,
+    path: impl Into<PathBuf>,
+    is_dir: bool,
+) -> AttachmentFileEntry {
+    AttachmentFileEntry {
+        path: path.into(),
+        name: name.into(),
+        is_dir,
+        size_bytes: None,
+    }
+}
+
+#[cfg(test)]
+pub fn attachment_entry_matches_query(name: &str, query: &str) -> bool {
+    fuzzy_match(name, query)
+}
+
+impl StickerPickerState {
+    pub fn selected_sticker(&self) -> Option<&TuiSticker> {
+        self.stickers.get(self.selected_index)
+    }
+
+    pub fn selected_preview_message(&self) -> Option<TuiMessage> {
+        let sticker = self.selected_sticker()?;
+        Some(TuiMessage {
+            id: format!("sticker-preview-{}", sticker.file_hash),
+            chat_id: "sticker-picker".to_string(),
+            sender: "Me".to_string(),
+            text: sticker.name.clone().unwrap_or_else(|| "sticker".to_string()),
+            timestamp: 0,
+            status: String::new(),
+            content_type: "sticker".to_string(),
+            file_hash: Some(sticker.file_hash.clone()),
+            content_metadata: None,
+        })
+    }
+}
+
+impl AttachmentModalState {
+    pub fn selected_path_or_entry(&self) -> Option<PathBuf> {
+        if !self.path.trim().is_empty() {
+            return Some(PathBuf::from(self.path.trim()));
+        }
+        self.selected_entry()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path.clone())
+    }
+}
+
+impl AttachmentModalState {
+    pub fn clear_selection(&mut self) {
+        self.path.clear();
+        self.status = None;
+        self.error = None;
+    }
+
+    pub fn enter_directory(&mut self, path: PathBuf) {
+        self.picker_root = path;
+        self.picker_query.clear();
+        self.selected_entry_index = 0;
+        self.clear_selection();
+    }
+
+    pub fn go_parent(&mut self) {
+        if let Some(parent) = self.picker_root.parent() {
+            self.enter_directory(parent.to_path_buf());
         }
     }
 }
@@ -2213,12 +2380,24 @@ mod tests {
         state.open_attachment_modal();
         let modal = state.attachment_modal.as_mut().expect("attachment modal");
         assert_eq!(modal.kind, MediaKind::Image);
-        assert_eq!(modal.focus, AttachmentModalField::Kind);
+        assert_eq!(modal.focus, AttachmentModalField::Picker);
         modal.cycle_kind(1);
         assert_eq!(modal.kind, MediaKind::Document);
-        modal.cycle_focus();
         modal.push_char('/');
-        assert_eq!(modal.path, "/");
+        assert_eq!(modal.picker_query, "/");
+        modal.set_picker_entries(vec![
+            attachment_file_entry_named("photos", "/tmp/photos", true),
+            attachment_file_entry_named("family-photo.png", "/tmp/family-photo.png", false),
+            attachment_file_entry_named("report.pdf", "/tmp/report.pdf", false),
+        ]);
+        modal.picker_query = "fp".to_string();
+        assert_eq!(
+            modal.selected_entry().map(|entry| entry.name.as_str()),
+            Some("family-photo.png")
+        );
+        assert!(attachment_entry_matches_query("family-photo.png", "fp"));
+        modal.set_path(PathBuf::from("/tmp/family-photo.png"));
+        assert_eq!(modal.selected_preview_path(), Some("/tmp/family-photo.png"));
 
         state.open_sticker_picker(vec![
             TuiSticker {
@@ -2235,6 +2414,12 @@ mod tests {
         let picker = state.sticker_picker.as_mut().expect("sticker picker");
         picker.move_selection(1);
         assert_eq!(picker.selected_hash(), Some("second"));
+        assert_eq!(
+            picker
+                .selected_preview_message()
+                .and_then(|message| message.file_hash),
+            Some("second".to_string())
+        );
         picker.enter_add_path_mode();
         picker.push_char('/');
         picker.push_char('t');

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use fastcdc::v2020::FastCDC;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -53,15 +53,23 @@ pub fn create(
     let file_hash = sha256_hex(data);
     let size_bytes = data.len() as i64;
 
-    // Check if file already exists
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE file_hash = ?1)",
-        [&file_hash],
-        |row| row.get(0),
-    )?;
+    let existing = conn
+        .query_row(
+            "SELECT size_bytes, is_complete FROM files WHERE file_hash = ?1",
+            [&file_hash],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?;
 
-    if exists {
-        return Ok(file_hash);
+    if let Some((existing_size, is_complete)) = existing {
+        let chunk_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_chunks WHERE file_hash = ?1",
+            [&file_hash],
+            |row| row.get(0),
+        )?;
+        if is_complete && existing_size == size_bytes && (size_bytes == 0 || chunk_count > 0) {
+            return Ok(file_hash);
+        }
     }
 
     let chunks_dir = get_chunks_dir(root_dir)?;
@@ -90,15 +98,23 @@ pub fn create(
     // Begin transaction
     let tx = conn.unchecked_transaction()?;
 
-    // Insert into files table
+    tx.execute("DELETE FROM file_chunks WHERE file_hash = ?1", [&file_hash])?;
+
+    // Insert into files table, repairing incomplete placeholders created by inbound transfers.
     tx.execute(
-        "INSERT INTO files (file_hash, file_name, mime_type, size_bytes, is_complete) VALUES (?1, ?2, ?3, ?4, 1)",
-        (
+        "INSERT INTO files (file_hash, file_name, mime_type, size_bytes, is_complete)
+         VALUES (?1, ?2, ?3, ?4, 1)
+         ON CONFLICT(file_hash) DO UPDATE SET
+            file_name = COALESCE(excluded.file_name, files.file_name),
+            mime_type = COALESCE(excluded.mime_type, files.mime_type),
+            size_bytes = excluded.size_bytes,
+            is_complete = 1",
+        params![
             &file_hash,
             file_name,
             mime_type,
             size_bytes,
-        ),
+        ],
     )?;
 
     // Insert into file_chunks table
@@ -260,6 +276,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn create_repairs_incomplete_placeholder_row() {
+        let conn = setup_test_db();
+        let temp = tempdir().unwrap();
+        let root = Some(temp.path().to_path_buf());
+        let test_data: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+        let file_hash = sha256_hex(&test_data);
+
+        conn.execute(
+            "INSERT INTO files (file_hash, file_name, mime_type, size_bytes, is_complete)
+             VALUES (?1, NULL, 'application/octet-stream', 0, 0)",
+            [&file_hash],
+        )
+        .unwrap();
+
+        let repaired_hash = create(
+            &conn,
+            &test_data,
+            Some("image.png"),
+            Some("image/png"),
+            root.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(repaired_hash, file_hash);
+        let chunk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_chunks WHERE file_hash = ?1",
+                [&file_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(chunk_count > 0);
+        let (size_bytes, is_complete, mime_type): (i64, bool, String) = conn
+            .query_row(
+                "SELECT size_bytes, is_complete, mime_type FROM files WHERE file_hash = ?1",
+                [&file_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(size_bytes, test_data.len() as i64);
+        assert!(is_complete);
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(load(&conn, &file_hash, root).unwrap(), test_data);
     }
 
     #[test]

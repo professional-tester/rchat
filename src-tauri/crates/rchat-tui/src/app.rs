@@ -8,11 +8,11 @@ use crate::{
     smoke::SmokeFrameGenerator,
     state::{
         db_chat_id, message_is_attachment, AppSessionPhase, AttachmentActionField,
-        AttachmentModalField, ComposerAction, ContextMenuAction, ContextMenuState,
-        ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind, NewPersonField,
-        NewPersonStep, SettingsField, SettingsPane, SettingsSection, StickerPickerMode,
-        StickerPickerState, TuiAppState, TuiChat, TuiChatDetails, TuiEnvelope, TuiMessage,
-        TuiSticker, TuiThemePreset,
+        AttachmentFileEntry, AttachmentModalField, ComposerAction, ContextMenuAction,
+        ContextMenuState, ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind,
+        NewPersonField, NewPersonStep, SettingsField, SettingsPane, SettingsSection,
+        StickerPickerMode, StickerPickerState, TuiAppState, TuiChat, TuiChatDetails,
+        TuiEnvelope, TuiMessage, TuiSticker, TuiThemePreset,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -40,11 +40,16 @@ use ratatui::{
     Frame, Terminal,
 };
 use ratatui_image::{picker::ProtocolType, Image};
+use rfd::FileDialog;
 use rchat_core::{
     app_state::{
         BroadcastPhase, BroadcastState, CallKind, TemporaryChatKind, VoiceCallPhase, VoiceCallState,
     },
-    chat::{details, direct, envelopes, group, media as chat_media, temporary},
+    chat::{
+        details, direct, envelopes, group,
+        media::{self as chat_media, MediaKind},
+        temporary,
+    },
     chat_identity,
     chat_kind::{self, ChatKind},
     events::{CoreEvent, VideoEncodedRemoteFrameEvent},
@@ -2675,23 +2680,77 @@ async fn handle_attachment_modal_key(
         }
         KeyCode::Up => {
             if let Some(modal) = state.app.attachment_modal.as_mut() {
-                modal.cycle_kind(-1);
+                if modal.focus == AttachmentModalField::Picker {
+                    modal.move_entry_selection(-1);
+                } else {
+                    modal.cycle_kind(-1);
+                    refresh_attachment_picker_entries(modal);
+                }
             }
         }
         KeyCode::Down => {
             if let Some(modal) = state.app.attachment_modal.as_mut() {
-                modal.cycle_kind(1);
+                if modal.focus == AttachmentModalField::Picker {
+                    modal.move_entry_selection(1);
+                } else {
+                    modal.cycle_kind(1);
+                    refresh_attachment_picker_entries(modal);
+                }
+            }
+        }
+        KeyCode::Left => {
+            if let Some(modal) = state.app.attachment_modal.as_mut() {
+                modal.go_parent();
+                refresh_attachment_picker_entries(modal);
+            }
+        }
+        KeyCode::Char('o') => {
+            if let Some(modal) = state.app.attachment_modal.as_mut() {
+                if let Some(path) = pick_attachment_file(modal.kind) {
+                    modal.set_path(path);
+                    modal.focus = AttachmentModalField::Send;
+                } else {
+                    modal.status = Some("native picker closed; use search below".to_string());
+                }
             }
         }
         KeyCode::Enter => {
-            let Some((kind, path)) = state
-                .app
-                .attachment_modal
-                .as_ref()
-                .map(|modal| (modal.kind, modal.path.clone()))
-            else {
+            let action = state.app.attachment_modal.as_ref().map(|modal| {
+                (
+                    modal.focus,
+                    modal.kind,
+                    modal.selected_path_or_entry(),
+                    modal.selected_entry().cloned(),
+                )
+            });
+            let Some((focus, kind, selected_path, selected_entry)) = action else {
                 return Ok(());
             };
+            if focus == AttachmentModalField::Picker {
+                if let Some(entry) = selected_entry {
+                    if entry.is_dir {
+                        if let Some(modal) = state.app.attachment_modal.as_mut() {
+                            modal.enter_directory(entry.path);
+                            refresh_attachment_picker_entries(modal);
+                        }
+                        return Ok(());
+                    }
+                    if let Some(modal) = state.app.attachment_modal.as_mut() {
+                        modal.set_path(entry.path);
+                        modal.focus = AttachmentModalField::Send;
+                    }
+                    return Ok(());
+                }
+            }
+
+            let Some(path) = selected_path else {
+                if let Some(modal) = state.app.attachment_modal.as_mut() {
+                    modal.error = Some("choose a file first".to_string());
+                    modal.status = None;
+                }
+                return Ok(());
+            };
+            let path = path.display().to_string();
             send_attachment_from_path(app_state, network_state, state, kind, &path).await?;
             state.app.attachment_modal = None;
         }
@@ -2708,6 +2767,84 @@ async fn handle_attachment_modal_key(
         _ => {}
     }
     Ok(())
+}
+
+fn pick_attachment_file(kind: MediaKind) -> Option<PathBuf> {
+    let mut dialog = FileDialog::new();
+    dialog = match kind {
+        MediaKind::Image => dialog.add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]),
+        MediaKind::Video => dialog.add_filter("Videos", &["mp4", "mov", "mkv", "webm", "avi"]),
+        MediaKind::Audio => dialog.add_filter("Audio", &["mp3", "wav", "ogg", "flac", "m4a"]),
+        MediaKind::Document => dialog.add_filter(
+            "Documents",
+            &["pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx"],
+        ),
+    };
+    dialog.pick_file()
+}
+
+fn refresh_attachment_picker_entries(modal: &mut crate::state::AttachmentModalState) {
+    let entries = match list_attachment_picker_entries(&modal.picker_root, modal.kind) {
+        Ok(entries) => entries,
+        Err(error) => {
+            modal.error = Some(error.to_string());
+            modal.status = None;
+            Vec::new()
+        }
+    };
+    modal.set_picker_entries(entries);
+}
+
+fn list_attachment_picker_entries(root: &Path, kind: MediaKind) -> Result<Vec<AttachmentFileEntry>> {
+    let mut entries = Vec::new();
+    if let Some(parent) = root.parent() {
+        entries.push(AttachmentFileEntry {
+            path: parent.to_path_buf(),
+            name: "../".to_string(),
+            is_dir: true,
+            size_bytes: None,
+        });
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let is_dir = metadata.is_dir();
+        if !is_dir && !attachment_kind_accepts_path(kind, &path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let name = name.to_string();
+        entries.push(AttachmentFileEntry {
+            path,
+            name,
+            is_dir,
+            size_bytes: (!is_dir).then_some(metadata.len()),
+        });
+    }
+    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    Ok(entries)
+}
+
+fn attachment_kind_accepts_path(kind: MediaKind, path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return kind == MediaKind::Document;
+    };
+    let ext = ext.to_lowercase();
+    match kind {
+        MediaKind::Image => matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"),
+        MediaKind::Video => matches!(ext.as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi"),
+        MediaKind::Audio => matches!(ext.as_str(), "mp3" | "wav" | "ogg" | "flac" | "m4a"),
+        MediaKind::Document => true,
+    }
 }
 
 async fn handle_sticker_picker_key(
@@ -2747,7 +2884,9 @@ async fn handle_sticker_picker_key(
     match code {
         KeyCode::Esc => state.app.sticker_picker = None,
         KeyCode::Char('a') => {
-            if let Some(picker) = state.app.sticker_picker.as_mut() {
+            if let Some(path) = pick_sticker_file() {
+                import_sticker_path_from_picker(app_state, state, path)?;
+            } else if let Some(picker) = state.app.sticker_picker.as_mut() {
                 picker.enter_add_path_mode();
             }
         }
@@ -2793,6 +2932,21 @@ fn import_sticker_from_picker(app_state: &AppState, state: &mut UiState) -> Resu
         return Ok(());
     }
 
+    import_sticker_path_from_picker(app_state, state, PathBuf::from(path))
+}
+
+fn pick_sticker_file() -> Option<PathBuf> {
+    FileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+        .pick_file()
+}
+
+fn import_sticker_path_from_picker(
+    app_state: &AppState,
+    state: &mut UiState,
+    path: PathBuf,
+) -> Result<()> {
+    let path = path.display().to_string();
     let imported = settings_stickers::add_sticker(app_state, &path)?;
     let stickers = settings_stickers::list_stickers(app_state)?
         .into_iter()
@@ -3240,6 +3394,20 @@ fn open_sticker_picker(app_state: &AppState, state: &mut UiState) -> Result<()> 
     state.app.open_sticker_picker(stickers);
     state.app.status = "sticker picker".to_string();
     Ok(())
+}
+
+fn open_attachment_modal(state: &mut UiState) {
+    state.app.open_attachment_modal();
+    if let Some(modal) = state.app.attachment_modal.as_mut() {
+        if let Some(path) = pick_attachment_file(modal.kind) {
+            modal.set_path(path);
+            modal.focus = AttachmentModalField::Send;
+        } else {
+            modal.status = Some("choose a file below, or press o to open file picker".to_string());
+        }
+        refresh_attachment_picker_entries(modal);
+    }
+    state.app.status = "attachment picker".to_string();
 }
 
 async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Result<()> {
@@ -3710,7 +3878,7 @@ async fn activate_composer_action(
 ) -> Result<()> {
     match state.app.selected_composer_action() {
         ComposerAction::Attach => {
-            state.app.open_attachment_modal();
+            open_attachment_modal(state);
             Ok(())
         }
         ComposerAction::Stickers => {
@@ -4678,7 +4846,7 @@ async fn execute_palette_command(
             Ok(())
         }
         Ok(PaletteCommand::AttachModal) => {
-            state.app.open_attachment_modal();
+            open_attachment_modal(state);
             Ok(())
         }
         Ok(PaletteCommand::Attach { kind, path }) => {
@@ -5573,11 +5741,6 @@ async fn submit_auth(app_state: &AppState, auth: &mut AuthUiState) -> Result<Aut
         return Ok(AuthKeyOutcome::Continue);
     }
 
-    auth.status = match auth.mode {
-        AuthMode::Unlock => "Unlocking vault...".to_string(),
-        AuthMode::CreateVault => "Creating vault...".to_string(),
-        AuthMode::GitHubLogin | AuthMode::LocalUsername => unreachable!("handled above"),
-    };
     auth.error = None;
 
     let mut config_manager = app_state.config_manager.lock().await;
@@ -6007,10 +6170,24 @@ fn render_app_shell(
         render_settings_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.attachment_modal.is_some() {
-        render_attachment_overlay(frame, frame.area(), state, &modal_theme);
+        render_attachment_overlay(
+            frame,
+            frame.area(),
+            state,
+            protocol_worker,
+            kitty_available,
+            &modal_theme,
+        );
     }
     if state.app.sticker_picker.is_some() {
-        render_sticker_picker_overlay(frame, frame.area(), state, &modal_theme);
+        render_sticker_picker_overlay(
+            frame,
+            frame.area(),
+            state,
+            inline_loader,
+            kitty_available,
+            &modal_theme,
+        );
     }
     if state.app.attachment_actions.is_some() {
         render_attachment_actions_overlay(frame, frame.area(), state, &modal_theme);
@@ -7269,10 +7446,22 @@ fn help_line_text(state: &UiState, width: usize) -> String {
         );
     }
     if state.app.attachment_modal.is_some() {
-        return fit_segments(&["Attach", "Up/Down kind", "Enter send", "Esc close"], width);
+        return fit_segments(
+            &[
+                "Attach",
+                "type search",
+                "o file picker",
+                "Enter select/send",
+                "Esc close",
+            ],
+            width,
+        );
     }
     if state.app.sticker_picker.is_some() {
-        return fit_segments(&["Stickers", "Up/Down move", "Enter send", "Esc close"], width);
+        return fit_segments(
+            &["Stickers", "preview first", "a add", "Enter send", "Esc close"],
+            width,
+        );
     }
     if state.app.show_command_palette {
         return fit_segments(&["Commands", "Enter run", "Esc close"], width);
@@ -7468,14 +7657,39 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
     frame.render_widget(paragraph, popup);
 }
 
-fn render_attachment_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
-    let Some(modal) = state.app.attachment_modal.as_ref() else {
+fn render_attachment_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    protocol_worker: Option<&ProtocolWorker>,
+    kitty_available: bool,
+    theme: &Theme,
+) {
+    let Some(modal) = state.app.attachment_modal.clone() else {
         return;
     };
-    let popup = centered_rect(68, 12, area);
+    let popup = centered_rect(82, 26, area);
     draw_shadow(frame, popup);
     frame.render_widget(Clear, popup);
-    let lines = vec![
+
+    let body = themed_block(" Attach ", theme);
+    frame.render_widget(
+        body.style(Style::default().bg(theme.surface).fg(theme.text)),
+        popup,
+    );
+    let inner = popup.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(inner);
+    let left = split[0];
+    let right = split[1];
+
+    let visible_entries = modal.visible_entries();
+    let mut lines = vec![
         Line::from(Span::styled(
             "Send Attachment",
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
@@ -7488,9 +7702,64 @@ fn render_attachment_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState,
             theme,
         ),
         attachment_modal_line(
-            modal.focus == AttachmentModalField::Path,
-            "Path",
-            &modal.path,
+            modal.focus == AttachmentModalField::Picker,
+            "Search",
+            &modal.picker_query,
+            theme,
+        ),
+        Line::from(Span::styled(
+            format!("Folder {}", modal.picker_root.display()),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(""),
+    ];
+
+    let entry_window_start = modal.selected_entry_index.saturating_sub(7);
+    for (offset, entry) in visible_entries
+        .iter()
+        .skip(entry_window_start)
+        .take(8)
+        .enumerate()
+    {
+        let index = entry_window_start + offset;
+        let selected =
+            modal.focus == AttachmentModalField::Picker && index == modal.selected_entry_index;
+        let style = if selected {
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let marker = if selected { ">" } else { " " };
+        let suffix = if entry.is_dir {
+            "/".to_string()
+        } else {
+            entry
+                .size_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "file".to_string())
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker} {} {suffix}", entry.name),
+            style,
+        )));
+    }
+
+    if visible_entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matching files",
+            Style::default().fg(theme.muted),
+        )));
+    }
+
+    lines.extend([
+        Line::from(""),
+        attachment_modal_line(
+            modal.focus == AttachmentModalField::Send,
+            "Selected",
+            modal.selected_preview_path().unwrap_or("none"),
             theme,
         ),
         attachment_button_line(
@@ -7501,30 +7770,56 @@ fn render_attachment_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState,
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "Up/Down changes kind, Tab moves focus, Esc closes",
+            "o opens file picker, type filters, Enter selects/sends, Left parent",
             Style::default().fg(theme.muted),
         )),
         modal_status_line(modal.status.as_deref(), modal.error.as_deref(), theme),
-    ];
+    ]);
+
     let paragraph = Paragraph::new(lines)
-        .block(themed_block(" Attach ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, popup);
+    frame.render_widget(paragraph, left);
+    render_attachment_preview_box(
+        frame,
+        right,
+        state,
+        &modal,
+        protocol_worker,
+        kitty_available,
+        theme,
+    );
 }
 
 fn render_sticker_picker_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &UiState,
+    state: &mut UiState,
+    inline_loader: Option<&InlineMediaLoader>,
+    kitty_available: bool,
     theme: &Theme,
 ) {
-    let Some(picker) = state.app.sticker_picker.as_ref() else {
+    let Some(picker) = state.app.sticker_picker.clone() else {
         return;
     };
-    let popup = centered_rect(72, 16, area);
+    let popup = centered_rect(82, 24, area);
     draw_shadow(frame, popup);
     frame.render_widget(Clear, popup);
+    frame.render_widget(
+        themed_block(" Stickers ", theme).style(Style::default().bg(theme.surface).fg(theme.text)),
+        popup,
+    );
+    let inner = popup.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(inner);
+    let left = split[0];
+    let right = split[1];
+
     let mut lines = vec![
         Line::from(Span::styled(
             "Sticker Picker",
@@ -7552,10 +7847,17 @@ fn render_sticker_picker_overlay(
         lines.push(Line::from(""));
         lines.push(attachment_button_line(true, "Add", "press a", theme));
     } else {
-        for (index, sticker) in picker.stickers.iter().take(10).enumerate() {
+        let sticker_window_start = picker.selected_index.saturating_sub(7);
+        for (offset, _sticker) in picker
+            .stickers
+            .iter()
+            .skip(sticker_window_start)
+            .take(8)
+            .enumerate()
+        {
+            let index = sticker_window_start + offset;
             let selected = index == picker.selected_index;
             let marker = if selected { ">" } else { " " };
-            let name = sticker.name.as_deref().unwrap_or("sticker");
             let style = if selected {
                 Style::default()
                     .fg(theme.bg)
@@ -7565,11 +7867,7 @@ fn render_sticker_picker_overlay(
                 Style::default().fg(theme.text)
             };
             lines.push(Line::from(Span::styled(
-                format!(
-                    "{marker} {name}  {}  {}",
-                    format_bytes(sticker.size_bytes.max(0) as u64),
-                    short_hash(&sticker.file_hash)
-                ),
+                format!("{marker} Sticker {}", index + 1),
                 style,
             )));
         }
@@ -7592,10 +7890,245 @@ fn render_sticker_picker_overlay(
         theme,
     ));
     let paragraph = Paragraph::new(lines)
-        .block(themed_block(" Stickers ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, popup);
+    frame.render_widget(paragraph, left);
+    render_sticker_picker_preview_box(
+        frame,
+        right,
+        state,
+        &picker,
+        inline_loader,
+        kitty_available,
+        theme,
+    );
+}
+
+fn render_attachment_preview_box(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    modal: &crate::state::AttachmentModalState,
+    protocol_worker: Option<&ProtocolWorker>,
+    kitty_available: bool,
+    theme: &Theme,
+) {
+    let block = themed_block(" Preview ", theme);
+    frame.render_widget(
+        block.style(Style::default().bg(theme.bg).fg(theme.text)),
+        area,
+    );
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let Some(path) = modal.selected_preview_path() else {
+        frame.render_widget(
+            Paragraph::new("Choose a file to preview")
+                .style(Style::default().bg(theme.bg).fg(theme.muted)),
+            inner,
+        );
+        return;
+    };
+
+    match modal.kind {
+        MediaKind::Image if kitty_available && state.protocol_type_is_kitty() => {
+            render_local_image_file_preview(frame, inner, state, path, protocol_worker, theme);
+        }
+        MediaKind::Image => {
+            render_preview_card(
+                frame,
+                inner,
+                theme,
+                "image preview unavailable",
+                path,
+                Some("Kitty/Ratty image support is not active"),
+            );
+        }
+        MediaKind::Video => {
+            render_preview_card(frame, inner, theme, "video", path, Some("opens externally"));
+        }
+        MediaKind::Audio => {
+            render_preview_card(frame, inner, theme, "audio", path, Some("opens externally"));
+        }
+        MediaKind::Document => {
+            render_preview_card(frame, inner, theme, "document", path, Some("opens externally"));
+        }
+    }
+}
+
+fn render_local_image_file_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    path: &str,
+    protocol_worker: Option<&ProtocolWorker>,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let key = InlineMediaKey::new(
+        "attachment-preview",
+        path.to_string(),
+        Size::new(area.width, area.height),
+    );
+    if state.inline_media_cache.get(&key).is_none() {
+        if let Some(worker) = protocol_worker {
+            match image::open(path) {
+                Ok(image) => {
+                    state.inline_media_cache.insert_loading(key.clone());
+                    worker.request(ProtocolRequest::inline(
+                        key.clone(),
+                        image,
+                        Size::new(area.width, area.height),
+                    ));
+                }
+                Err(error) => state
+                    .inline_media_cache
+                    .insert_error(key.clone(), format!("failed to preview image: {error}")),
+            }
+        } else {
+            state
+                .inline_media_cache
+                .insert_error(key.clone(), "image preview unavailable");
+        }
+    }
+
+    match state.inline_media_cache.get(&key) {
+        Some(InlineMediaState::Ready(protocol)) => {
+            frame.render_widget(Image::new(protocol), area);
+        }
+        Some(InlineMediaState::Error(error)) => {
+            render_preview_card(frame, area, theme, "image", path, Some(error.as_str()));
+        }
+        Some(InlineMediaState::Loading) | None => {
+            frame.render_widget(
+                Paragraph::new("loading preview...")
+                    .style(Style::default().bg(theme.bg).fg(theme.muted)),
+                area,
+            );
+        }
+    }
+}
+
+fn render_sticker_picker_preview_box(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    picker: &StickerPickerState,
+    inline_loader: Option<&InlineMediaLoader>,
+    kitty_available: bool,
+    theme: &Theme,
+) {
+    let block = themed_block(" Preview ", theme);
+    frame.render_widget(
+        block.style(Style::default().bg(theme.bg).fg(theme.text)),
+        area,
+    );
+    let inner = area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+
+    let Some(sticker) = picker.selected_sticker() else {
+        frame.render_widget(
+            Paragraph::new("Add a sticker to preview it here")
+                .style(Style::default().bg(theme.bg).fg(theme.muted)),
+            inner,
+        );
+        return;
+    };
+
+    let preview_height = inner.height.saturating_sub(3).max(1);
+    let preview_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: preview_height,
+    };
+    let metadata_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(preview_height),
+        width: inner.width,
+        height: inner.height.saturating_sub(preview_height),
+    };
+
+    if kitty_available && state.protocol_type_is_kitty() {
+        if let Some(message) = picker.selected_preview_message() {
+            render_inline_preview_box(frame, preview_area, state, &message, theme, inline_loader);
+        }
+    } else {
+        frame.render_widget(
+            Paragraph::new("sticker preview unavailable")
+                .style(Style::default().bg(theme.bg).fg(theme.muted)),
+            preview_area,
+        );
+    }
+
+    let metadata = vec![
+        Line::from(Span::styled(
+            sticker.name.as_deref().unwrap_or("sticker"),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{}  {}",
+                format_bytes(sticker.size_bytes.max(0) as u64),
+                short_hash(&sticker.file_hash)
+            ),
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(metadata)
+            .style(Style::default().bg(theme.bg).fg(theme.text))
+            .wrap(Wrap { trim: true }),
+        metadata_area,
+    );
+}
+
+fn render_preview_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    title: &str,
+    path: &str,
+    note: Option<&str>,
+) {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(name.to_string(), Style::default().fg(theme.text))),
+    ];
+    if let Ok(metadata) = fs::metadata(path) {
+        lines.push(Line::from(Span::styled(
+            format_bytes(metadata.len()),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if let Some(note) = note {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            note.to_string(),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg).fg(theme.text))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn render_attachment_actions_overlay(
