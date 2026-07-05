@@ -7,26 +7,32 @@ use crate::{
     },
     smoke::SmokeFrameGenerator,
     state::{
-        db_chat_id, AppSessionPhase, AttachmentActionField, AttachmentModalField, FocusPane,
-        MediaViewerAction, MediaViewerKind, NewPersonField, NewPersonStep, SettingsField,
-        SettingsSection, TuiAppState, TuiChat, TuiChatDetails, TuiEnvelope, TuiMessage, TuiSticker,
-        TuiThemePreset,
+        db_chat_id, message_is_attachment, AppSessionPhase, AttachmentActionField,
+        AttachmentModalField, ComposerAction, ContextMenuAction, ContextMenuState,
+        ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind, NewPersonField,
+        NewPersonStep, SettingsField, SettingsPane, SettingsSection, StickerPickerMode,
+        StickerPickerState, TuiAppState, TuiChat, TuiChatDetails, TuiEnvelope, TuiMessage,
+        TuiSticker, TuiThemePreset,
     },
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
+    cursor::MoveTo,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
         KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear as TerminalClear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use image::{DynamicImage, Luma};
 use qrcode::QrCode;
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -84,6 +90,7 @@ const INLINE_MEDIA_MIN_WIDTH: u16 = 18;
 const PASSWORD_MASK_SYMBOL: &str = "•";
 const NEW_PERSON_QR_WIDTH: u16 = 28;
 const NEW_PERSON_QR_HEIGHT: u16 = 12;
+const KITTY_DELETE_VISIBLE_PLACEMENTS: &[u8] = b"\x1b_Ga=d,q=2\x1b\\";
 
 #[derive(Debug, Parser)]
 #[command(name = "rchat-tui")]
@@ -585,7 +592,10 @@ mod tests {
             sidebar_rows(&state),
             vec![
                 SidebarRow::Chat(0),
-                SidebarRow::Envelope("folder Projects".to_string()),
+                SidebarRow::Envelope {
+                    id: "env-work".to_string(),
+                    label: "folder Projects".to_string(),
+                },
                 SidebarRow::Chat(1),
             ]
         );
@@ -600,10 +610,25 @@ mod tests {
             sidebar_click_target(&state, sidebar, 2, 5),
             Some(MouseHitTarget::Chat(0))
         );
-        assert_eq!(sidebar_click_target(&state, sidebar, 2, 6), None);
+        assert_eq!(
+            sidebar_click_target(&state, sidebar, 2, 6),
+            Some(MouseHitTarget::Envelope("env-work".to_string()))
+        );
         assert_eq!(
             sidebar_click_target(&state, sidebar, 2, 7),
             Some(MouseHitTarget::Chat(1))
+        );
+
+        state.app.sidebar_search = "work".to_string();
+        assert_eq!(
+            sidebar_rows(&state),
+            vec![
+                SidebarRow::Envelope {
+                    id: "env-work".to_string(),
+                    label: "folder Projects".to_string(),
+                },
+                SidebarRow::Chat(1),
+            ]
         );
     }
 
@@ -625,6 +650,232 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Design Crew [group] (4)"));
         assert!(!rendered.contains("[offline]"));
+    }
+
+    #[test]
+    fn sidebar_visible_rows_keep_selected_chat_in_view() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        state.app.replace_chats(
+            (0..12)
+                .map(|index| TuiChat {
+                    id: format!("chat-{index}"),
+                    name: format!("Chat {index}"),
+                    latest_timestamp: index,
+                    unread_count: 0,
+                })
+                .collect(),
+        );
+        state.app.selected_chat_index = 10;
+
+        let rows = visible_sidebar_rows(&mut state, 4);
+
+        assert_eq!(rows.len(), 4);
+        assert!(rows.contains(&SidebarRow::Chat(10)));
+        assert!(state.app.sidebar_scroll_offset > 0);
+    }
+
+    #[test]
+    fn media_viewer_copy_uses_move_image_wording() {
+        let viewer = crate::state::MediaViewerState::new(
+            "m1".to_string(),
+            "hash-1".to_string(),
+            "image.png".to_string(),
+            "image".to_string(),
+            None,
+        );
+
+        assert_eq!(media_viewer_view_label(&viewer), "zoom 100%  offset 0,0");
+        assert!(media_viewer_shortcuts_label().contains("arrows move image when zoomed"));
+        assert!(!media_viewer_shortcuts_label().contains("pan"));
+    }
+
+    #[test]
+    fn new_person_shortcuts_prefer_arrow_navigation() {
+        let label = new_person_shortcuts_label();
+
+        assert!(label.contains("Up/Down"));
+        assert!(!label.contains("Tab focus"));
+    }
+
+    #[test]
+    fn footer_help_text_fits_terminal_width() {
+        let state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+
+        let compact = help_line_text(&state, 52);
+
+        assert!(compact.chars().count() <= 52);
+        assert!(compact.contains("n new"));
+        assert!(compact.contains("? help"));
+        assert!(!compact.contains("/ commands"));
+        assert!(!compact.contains("Conversations -> Chat -> Message"));
+    }
+
+    #[test]
+    fn composer_printable_keys_are_message_text_not_global_shortcuts() {
+        assert_eq!(
+            composer_printable_char(FocusPane::Composer, KeyCode::Char('/')),
+            Some('/')
+        );
+        assert_eq!(
+            composer_printable_char(FocusPane::Composer, KeyCode::Char('?')),
+            Some('?')
+        );
+        assert_eq!(
+            composer_printable_char(FocusPane::Composer, KeyCode::Char('n')),
+            Some('n')
+        );
+        assert_eq!(
+            composer_printable_char(FocusPane::Composer, KeyCode::Char('q')),
+            Some('q')
+        );
+        assert_eq!(composer_printable_char(FocusPane::Chats, KeyCode::Char('/')), None);
+    }
+
+    #[test]
+    fn help_overlay_copy_is_gui_first_not_raw_commands() {
+        let text = help_overlay_text_lines().join("\n");
+
+        assert!(text.contains("n: New Person"));
+        assert!(text.contains("s: Settings"));
+        assert!(!text.contains("command palette"));
+        assert!(!text.contains("invite create"));
+        assert!(!text.contains("invite redeem"));
+        assert!(!text.contains("attach ["));
+    }
+
+    #[test]
+    fn kitty_graphics_clear_sequence_deletes_visible_placements_silently() {
+        assert_eq!(
+            kitty_graphics_delete_visible_placements_sequence(),
+            b"\x1b_Ga=d,q=2\x1b\\"
+        );
+    }
+
+    #[test]
+    fn invalidating_terminal_graphics_drops_cached_protocol_state() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        let inline_key = InlineMediaKey::new("m1", "hash-1", Size::new(20, 8));
+        let viewer_key = MediaViewerKey::new("hash-2", Size::new(80, 24), 100, 0, 0);
+        state.inline_media_cache.insert_loading(inline_key.clone());
+        state.last_protocol_seq = Some(12);
+        state.viewer_protocol_key = Some(viewer_key);
+
+        invalidate_terminal_graphics_protocols(&mut state);
+
+        assert!(state.inline_media_cache.get(&inline_key).is_none());
+        assert!(state.protocol.is_none());
+        assert!(state.remote_video_protocol.is_none());
+        assert!(state.viewer_protocol.is_none());
+        assert!(state.viewer_protocol_key.is_none());
+        assert!(state.last_protocol_seq.is_none());
+    }
+
+    #[test]
+    fn external_terminal_clear_forces_next_frame_to_repaint_even_if_content_matches() {
+        let backend = ratatui::backend::TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("hello"), frame.area());
+            })
+            .unwrap();
+        terminal.backend().assert_buffer_lines(["hello"]);
+
+        terminal.backend_mut().clear().unwrap();
+        terminal.backend().assert_buffer_lines(["     "]);
+
+        force_full_redraw_after_external_clear(&mut terminal);
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("hello"), frame.area());
+            })
+            .unwrap();
+
+        terminal.backend().assert_buffer_lines(["hello"]);
+    }
+
+    #[test]
+    fn footer_help_text_uses_modal_context() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        state.app.open_new_person();
+
+        let compact = help_line_text(&state, 44);
+
+        assert!(compact.contains("New Person"));
+        assert!(compact.contains("Up/Down move"));
+        assert!(!compact.contains("n new"));
+        assert!(compact.chars().count() <= 44);
+    }
+
+    #[test]
+    fn background_kitty_media_is_suppressed_while_modal_overlay_is_open() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+
+        assert!(background_kitty_media_enabled(&state, true));
+
+        state.app.open_new_person();
+
+        assert!(!background_kitty_media_enabled(&state, true));
+    }
+
+    #[test]
+    fn overlay_transitions_do_not_request_full_terminal_clear() {
+        assert_eq!(
+            graphics_transition_action(false, true, true),
+            GraphicsTransitionAction {
+                clear_kitty_graphics: true,
+                invalidate_protocols: true,
+                clear_terminal: false,
+            }
+        );
+        assert_eq!(
+            graphics_transition_action(true, false, true),
+            GraphicsTransitionAction {
+                clear_kitty_graphics: true,
+                invalidate_protocols: true,
+                clear_terminal: false,
+            }
+        );
+        assert_eq!(
+            graphics_transition_action(false, true, false),
+            GraphicsTransitionAction {
+                clear_kitty_graphics: false,
+                invalidate_protocols: false,
+                clear_terminal: false,
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_active_dims_background_theme_without_dimming_modal_theme() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        let normal = Theme::rchat();
+
+        assert_eq!(app_background_theme(&state), normal);
+        assert_eq!(modal_overlay_theme(), normal);
+
+        state.app.open_new_person();
+        let dimmed = app_background_theme(&state);
+
+        assert_ne!(dimmed, normal);
+        assert_eq!(dimmed.bg, Color::Rgb(8, 10, 14));
+        assert_eq!(modal_overlay_theme(), normal);
+    }
+
+    #[test]
+    fn graphics_clear_generation_changes_when_modal_overlay_opens_or_closes() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        let initial = graphics_clear_generation(&state);
+
+        state.app.open_new_person();
+        let with_modal = graphics_clear_generation(&state);
+
+        state.app.close_new_person();
+        let closed = graphics_clear_generation(&state);
+
+        assert_ne!(initial, with_modal);
+        assert_eq!(initial, closed);
     }
 
     #[test]
@@ -843,7 +1094,7 @@ mod tests {
         assert_eq!(state.voice_call_state.call_id.as_deref(), Some("call-1"));
         assert_eq!(
             status,
-            Some("voice incoming peer-1 | / voice accept | / voice reject".to_string())
+            Some("voice incoming peer-1 | use incoming call controls".to_string())
         );
     }
 
@@ -935,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_group_invite_status_includes_accept_and_reject_commands() {
+    fn incoming_group_invite_status_is_gui_first() {
         let event = rchat_core::events::GroupInviteReceivedEvent {
             invite_id: "invite-1".to_string(),
             group_id: "group:550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -946,8 +1197,8 @@ mod tests {
         let status = group_invite_received_status(&event);
 
         assert!(status.contains("group invite Design Crew from peer-1"));
-        assert!(status.contains("/group-invite accept invite-1"));
-        assert!(status.contains("/group-invite reject invite-1"));
+        assert!(status.contains("New Person"));
+        assert!(!status.contains("/group-invite"));
     }
 
     #[test]
@@ -969,7 +1220,7 @@ mod tests {
 
         assert_eq!(
             screen_share_status_label(&state),
-            Some("sharing screen with peer-1 | / screen end".to_string())
+            Some("sharing screen with peer-1 | e end".to_string())
         );
     }
 
@@ -992,8 +1243,9 @@ mod tests {
 
         assert_eq!(prompt.title, "Incoming screen share");
         assert!(prompt.body.contains("peer-1"));
-        assert!(prompt.actions.contains("/ screen accept"));
-        assert!(prompt.actions.contains("/ screen reject"));
+        assert!(prompt.actions.contains("a accept"));
+        assert!(prompt.actions.contains("r reject"));
+        assert!(!prompt.actions.contains("/ screen"));
     }
 
     #[test]
@@ -1018,10 +1270,7 @@ mod tests {
 
         assert_eq!(
             status,
-            Some(
-                "video active peer-1 muted camera off | / video mute off | / video camera on | / video end"
-                    .to_string()
-            )
+            Some("video active peer-1 muted camera off | Actions: Video ends".to_string())
         );
     }
 }
@@ -1084,6 +1333,7 @@ async fn run_interactive() -> Result<()> {
         LatestFrameSlot::<VideoEncodedRemoteFrameEvent>::default();
     let mut decoder = ScreenFrameDecoder::default();
     let mut remote_video_decoder = RemoteVideoFrameDecoder::default();
+    let mut last_graphics_clear_generation = graphics_clear_generation(&state);
 
     loop {
         let mut refresh_requested = false;
@@ -1227,6 +1477,25 @@ async fn run_interactive() -> Result<()> {
                 }
                 _ => {}
             }
+        }
+
+        let graphics_clear_generation = graphics_clear_generation(&state);
+        if graphics_clear_generation != last_graphics_clear_generation {
+            let transition = graphics_transition_action(
+                last_graphics_clear_generation,
+                graphics_clear_generation,
+                kitty_available,
+            );
+            if transition.clear_kitty_graphics {
+                terminal.clear_terminal_graphics()?;
+            }
+            if transition.invalidate_protocols {
+                invalidate_terminal_graphics_protocols(&mut state);
+            }
+            if transition.clear_terminal {
+                terminal.clear()?;
+            }
+            last_graphics_clear_generation = graphics_clear_generation;
         }
 
         terminal.draw(|frame| {
@@ -1542,11 +1811,18 @@ async fn run_auth_screen(app_state: &AppState, terminal: &mut TerminalSession) -
     let mut config_manager = app_state.config_manager.lock().await;
     if config_manager.try_restore_session() {
         drop(config_manager);
-        if !needs_identity_choice(app_state).await? {
-            return Ok(true);
+        match needs_identity_choice(app_state).await {
+            Ok(false) => return Ok(true),
+            Ok(true) => {
+                let mut auth = AuthUiState::new(AuthMode::GitHubLogin);
+                return run_auth_form(app_state, terminal, &mut auth).await;
+            }
+            Err(_) => {
+                let mut config_manager = app_state.config_manager.lock().await;
+                config_manager.clear_restored_session();
+            }
         }
-        let mut auth = AuthUiState::new(AuthMode::GitHubLogin);
-        return run_auth_form(app_state, terminal, &mut auth).await;
+        config_manager = app_state.config_manager.lock().await;
     }
     let mode = if config_manager.exists() {
         AuthMode::Unlock
@@ -1620,6 +1896,10 @@ async fn refresh_direct_chats(
     let group_chats = list_group_chats(app_state, network_state).await?;
     let envelope_rows = envelopes::list_envelopes(app_state)?;
     let assignment_rows = envelopes::list_assignments(app_state)?;
+    state.app.pinned_chat_keys = settings_peers::get_pinned_peers(app_state)
+        .await?
+        .into_iter()
+        .collect();
     state.app.replace_chats(
         chats
             .into_iter()
@@ -2135,10 +2415,16 @@ async fn handle_new_person_key(
                 close_new_person_modal(network_state, state).await?;
             }
         }
-        KeyCode::Tab => {
+        KeyCode::Up => {
             let local_count = state.app.local_peers.len();
             if let Some(modal) = state.app.new_person.as_mut() {
-                modal.cycle_focus(local_count);
+                modal.move_focus(-1, local_count);
+            }
+        }
+        KeyCode::Down => {
+            let local_count = state.app.local_peers.len();
+            if let Some(modal) = state.app.new_person.as_mut() {
+                modal.move_focus(1, local_count);
             }
         }
         KeyCode::Enter => {
@@ -2430,8 +2716,41 @@ async fn handle_sticker_picker_key(
     state: &mut UiState,
     code: KeyCode,
 ) -> Result<()> {
+    if state
+        .app
+        .sticker_picker
+        .as_ref()
+        .is_some_and(|picker| picker.mode == StickerPickerMode::AddPath)
+    {
+        match code {
+            KeyCode::Esc => {
+                if let Some(picker) = state.app.sticker_picker.as_mut() {
+                    picker.exit_add_path_mode();
+                }
+            }
+            KeyCode::Enter => import_sticker_from_picker(app_state, state)?,
+            KeyCode::Backspace => {
+                if let Some(picker) = state.app.sticker_picker.as_mut() {
+                    picker.pop_char();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(picker) = state.app.sticker_picker.as_mut() {
+                    picker.push_char(ch);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match code {
         KeyCode::Esc => state.app.sticker_picker = None,
+        KeyCode::Char('a') => {
+            if let Some(picker) = state.app.sticker_picker.as_mut() {
+                picker.enter_add_path_mode();
+            }
+        }
         KeyCode::Up => {
             if let Some(picker) = state.app.sticker_picker.as_mut() {
                 picker.move_selection(-1);
@@ -2454,6 +2773,163 @@ async fn handle_sticker_picker_key(
             send_sticker_hash(app_state, network_state, state, &hash).await?;
             state.app.sticker_picker = None;
         }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn import_sticker_from_picker(app_state: &AppState, state: &mut UiState) -> Result<()> {
+    let path = state
+        .app
+        .sticker_picker
+        .as_ref()
+        .map(|picker| picker.add_path.trim().to_string())
+        .unwrap_or_default();
+    if path.is_empty() {
+        if let Some(picker) = state.app.sticker_picker.as_mut() {
+            picker.error = Some("enter a sticker image path".to_string());
+            picker.status = None;
+        }
+        return Ok(());
+    }
+
+    let imported = settings_stickers::add_sticker(app_state, &path)?;
+    let stickers = settings_stickers::list_stickers(app_state)?
+        .into_iter()
+        .map(|sticker| TuiSticker {
+            file_hash: sticker.file_hash,
+            name: sticker.name,
+            size_bytes: sticker.size_bytes,
+        })
+        .collect::<Vec<_>>();
+    let mut picker = StickerPickerState::new(stickers);
+    picker.select_hash(&imported.file_hash);
+    picker.status = Some(if imported.already_exists {
+        "sticker already saved".to_string()
+    } else {
+        "sticker imported".to_string()
+    });
+    state.app.sticker_picker = Some(picker);
+    Ok(())
+}
+
+async fn handle_context_menu_key(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    code: KeyCode,
+) -> Result<()> {
+    let action_count = state
+        .app
+        .context_menu
+        .as_ref()
+        .map(context_menu_actions)
+        .map(|actions| actions.len())
+        .unwrap_or_default();
+    match code {
+        KeyCode::Esc => state.app.context_menu = None,
+        KeyCode::Up => {
+            if let Some(menu) = state.app.context_menu.as_mut() {
+                menu.move_selection(-1, action_count);
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if let Some(menu) = state.app.context_menu.as_mut() {
+                menu.move_selection(1, action_count);
+            }
+        }
+        KeyCode::Enter => activate_context_menu_action(app_state, network_state, state).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_context_menu_for_focus(state: &mut UiState) {
+    let target = match state.app.focus {
+        FocusPane::Chats => Some(ContextMenuTarget::Chat(state.app.selected_chat_index)),
+        FocusPane::History => state
+            .app
+            .selected_message_id
+            .clone()
+            .map(ContextMenuTarget::Message),
+        _ => None,
+    };
+    if let Some(target) = target {
+        state.app.context_menu = Some(ContextMenuState::new(target));
+    }
+}
+
+fn context_menu_actions(menu: &ContextMenuState) -> Vec<ContextMenuAction> {
+    match &menu.target {
+        ContextMenuTarget::Chat(_) => vec![
+            ContextMenuAction::Open,
+            ContextMenuAction::Details,
+            ContextMenuAction::MoveToRoot,
+            ContextMenuAction::Close,
+        ],
+        ContextMenuTarget::Envelope(_) => {
+            vec![ContextMenuAction::DeleteEnvelope, ContextMenuAction::Close]
+        }
+        ContextMenuTarget::Message(_) => vec![
+            ContextMenuAction::AttachmentActions,
+            ContextMenuAction::Close,
+        ],
+    }
+}
+
+fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
+    match action {
+        ContextMenuAction::Open => "Open",
+        ContextMenuAction::Details => "Details",
+        ContextMenuAction::MoveToRoot => "Remove from envelope",
+        ContextMenuAction::DeleteEnvelope => "Delete envelope",
+        ContextMenuAction::AttachmentActions => "Message actions",
+        ContextMenuAction::Close => "Close",
+    }
+}
+
+async fn activate_context_menu_action(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let Some(menu) = state.app.context_menu.clone() else {
+        return Ok(());
+    };
+    let actions = context_menu_actions(&menu);
+    let action = actions
+        .get(menu.selected_index)
+        .copied()
+        .unwrap_or(ContextMenuAction::Close);
+    state.app.context_menu = None;
+
+    match (menu.target, action) {
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Open) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                open_chat_list_item(app_state, network_state, state, &chat_id).await?;
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Details) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                open_chat_details(app_state, network_state, state, &chat_id).await?;
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::MoveToRoot) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                envelopes::move_chat_to_envelope(app_state, &chat_id, None)?;
+                refresh_direct_chats(app_state, network_state, state).await?;
+                state.app.status = format!("removed {chat_id} from envelope");
+            }
+        }
+        (ContextMenuTarget::Envelope(id), ContextMenuAction::DeleteEnvelope) => {
+            envelopes::delete_envelope(app_state, &id)?;
+            refresh_direct_chats(app_state, network_state, state).await?;
+            state.app.status = format!("deleted envelope {id}");
+        }
+        (ContextMenuTarget::Message(_), ContextMenuAction::AttachmentActions) => {
+            open_attachment_actions_for_selected(app_state, state)?;
+        }
+        (_, ContextMenuAction::Close) => {}
         _ => {}
     }
     Ok(())
@@ -2671,9 +3147,67 @@ async fn activate_attachment_action(
             state.app.status = "attachment retry requested".to_string();
             state.app.attachment_actions = None;
         }
+        AttachmentActionField::SaveSticker => {
+            let result = settings_stickers::save_sticker_from_message(app_state, &snapshot.file_hash)?;
+            if let Some(modal) = state.app.attachment_actions.as_mut() {
+                modal.sticker_saved = true;
+                modal.status = Some(if result.already_exists {
+                    "sticker already saved".to_string()
+                } else {
+                    "sticker saved".to_string()
+                });
+                modal.error = None;
+                modal.focus = AttachmentActionField::Close;
+            }
+        }
         AttachmentActionField::Close => state.app.attachment_actions = None,
     }
     Ok(())
+}
+
+fn open_attachment_actions_for_selected(app_state: &AppState, state: &mut UiState) -> Result<()> {
+    let Some(message) = state.app.selected_attachment_message().cloned() else {
+        state.app.last_error = Some("no attachment selected".to_string());
+        return Ok(());
+    };
+    let sticker_saved = if message.content_type == "sticker" {
+        message
+            .file_hash
+            .as_deref()
+            .map(|file_hash| sticker_exists(app_state, file_hash))
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let Some(modal) =
+        crate::state::AttachmentActionModalState::from_message_with_sticker_saved(
+            &message,
+            sticker_saved,
+        )
+    else {
+        state.app.last_error = Some("selected message has no attachment".to_string());
+        return Ok(());
+    };
+
+    state.app.show_command_palette = false;
+    state.app.chat_details = None;
+    state.app.show_help = false;
+    state.app.new_person = None;
+    state.app.settings = None;
+    state.app.attachment_modal = None;
+    state.app.sticker_picker = None;
+    state.app.media_viewer = None;
+    state.app.attachment_actions = Some(modal);
+    Ok(())
+}
+
+fn sticker_exists(app_state: &AppState, file_hash: &str) -> Result<bool> {
+    let conn = app_state
+        .db_conn
+        .lock()
+        .map_err(|error| anyhow!("database lock failed: {error}"))?;
+    Ok(storage::db::sticker_exists(&conn, file_hash))
 }
 
 fn previous_new_person_step(step: NewPersonStep) -> Option<NewPersonStep> {
@@ -2769,12 +3303,18 @@ async fn handle_settings_key(
         }
         KeyCode::Up => {
             if let Some(modal) = state.app.settings.as_mut() {
-                modal.move_section(-1);
+                match modal.pane {
+                    SettingsPane::Menu => modal.move_section(-1),
+                    SettingsPane::Content => modal.move_content(-1),
+                }
             }
         }
         KeyCode::Down => {
             if let Some(modal) = state.app.settings.as_mut() {
-                modal.move_section(1);
+                match modal.pane {
+                    SettingsPane::Menu => modal.move_section(1),
+                    SettingsPane::Content => modal.move_content(1),
+                }
             }
         }
         KeyCode::Enter => {
@@ -2808,7 +3348,7 @@ async fn activate_settings_focus(
         SettingsField::Section(index) => {
             if let Some(section) = SettingsSection::ALL.get(index).copied() {
                 if let Some(modal) = state.app.settings.as_mut() {
-                    modal.set_section(section);
+                    modal.activate_section(section);
                 }
             }
         }
@@ -3009,6 +3549,11 @@ async fn handle_interactive_key(
         return Ok(false);
     }
 
+    if state.app.context_menu.is_some() {
+        handle_context_menu_key(app_state, network_state, state, code).await?;
+        return Ok(false);
+    }
+
     if state.app.show_command_palette {
         match code {
             KeyCode::Esc => state.app.close_command_palette(),
@@ -3031,9 +3576,36 @@ async fn handle_interactive_key(
         return Ok(false);
     }
 
+    if state.app.sidebar_search_active && state.app.focus == FocusPane::Chats {
+        match code {
+            KeyCode::Esc => state.app.close_sidebar_search(),
+            KeyCode::Backspace => state.app.pop_sidebar_search_char(),
+            KeyCode::Char(ch) => state.app.push_sidebar_search_char(ch),
+            KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Tab => {}
+            _ => {}
+        }
+        if !matches!(code, KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Tab) {
+            return Ok(false);
+        }
+    }
+
+    if let Some(ch) = composer_printable_char(state.app.focus, code) {
+        state.app.composer.push(ch);
+        return Ok(false);
+    }
+
     match code {
         KeyCode::Esc if state.app.chat_details.is_some() || state.app.show_help => {
             state.app.close_modal();
+        }
+        KeyCode::Char('a') if should_render_incoming_screen_share_prompt(state) => {
+            accept_incoming_screen_share(network_state, state).await?;
+        }
+        KeyCode::Char('r') if should_render_incoming_screen_share_prompt(state) => {
+            reject_incoming_screen_share(network_state, state).await?;
+        }
+        KeyCode::Char('e') if state.broadcast_state.phase != BroadcastPhase::Idle => {
+            end_current_screen_share(network_state, state).await?;
         }
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Char('n') => {
@@ -3044,11 +3616,24 @@ async fn handle_interactive_key(
                 state.app.last_error = Some(error.to_string());
             }
         }
+        KeyCode::Char('m')
+            if matches!(state.app.focus, FocusPane::Chats | FocusPane::History) =>
+        {
+            open_context_menu_for_focus(state);
+        }
+        KeyCode::Char('/') if state.app.focus != FocusPane::Composer => {
+            state.app.open_sidebar_search();
+        }
         KeyCode::Char('?') => state.app.show_help = !state.app.show_help,
-        KeyCode::Char('/') => state.app.open_command_palette(),
         KeyCode::Tab => state.app.cycle_focus(),
         KeyCode::PageUp => state.app.scroll_history(5),
         KeyCode::PageDown => state.app.scroll_history(-5),
+        KeyCode::Left if state.app.focus == FocusPane::ComposerActions => {
+            state.app.move_composer_action(-1);
+        }
+        KeyCode::Right if state.app.focus == FocusPane::ComposerActions => {
+            state.app.move_composer_action(1);
+        }
         KeyCode::Left if state.app.focus == FocusPane::History => {
             state.app.move_attachment_selection(-1);
         }
@@ -3058,8 +3643,20 @@ async fn handle_interactive_key(
         KeyCode::Char('v') if state.app.focus == FocusPane::History => {
             open_media_viewer_for_selected(app_state, state)?;
         }
-        KeyCode::Up => state.app.move_selection(-1),
-        KeyCode::Down => state.app.move_selection(1),
+        KeyCode::Up => {
+            let was_chats = state.app.focus == FocusPane::Chats;
+            state.app.move_selection(-1);
+            if was_chats {
+                state.sidebar_follow_selection = true;
+            }
+        }
+        KeyCode::Down => {
+            let was_chats = state.app.focus == FocusPane::Chats;
+            state.app.move_selection(1);
+            if was_chats {
+                state.sidebar_follow_selection = true;
+            }
+        }
         KeyCode::Enter => match state.app.focus {
             FocusPane::Chats => {
                 if let Some(chat_id) = state.app.selected_chat_id().map(ToOwned::to_owned) {
@@ -3067,7 +3664,10 @@ async fn handle_interactive_key(
                 }
             }
             FocusPane::History => {
-                state.app.open_attachment_actions_for_selected();
+                open_attachment_actions_for_selected(app_state, state)?;
+            }
+            FocusPane::ComposerActions => {
+                activate_composer_action(app_state, network_state, state).await?;
             }
             FocusPane::Composer => send_composer(app_state, network_state, state).await?,
             FocusPane::CommandPalette => {}
@@ -3075,13 +3675,181 @@ async fn handle_interactive_key(
         KeyCode::Backspace if state.app.focus == FocusPane::Composer => {
             state.app.composer.pop();
         }
-        KeyCode::Char(ch) if state.app.focus == FocusPane::Composer => {
-            state.app.composer.push(ch);
-        }
         _ => {}
     }
 
     Ok(false)
+}
+
+fn composer_printable_char(focus: FocusPane, code: KeyCode) -> Option<char> {
+    match code {
+        KeyCode::Char(ch) if focus == FocusPane::Composer => Some(ch),
+        _ => None,
+    }
+}
+
+fn composer_action_click_index(area: Rect, column: u16, row: u16) -> Option<usize> {
+    let inner = inset_rect(area, 1);
+    if !rect_contains(inner, column, row) || inner.width == 0 {
+        return None;
+    }
+    let relative = column.saturating_sub(inner.x) as usize;
+    let width = inner.width.max(1) as usize;
+    let index = relative
+        .saturating_mul(ComposerAction::ALL.len())
+        .checked_div(width)
+        .unwrap_or_default()
+        .min(ComposerAction::ALL.len().saturating_sub(1));
+    Some(index)
+}
+
+async fn activate_composer_action(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    match state.app.selected_composer_action() {
+        ComposerAction::Attach => {
+            state.app.open_attachment_modal();
+            Ok(())
+        }
+        ComposerAction::Stickers => {
+            open_sticker_picker(app_state, state)?;
+            Ok(())
+        }
+        ComposerAction::Voice => toggle_voice_call(network_state, state).await,
+        ComposerAction::Video => toggle_video_call(network_state, state).await,
+        ComposerAction::Screen => toggle_screen_share(network_state, state).await,
+        ComposerAction::Details => {
+            let chat_id = state
+                .app
+                .active_chat_id
+                .clone()
+                .or_else(|| state.app.selected_chat_id().map(ToOwned::to_owned))
+                .ok_or_else(|| anyhow!("select a chat first"))?;
+            open_chat_details(app_state, network_state, state, &chat_id).await
+        }
+    }
+}
+
+async fn toggle_voice_call(network_state: &NetworkState, state: &mut UiState) -> Result<()> {
+    if state.voice_call_state.call_kind == Some(CallKind::Voice)
+        && state.voice_call_state.phase != VoiceCallPhase::Idle
+    {
+        let call_id = voice_call_id(state, None)?;
+        send_network_command(
+            network_state,
+            NetworkCommand::EndVoiceCall {
+                call_id: call_id.clone(),
+            },
+        )
+        .await?;
+        state.app.status = format!("voice call ending {call_id}");
+        return Ok(());
+    }
+
+    let peer_id = voice_call_target_chat_id(state, None)?;
+    send_network_command(
+        network_state,
+        NetworkCommand::StartVoiceCall {
+            peer_id: peer_id.clone(),
+        },
+    )
+    .await?;
+    state.app.status = format!("voice call requested {peer_id}");
+    Ok(())
+}
+
+async fn toggle_video_call(network_state: &NetworkState, state: &mut UiState) -> Result<()> {
+    if state.voice_call_state.call_kind == Some(CallKind::Video)
+        && state.voice_call_state.phase != VoiceCallPhase::Idle
+    {
+        let call_id = voice_call_id(state, None)?;
+        send_network_command(
+            network_state,
+            NetworkCommand::EndVideoCall {
+                call_id: call_id.clone(),
+            },
+        )
+        .await?;
+        state.app.status = format!("video call ending {call_id}");
+        return Ok(());
+    }
+
+    let peer_id = live_call_target_chat_id(state, None, "video")?;
+    send_network_command(
+        network_state,
+        NetworkCommand::StartVideoCall {
+            peer_id: peer_id.clone(),
+        },
+    )
+    .await?;
+    state.app.status = format!("video call requested {peer_id}");
+    Ok(())
+}
+
+async fn toggle_screen_share(network_state: &NetworkState, state: &mut UiState) -> Result<()> {
+    if state.broadcast_state.phase != BroadcastPhase::Idle {
+        return end_current_screen_share(network_state, state).await;
+    }
+
+    let peer_id = screen_share_target_chat_id(state, None)?;
+    let profile = ScreenCaptureProfile::P720F15;
+    send_network_command(
+        network_state,
+        NetworkCommand::StartScreenBroadcast {
+            peer_id: peer_id.clone(),
+            profile,
+        },
+    )
+    .await?;
+    state.app.status = format!("screen share requested {peer_id} {}", profile.label());
+    Ok(())
+}
+
+async fn accept_incoming_screen_share(
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let session_id = screen_share_session_id(state, None)?;
+    send_network_command(
+        network_state,
+        NetworkCommand::AcceptScreenBroadcast {
+            session_id: session_id.clone(),
+        },
+    )
+    .await?;
+    state.app.status = format!("screen share accepted {session_id}");
+    Ok(())
+}
+
+async fn reject_incoming_screen_share(
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let session_id = screen_share_session_id(state, None)?;
+    send_network_command(
+        network_state,
+        NetworkCommand::RejectScreenBroadcast {
+            session_id: session_id.clone(),
+        },
+    )
+    .await?;
+    state.app.status = format!("screen share rejected {session_id}");
+    Ok(())
+}
+
+async fn end_current_screen_share(network_state: &NetworkState, state: &mut UiState) -> Result<()> {
+    let session_id = screen_share_session_id(state, None)?;
+    send_network_command(
+        network_state,
+        NetworkCommand::EndScreenBroadcast {
+            session_id: session_id.clone(),
+        },
+    )
+    .await?;
+    state.app.status = format!("screen share ending {session_id}");
+    Ok(())
 }
 
 async fn handle_mouse_event(
@@ -3106,6 +3874,13 @@ async fn handle_mouse_event(
         return Ok(());
     }
 
+    if state.app.context_menu.is_some() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left | MouseButton::Right)) {
+            state.app.context_menu = None;
+        }
+        return Ok(());
+    }
+
     if state.app.show_command_palette {
         return Ok(());
     }
@@ -3119,6 +3894,17 @@ async fn handle_mouse_event(
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if rect_contains(layout.composer_actions, mouse.column, mouse.row) {
+                state.app.focus = FocusPane::ComposerActions;
+                if let Some(index) =
+                    composer_action_click_index(layout.composer_actions, mouse.column, mouse.row)
+                {
+                    state.app.selected_composer_action_index = index;
+                    activate_composer_action(app_state, network_state, state).await?;
+                }
+                return Ok(());
+            }
+
             if rect_contains(layout.composer, mouse.column, mouse.row) {
                 state.app.focus = FocusPane::Composer;
                 return Ok(());
@@ -3129,9 +3915,13 @@ async fn handle_mouse_event(
                     Some(MouseHitTarget::Chat(index)) => {
                         state.app.focus = FocusPane::Chats;
                         state.app.selected_chat_index = index;
+                        state.sidebar_follow_selection = true;
                         if let Some(chat_id) = state.app.selected_chat_id().map(ToOwned::to_owned) {
                             open_chat_list_item(app_state, network_state, state, &chat_id).await?;
                         }
+                    }
+                    Some(MouseHitTarget::Envelope(_)) => {
+                        state.app.focus = FocusPane::Chats;
                     }
                     None => {
                         state.app.focus = FocusPane::Chats;
@@ -3144,13 +3934,37 @@ async fn handle_mouse_event(
                 state.app.focus = FocusPane::History;
             }
         }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if rect_contains(layout.sidebar, mouse.column, mouse.row) {
+                state.app.focus = FocusPane::Chats;
+                match sidebar_click_target(state, layout.sidebar, mouse.column, mouse.row) {
+                    Some(MouseHitTarget::Chat(index)) => {
+                        state.app.selected_chat_index = index;
+                        state.app.context_menu =
+                            Some(ContextMenuState::new(ContextMenuTarget::Chat(index)));
+                    }
+                    Some(MouseHitTarget::Envelope(id)) => {
+                        state.app.context_menu =
+                            Some(ContextMenuState::new(ContextMenuTarget::Envelope(id)));
+                    }
+                    None => {}
+                }
+            } else if rect_contains(layout.chat_history, mouse.column, mouse.row) {
+                state.app.focus = FocusPane::History;
+                if let Some(message_id) = state.app.selected_message_id.clone() {
+                    state.app.context_menu =
+                        Some(ContextMenuState::new(ContextMenuTarget::Message(message_id)));
+                }
+            }
+        }
         MouseEventKind::ScrollUp => {
             if rect_contains(layout.chat_history, mouse.column, mouse.row) {
                 state.app.focus = FocusPane::History;
                 state.app.scroll_history(3);
             } else if rect_contains(layout.sidebar, mouse.column, mouse.row) {
                 state.app.focus = FocusPane::Chats;
-                state.app.move_selection(-1);
+                state.sidebar_follow_selection = false;
+                scroll_sidebar_rows(state, -3, sidebar_visible_row_capacity(layout.sidebar));
             }
         }
         MouseEventKind::ScrollDown => {
@@ -3159,7 +3973,8 @@ async fn handle_mouse_event(
                 state.app.scroll_history(-3);
             } else if rect_contains(layout.sidebar, mouse.column, mouse.row) {
                 state.app.focus = FocusPane::Chats;
-                state.app.move_selection(1);
+                state.sidebar_follow_selection = false;
+                scroll_sidebar_rows(state, 3, sidebar_visible_row_capacity(layout.sidebar));
             }
         }
         _ => {}
@@ -3302,9 +4117,10 @@ fn temporary_chat_click_target(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MouseHitTarget {
     Chat(usize),
+    Envelope(String),
 }
 
 fn sidebar_click_target(
@@ -3323,12 +4139,15 @@ fn sidebar_click_target(
         return None;
     }
 
-    let row_index = relative_row.saturating_sub(1) as usize;
-    if let Some(SidebarRow::Chat(index)) = sidebar_rows(state).get(row_index) {
-        return Some(MouseHitTarget::Chat(*index));
+    let row_index = state
+        .app
+        .sidebar_scroll_offset
+        .saturating_add(relative_row.saturating_sub(1) as usize);
+    match sidebar_rows(state).get(row_index) {
+        Some(SidebarRow::Chat(index)) => Some(MouseHitTarget::Chat(*index)),
+        Some(SidebarRow::Envelope { id, .. }) => Some(MouseHitTarget::Envelope(id.clone())),
+        None => None,
     }
-
-    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4293,11 +5112,9 @@ fn drain_core_events(
 
 fn group_invite_received_status(event: &rchat_core::events::GroupInviteReceivedEvent) -> String {
     format!(
-        "group invite {} from {} - /group-invite accept {} or /group-invite reject {}",
+        "group invite {} from {} - open New Person to accept or reject",
         short_identifier(&event.group_name, 28),
-        short_identifier(&event.inviter_peer_id, 24),
-        event.invite_id,
-        event.invite_id
+        short_identifier(&event.inviter_peer_id, 24)
     )
 }
 
@@ -4439,7 +5256,7 @@ impl TerminalSession {
         let backend = CrosstermBackend::new(output);
         let terminal = Terminal::new(backend).context("failed to start terminal")?;
         let mut session = Self { terminal };
-        session.terminal.clear()?;
+        session.clear()?;
         Ok(session)
     }
 
@@ -4454,6 +5271,31 @@ impl TerminalSession {
     fn size(&self) -> Result<Size> {
         self.terminal.size().context("failed to read terminal size")
     }
+
+    fn clear(&mut self) -> Result<()> {
+        execute!(
+            self.terminal.backend_mut(),
+            TerminalClear(ClearType::All),
+            MoveTo(0, 0)
+        )
+        .context("failed to clear terminal")?;
+        force_full_redraw_after_external_clear(&mut self.terminal);
+        Ok(())
+    }
+
+    fn clear_terminal_graphics(&mut self) -> Result<()> {
+        self.terminal
+            .backend_mut()
+            .write_all(kitty_graphics_delete_visible_placements_sequence())
+            .context("failed to clear terminal graphics")?;
+        std::io::Write::flush(self.terminal.backend_mut())
+            .context("failed to flush terminal graphics clear")
+    }
+}
+
+fn force_full_redraw_after_external_clear<B: Backend>(terminal: &mut Terminal<B>) {
+    terminal.swap_buffers();
+    terminal.swap_buffers();
 }
 
 impl Drop for TerminalSession {
@@ -4515,6 +5357,7 @@ struct UiState {
     viewer_image: Option<ViewerLoadedImage>,
     viewer_protocol: Option<ProtocolResponse>,
     viewer_protocol_key: Option<MediaViewerKey>,
+    sidebar_follow_selection: bool,
     show_help: bool,
 }
 
@@ -4560,6 +5403,7 @@ impl UiState {
             viewer_image: None,
             viewer_protocol: None,
             viewer_protocol_key: None,
+            sidebar_follow_selection: true,
             show_help: true,
         }
     }
@@ -5116,7 +5960,9 @@ fn render_app_shell(
     protocol_worker: Option<&ProtocolWorker>,
     kitty_available: bool,
 ) {
-    let theme = Theme::rchat();
+    let theme = app_background_theme(state);
+    let modal_theme = modal_overlay_theme();
+    let background_kitty_available = background_kitty_media_enabled(state, kitty_available);
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg)),
         frame.area(),
@@ -5128,7 +5974,7 @@ fn render_app_shell(
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(12), Constraint::Min(4)])
             .split(layout.chat_history);
-        render_remote_video_panel(frame, split[0], state, kitty_available, &theme);
+        render_remote_video_panel(frame, split[0], state, background_kitty_available, &theme);
         split[1]
     } else {
         layout.chat_history
@@ -5142,31 +5988,35 @@ fn render_app_shell(
         state,
         &theme,
         inline_loader,
-        kitty_available,
+        background_kitty_available,
     );
+    render_composer_actions(frame, layout.composer_actions, state, &theme);
     render_composer(frame, layout.composer, state, &theme);
     render_help_line(frame, layout.help_line, state, &theme);
 
     if state.app.show_help {
-        render_help_overlay(frame, frame.area(), &theme);
+        render_help_overlay(frame, frame.area(), &modal_theme);
     }
     if state.app.chat_details.is_some() {
-        render_chat_details_overlay(frame, frame.area(), state, &theme);
+        render_chat_details_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.new_person.is_some() {
-        render_new_person_overlay(frame, frame.area(), state, kitty_available, &theme);
+        render_new_person_overlay(frame, frame.area(), state, kitty_available, &modal_theme);
     }
     if state.app.settings.is_some() {
-        render_settings_overlay(frame, frame.area(), state, &theme);
+        render_settings_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.attachment_modal.is_some() {
-        render_attachment_overlay(frame, frame.area(), state, &theme);
+        render_attachment_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.sticker_picker.is_some() {
-        render_sticker_picker_overlay(frame, frame.area(), state, &theme);
+        render_sticker_picker_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.attachment_actions.is_some() {
-        render_attachment_actions_overlay(frame, frame.area(), state, &theme);
+        render_attachment_actions_overlay(frame, frame.area(), state, &modal_theme);
+    }
+    if state.app.context_menu.is_some() {
+        render_context_menu_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.media_viewer.is_some() {
         render_media_viewer_overlay(
@@ -5175,15 +6025,70 @@ fn render_app_shell(
             state,
             protocol_worker,
             kitty_available,
-            &theme,
+            &modal_theme,
         );
     }
     if should_render_incoming_screen_share_prompt(state) {
-        render_incoming_screen_share_prompt(frame, frame.area(), state, &theme);
+        render_incoming_screen_share_prompt(frame, frame.area(), state, &modal_theme);
     }
     if state.app.show_command_palette {
-        render_command_palette(frame, frame.area(), state, &theme);
+        render_command_palette(frame, frame.area(), state, &modal_theme);
     }
+}
+
+fn background_kitty_media_enabled(state: &UiState, kitty_available: bool) -> bool {
+    kitty_available && !graphics_obscuring_overlay_active(state)
+}
+
+fn graphics_clear_generation(state: &UiState) -> bool {
+    graphics_obscuring_overlay_active(state)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphicsTransitionAction {
+    clear_kitty_graphics: bool,
+    invalidate_protocols: bool,
+    clear_terminal: bool,
+}
+
+fn graphics_transition_action(
+    previous_overlay_active: bool,
+    current_overlay_active: bool,
+    kitty_available: bool,
+) -> GraphicsTransitionAction {
+    let changed = previous_overlay_active != current_overlay_active;
+    GraphicsTransitionAction {
+        clear_kitty_graphics: changed && kitty_available,
+        invalidate_protocols: changed && kitty_available,
+        clear_terminal: false,
+    }
+}
+
+fn kitty_graphics_delete_visible_placements_sequence() -> &'static [u8] {
+    KITTY_DELETE_VISIBLE_PLACEMENTS
+}
+
+fn invalidate_terminal_graphics_protocols(state: &mut UiState) {
+    state.protocol = None;
+    state.remote_video_protocol = None;
+    state.viewer_protocol = None;
+    state.viewer_protocol_key = None;
+    state.last_protocol_seq = None;
+    state.inline_media_cache.clear();
+}
+
+fn graphics_obscuring_overlay_active(state: &UiState) -> bool {
+    state.app.show_help
+        || state.app.chat_details.is_some()
+        || state.app.new_person.is_some()
+        || state.app.settings.is_some()
+        || state.app.attachment_modal.is_some()
+        || state.app.sticker_picker.is_some()
+        || state.app.attachment_actions.is_some()
+        || state.app.context_menu.is_some()
+        || state.app.media_viewer.is_some()
+        || state.app.show_command_palette
+        || should_render_incoming_screen_share_prompt(state)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5191,6 +6096,7 @@ struct AppLayout {
     top_bar: Rect,
     sidebar: Rect,
     chat_history: Rect,
+    composer_actions: Rect,
     composer: Rect,
     help_line: Rect,
 }
@@ -5201,6 +6107,7 @@ fn app_layout(area: Rect) -> AppLayout {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
+            Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Length(1),
         ])
@@ -5214,8 +6121,9 @@ fn app_layout(area: Rect) -> AppLayout {
         top_bar: root[0],
         sidebar: body[0],
         chat_history: body[1],
-        composer: root[2],
-        help_line: root[3],
+        composer_actions: root[2],
+        composer: root[3],
+        help_line: root[4],
     }
 }
 
@@ -5340,23 +6248,23 @@ fn voice_call_status_label(state: &UiState) -> Option<String> {
     let peer = call.peer_id.as_deref().unwrap_or("unknown");
     let label = match (kind, &call.phase) {
         (CallKind::Voice, VoiceCallPhase::OutgoingRinging) => {
-            format!("voice calling {peer} | / voice end")
+            format!("voice calling {peer} | Actions: Voice ends")
         }
         (CallKind::Voice, VoiceCallPhase::IncomingRinging) => {
-            format!("voice incoming {peer} | / voice accept | / voice reject")
+            format!("voice incoming {peer} | use incoming call controls")
         }
         (CallKind::Voice, VoiceCallPhase::Active) if call.muted => {
-            format!("voice active {peer} muted | / voice mute off | / voice end")
+            format!("voice active {peer} muted | Actions: Voice ends")
         }
         (CallKind::Voice, VoiceCallPhase::Active) => {
-            format!("voice active {peer} | / voice mute on | / voice end")
+            format!("voice active {peer} | Actions: Voice ends")
         }
         (CallKind::Voice, VoiceCallPhase::Ending) => format!("voice ending {peer}"),
         (CallKind::Video, VoiceCallPhase::OutgoingRinging) => {
-            format!("video calling {peer} | / video end")
+            format!("video calling {peer} | Actions: Video ends")
         }
         (CallKind::Video, VoiceCallPhase::IncomingRinging) => {
-            format!("video incoming {peer} | / video accept | / video reject")
+            format!("video incoming {peer} | use incoming call controls")
         }
         (CallKind::Video, VoiceCallPhase::Active) => video_call_active_status_label(call, peer),
         (CallKind::Video, VoiceCallPhase::Ending) => format!("video ending {peer}"),
@@ -5372,17 +6280,7 @@ fn video_call_active_status_label(call: &VoiceCallState, peer: &str) -> String {
     } else {
         "camera off"
     };
-    let mute_action = if call.muted {
-        "/ video mute off"
-    } else {
-        "/ video mute on"
-    };
-    let camera_action = if call.camera_enabled {
-        "/ video camera off"
-    } else {
-        "/ video camera on"
-    };
-    format!("video active {peer} {mute} {camera} | {mute_action} | {camera_action} | / video end")
+    format!("video active {peer} {mute} {camera} | Actions: Video ends")
 }
 
 fn screen_share_status_label(state: &UiState) -> Option<String> {
@@ -5392,16 +6290,14 @@ fn screen_share_status_label(state: &UiState) -> Option<String> {
     }
     let peer = broadcast.peer_id.as_deref().unwrap_or("unknown");
     let label = match broadcast.phase {
-        BroadcastPhase::OutgoingRinging => {
-            format!("starting screen share with {peer} | / screen end")
-        }
+        BroadcastPhase::OutgoingRinging => format!("starting screen share with {peer} | e end"),
         BroadcastPhase::IncomingRinging => {
-            format!("incoming screen share from {peer} | / screen accept | / screen reject")
+            format!("incoming screen share from {peer} | a accept | r reject")
         }
         BroadcastPhase::Active if broadcast.is_host => {
-            format!("sharing screen with {peer} | / screen end")
+            format!("sharing screen with {peer} | e end")
         }
-        BroadcastPhase::Active => format!("watching screen share from {peer} | / screen end"),
+        BroadcastPhase::Active => format!("watching screen share from {peer} | e end"),
         BroadcastPhase::Ending => format!("ending screen share with {peer}"),
         BroadcastPhase::Idle => return None,
     };
@@ -5425,7 +6321,7 @@ fn incoming_screen_share_prompt_summary(state: &UiState) -> Option<IncomingScree
     Some(IncomingScreenSharePrompt {
         title: "Incoming screen share".to_string(),
         body: format!("{peer} wants to share their screen.\nSession {session}"),
-        actions: "/ screen accept    / screen reject".to_string(),
+        actions: "a accept    r reject".to_string(),
     })
 }
 
@@ -5438,6 +6334,7 @@ fn should_render_incoming_screen_share_prompt(state: &UiState) -> bool {
         && state.app.attachment_modal.is_none()
         && state.app.sticker_picker.is_none()
         && state.app.attachment_actions.is_none()
+        && state.app.context_menu.is_none()
         && state.app.media_viewer.is_none()
 }
 
@@ -5470,7 +6367,7 @@ fn render_incoming_screen_share_prompt(
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "Open command palette with /, then run one of the commands.",
+            "Use the direct keys above. Esc keeps the share pending.",
             Style::default().fg(theme.muted),
         )),
     ];
@@ -5481,9 +6378,13 @@ fn render_incoming_screen_share_prompt(
     frame.render_widget(paragraph, popup);
 }
 
-fn render_app_sidebar(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+fn render_app_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState, theme: &Theme) {
     let mut lines = vec![Line::from(Span::styled(
-        "Chats",
+        if state.app.sidebar_search_active {
+            format!("Search: {}", state.app.sidebar_search)
+        } else {
+            "Chats".to_string()
+        },
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))];
 
@@ -5494,9 +6395,11 @@ fn render_app_sidebar(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme:
         )));
     }
 
-    for row in sidebar_rows(state) {
+    let inner = inset_rect(area, 1);
+    let visible_capacity = inner.height.saturating_sub(1) as usize;
+    for row in visible_sidebar_rows(state, visible_capacity) {
         match row {
-            SidebarRow::Envelope(label) => {
+            SidebarRow::Envelope { label, .. } => {
                 lines.push(Line::from(Span::styled(
                     label,
                     Style::default()
@@ -5525,11 +6428,22 @@ fn render_app_sidebar(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme:
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarRow {
-    Envelope(String),
+    Envelope { id: String, label: String },
     Chat(usize),
 }
 
 fn sidebar_rows(state: &UiState) -> Vec<SidebarRow> {
+    let query = state.app.sidebar_search.trim().to_ascii_lowercase();
+    let chat_matches = |chat: &TuiChat| {
+        query.is_empty()
+            || chat.name.to_ascii_lowercase().contains(&query)
+            || chat.id.to_ascii_lowercase().contains(&query)
+    };
+    let envelope_matches = |envelope: &TuiEnvelope| {
+        query.is_empty()
+            || envelope.name.to_ascii_lowercase().contains(&query)
+            || envelope.id.to_ascii_lowercase().contains(&query)
+    };
     let known_envelopes = state
         .app
         .envelopes
@@ -5545,7 +6459,10 @@ fn sidebar_rows(state: &UiState) -> Vec<SidebarRow> {
             .chats
             .iter()
             .enumerate()
-            .filter(|(_, chat)| state.app.chat_envelope_id(&chat.id) == Some(envelope.id.as_str()))
+            .filter(|(_, chat)| {
+                state.app.chat_envelope_id(&chat.id) == Some(envelope.id.as_str())
+                    && (chat_matches(chat) || envelope_matches(envelope))
+            })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if members.is_empty() {
@@ -5553,7 +6470,10 @@ fn sidebar_rows(state: &UiState) -> Vec<SidebarRow> {
         }
 
         let icon = envelope.icon.as_deref().unwrap_or("folder");
-        rows.push(SidebarRow::Envelope(format!("{icon} {}", envelope.name)));
+        rows.push(SidebarRow::Envelope {
+            id: envelope.id.clone(),
+            label: format!("{icon} {}", envelope.name),
+        });
         for index in members {
             grouped_chat_indices.insert(index);
             rows.push(SidebarRow::Chat(index));
@@ -5573,11 +6493,76 @@ fn sidebar_rows(state: &UiState) -> Vec<SidebarRow> {
                 .app
                 .chat_envelope_id(&chat.id)
                 .is_none_or(|envelope_id| !known_envelopes.contains(envelope_id))
+                && chat_matches(chat)
         })
         .map(|(index, _)| SidebarRow::Chat(index))
         .collect::<Vec<_>>();
     root_rows.extend(rows);
     root_rows
+}
+
+fn sidebar_visible_row_capacity(sidebar: Rect) -> usize {
+    inset_rect(sidebar, 1).height.saturating_sub(1) as usize
+}
+
+fn visible_sidebar_rows(state: &mut UiState, visible_capacity: usize) -> Vec<SidebarRow> {
+    let rows = sidebar_rows(state);
+    if visible_capacity == 0 || rows.is_empty() {
+        state.app.sidebar_scroll_offset = 0;
+        return Vec::new();
+    }
+
+    let max_offset = rows.len().saturating_sub(visible_capacity);
+    state.app.sidebar_scroll_offset = state.app.sidebar_scroll_offset.min(max_offset);
+
+    if state.sidebar_follow_selection {
+        if let Some(selected_row) = selected_sidebar_row_index(&rows, state.app.selected_chat_index)
+        {
+            if selected_row < state.app.sidebar_scroll_offset {
+                state.app.sidebar_scroll_offset = selected_row;
+            } else {
+                let bottom = state
+                    .app
+                    .sidebar_scroll_offset
+                    .saturating_add(visible_capacity);
+                if selected_row >= bottom {
+                    state.app.sidebar_scroll_offset = selected_row
+                        .saturating_add(1)
+                        .saturating_sub(visible_capacity);
+                }
+            }
+        }
+    }
+    state.sidebar_follow_selection = false;
+
+    let start = state.app.sidebar_scroll_offset.min(max_offset);
+    rows.into_iter().skip(start).take(visible_capacity).collect()
+}
+
+fn scroll_sidebar_rows(state: &mut UiState, delta: isize, visible_capacity: usize) {
+    let rows = sidebar_rows(state);
+    if visible_capacity == 0 || rows.len() <= visible_capacity {
+        state.app.sidebar_scroll_offset = 0;
+        return;
+    }
+    let max_offset = rows.len().saturating_sub(visible_capacity);
+    if delta < 0 {
+        state.app.sidebar_scroll_offset = state
+            .app
+            .sidebar_scroll_offset
+            .saturating_sub(delta.unsigned_abs());
+    } else {
+        state.app.sidebar_scroll_offset = state
+            .app
+            .sidebar_scroll_offset
+            .saturating_add(delta as usize)
+            .min(max_offset);
+    }
+}
+
+fn selected_sidebar_row_index(rows: &[SidebarRow], selected_chat_index: usize) -> Option<usize> {
+    rows.iter()
+        .position(|row| *row == SidebarRow::Chat(selected_chat_index))
 }
 
 fn sidebar_chat_line<'a>(state: &'a UiState, index: usize, theme: &Theme) -> Line<'a> {
@@ -5592,6 +6577,32 @@ fn sidebar_chat_line<'a>(state: &'a UiState, index: usize, theme: &Theme) -> Lin
         "online"
     } else {
         "offline"
+    };
+    let parsed_kind = chat_kind::parse_chat_kind(&chat.id);
+    let mut badges = Vec::new();
+    if state.app.is_chat_pinned(chat) {
+        badges.push("pin");
+    }
+    if matches!(
+        parsed_kind,
+        ChatKind::TemporaryDirect | ChatKind::TemporaryGroup
+    ) {
+        badges.push("temp");
+    }
+    if state.voice_call_state.peer_id.as_deref() == Some(chat.id.as_str())
+        && state.voice_call_state.phase != VoiceCallPhase::Idle
+    {
+        badges.push("live");
+    }
+    if state.broadcast_state.peer_id.as_deref() == Some(chat.id.as_str())
+        && state.broadcast_state.phase != BroadcastPhase::Idle
+    {
+        badges.push("share");
+    }
+    let badges = if badges.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", badges.join(" "))
     };
     let unread = if chat.unread_count > 0 {
         format!(" ({})", chat.unread_count)
@@ -5619,7 +6630,7 @@ fn sidebar_chat_line<'a>(state: &'a UiState, index: usize, theme: &Theme) -> Lin
     };
     let name = display_chat_name(&chat.name, &chat.id);
     Line::from(Span::styled(
-        format!("{marker} {} [{}]{}", name, kind_label, unread),
+        format!("{marker} {} [{}]{}{}", name, kind_label, unread, badges),
         style,
     ))
 }
@@ -5852,11 +6863,13 @@ fn render_message(
     } else {
         display_sender_label(&message.sender, peer_label)
     };
-    let attachment_selected = state.app.focus == FocusPane::History
-        && state
-            .app
-            .selected_attachment_message()
-            .is_some_and(|selected| selected.id == message.id);
+    let message_selected = message_is_selected(state, message);
+    let attachment_selected = message_selected && message_is_attachment(message);
+    let message_bg = if message_selected {
+        theme.surface
+    } else {
+        theme.bg
+    };
     let mut header_spans = vec![
         Span::styled(
             sender_label,
@@ -5876,17 +6889,21 @@ fn render_message(
             Style::default().fg(theme.muted),
         ),
     ];
-    if attachment_selected {
+    if message_selected {
         header_spans.push(Span::raw("  "));
         header_spans.push(Span::styled(
-            "v view | Enter actions",
+            if attachment_selected {
+                "selected | v view | Enter actions"
+            } else {
+                "selected"
+            },
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ));
     }
     let header = Paragraph::new(Line::from(header_spans))
-        .style(Style::default().bg(theme.bg).fg(theme.text));
+        .style(Style::default().bg(message_bg).fg(theme.text));
     frame.render_widget(
         header,
         Rect {
@@ -5917,7 +6934,7 @@ fn render_message(
         )));
     }
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().bg(theme.bg).fg(theme.text))
+        .style(Style::default().bg(message_bg).fg(theme.text))
         .wrap(Wrap { trim: true });
     frame.render_widget(
         paragraph,
@@ -5928,6 +6945,14 @@ fn render_message(
             height: area.height.saturating_sub(1),
         },
     );
+}
+
+fn message_is_selected(state: &UiState, message: &TuiMessage) -> bool {
+    state.app.focus == FocusPane::History
+        && state
+            .app
+            .selected_message()
+            .is_some_and(|selected| selected.id == message.id)
 }
 
 fn render_message_clipped(
@@ -6144,6 +7169,44 @@ fn short_hash(hash: &str) -> String {
     }
 }
 
+fn render_composer_actions(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+    let focused = state.app.focus == FocusPane::ComposerActions;
+    let border_style = if focused {
+        Style::default().fg(theme.accent)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let spans = ComposerAction::ALL
+        .iter()
+        .enumerate()
+        .flat_map(|(index, action)| {
+            let selected = focused && index == state.app.selected_composer_action_index;
+            let style = if selected {
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            [
+                Span::styled(format!(" {} ", action.label()), style),
+                Span::raw(" "),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line)
+        .block(
+            themed_block(" Actions ", theme)
+                .border_style(border_style)
+                .style(Style::default().bg(theme.surface).fg(theme.text)),
+        )
+        .style(Style::default().bg(theme.surface).fg(theme.text))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
     let focused = state.app.focus == FocusPane::Composer;
     let title = if state.app.active_chat_id.is_some() {
@@ -6169,61 +7232,150 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &T
 }
 
 fn render_help_line(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
-    let line = Paragraph::new(format!(
-        "Focus: {} | n new person | s settings | Tab: Conversations → Chat → Message | ↑/↓ navigate/scroll | PgUp/PgDn chat | Enter select/send | Mouse click/scroll | / commands | ? help | q quit",
-        focus_label(state.app.focus)
-    ))
-    .style(Style::default().bg(theme.bg).fg(theme.muted));
+    let line = Paragraph::new(help_line_text(state, area.width as usize))
+        .style(Style::default().bg(theme.bg).fg(theme.muted));
     frame.render_widget(line, area);
 }
 
-fn focus_label(focus: FocusPane) -> &'static str {
-    match focus {
-        FocusPane::Chats => "Conversations",
+fn help_line_text(state: &UiState, width: usize) -> String {
+    if state.app.new_person.is_some() {
+        return fit_segments(
+            &["New Person", "Up/Down move", "Enter activate", "Esc back"],
+            width,
+        );
+    }
+    if state.app.settings.is_some() {
+        return fit_segments(
+            &[
+                "Settings",
+                "Tab panes",
+                "Up/Down move",
+                "Enter activate",
+                "Esc close",
+            ],
+            width,
+        );
+    }
+    if state.app.media_viewer.is_some() {
+        return fit_segments(
+            &["Viewer", "+/- zoom", "arrows move", "Enter action", "Esc close"],
+            width,
+        );
+    }
+    if state.app.attachment_actions.is_some() {
+        return fit_segments(
+            &["Attachment", "Up/Down move", "Enter action", "Esc close"],
+            width,
+        );
+    }
+    if state.app.attachment_modal.is_some() {
+        return fit_segments(&["Attach", "Up/Down kind", "Enter send", "Esc close"], width);
+    }
+    if state.app.sticker_picker.is_some() {
+        return fit_segments(&["Stickers", "Up/Down move", "Enter send", "Esc close"], width);
+    }
+    if state.app.show_command_palette {
+        return fit_segments(&["Commands", "Enter run", "Esc close"], width);
+    }
+
+    let focus = match state.app.focus {
+        FocusPane::Chats => "Chats",
         FocusPane::History => "Chat",
+        FocusPane::ComposerActions => "Actions",
         FocusPane::Composer => "Message",
         FocusPane::CommandPalette => "Commands",
+    };
+    let context_hints: &[&str] = match state.app.focus {
+        FocusPane::Chats if state.app.sidebar_search_active => {
+            &["type to filter", "Esc clear", "Enter open"]
+        }
+        FocusPane::Chats => &["Up/Down move", "/ search", "Enter open", "m menu"],
+        FocusPane::History => &["Up/Down msgs", "Enter actions", "v view"],
+        FocusPane::ComposerActions => &["Left/Right choose", "Enter activate"],
+        FocusPane::Composer => &["Enter send", "Tab leave"],
+        FocusPane::CommandPalette => &["Enter run", "Esc close"],
+    };
+    let mut parts = if state.app.focus == FocusPane::Composer {
+        vec![focus, "text types normally", "? is text"]
+    } else {
+        vec![focus, "n new", "s settings", "? help", "q quit"]
+    };
+    parts.extend_from_slice(context_hints);
+    fit_segments(&parts, width)
+}
+
+fn fit_segments(parts: &[&str], width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    for part in parts {
+        let candidate = if output.is_empty() {
+            (*part).to_string()
+        } else {
+            format!("{output} | {part}")
+        };
+        if candidate.chars().count() <= width {
+            output = candidate;
+        }
+    }
+
+    if output.is_empty() {
+        truncate_chars(parts.first().copied().unwrap_or_default(), width)
+    } else {
+        truncate_chars(&output, width)
     }
 }
 
+fn truncate_chars(value: &str, width: usize) -> String {
+    value.chars().take(width).collect()
+}
+
 fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let popup = centered_rect(76, 19, area);
+    let popup = centered_rect(76, 24, area);
     draw_shadow(frame, popup);
     frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::from("Keyboard"),
-        Line::from("Tab: Conversations -> Chat -> Message -> Conversations"),
-        Line::from("Up/Down: navigate conversations or scroll focused chat"),
-        Line::from("PageUp/PageDown: scroll chat history"),
-        Line::from("Enter: open chat or send message"),
-        Line::from("n: New Person"),
-        Line::from("s: Settings"),
-        Line::from("/: command palette"),
-        Line::from("Mouse: click pane to focus, wheel over chat to scroll"),
-        Line::from("q: quit"),
-        Line::from(""),
-        Line::from("Commands"),
-        Line::from("refresh | open <chat-id> | details [chat-id] | connect <peer-id>"),
-        Line::from("envelope create <id> <name> | rename <id> <name> | delete <id>"),
-        Line::from("move <chat-id> <envelope-id|root>"),
-        Line::from("invite create <user> <password>"),
-        Line::from("invite redeem <user> <password>"),
-        Line::from("attach [image|document|video|audio] <path>"),
-        Line::from("sticker [file-hash]"),
-        Line::from("view <file-hash> | save <file-hash> <target-path> | open <file-hash>"),
-        Line::from("copy-hash <file-hash> | retry <file-hash>"),
-        Line::from("voice start [chat-id] | accept [call-id] | reject [call-id] | end [call-id]"),
-        Line::from("voice mute [on|off] [call-id]"),
-        Line::from("video start [chat-id] | accept [call-id] | reject [call-id] | end [call-id]"),
-        Line::from("video mute [on|off] [call-id] | camera <on|off> [call-id]"),
-        Line::from("screen start [480p15|480p30|720p15|720p30] [chat-id]"),
-        Line::from("screen accept [session-id] | reject [session-id] | end [session-id]"),
-    ];
+    let lines = help_overlay_text_lines()
+        .iter()
+        .copied()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
         .block(themed_block(" Help ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, popup);
+}
+
+fn help_overlay_text_lines() -> &'static [&'static str] {
+    &[
+        "Keyboard",
+        "Tab: Conversations -> Chat -> Actions -> Message -> Conversations",
+        "Up/Down: move the selected conversation or message",
+        "PageUp/PageDown: scroll chat history",
+        "Enter: open chat, activate action, open attachment actions, or send message",
+        "Left/Right: choose composer action when Actions is focused",
+        "/: search conversations outside Message focus",
+        "n: New Person",
+        "s: Settings",
+        "v: View selected attachment from Chat focus",
+        "?: Help",
+        "q: quit outside Message focus",
+        "",
+        "Message",
+        "When Message is focused, letters and punctuation are typed normally.",
+        "Use Tab or mouse click to leave the message box before using app shortcuts.",
+        "",
+        "Mouse",
+        "Click a pane to focus it. Click action buttons to activate them.",
+        "Use the wheel over Conversations or Chat to scroll.",
+        "",
+        "Incoming Screen Share",
+        "a: accept",
+        "r: reject",
+        "e: end active screen share",
+    ]
 }
 
 fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
@@ -6380,11 +7532,25 @@ fn render_sticker_picker_overlay(
         )),
         Line::from(""),
     ];
-    if picker.stickers.is_empty() {
+    if picker.mode == StickerPickerMode::AddPath {
+        lines.push(attachment_modal_line(
+            true,
+            "Path",
+            &picker.add_path,
+            theme,
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Enter imports, Esc returns to picker",
+            Style::default().fg(theme.muted),
+        )));
+    } else if picker.stickers.is_empty() {
         lines.push(Line::from(Span::styled(
             "No stickers in library",
             Style::default().fg(theme.muted),
         )));
+        lines.push(Line::from(""));
+        lines.push(attachment_button_line(true, "Add", "press a", theme));
     } else {
         for (index, sticker) in picker.stickers.iter().take(10).enumerate() {
             let selected = index == picker.selected_index;
@@ -6407,10 +7573,17 @@ fn render_sticker_picker_overlay(
                 style,
             )));
         }
+        lines.push(Line::from(""));
+        lines.push(attachment_button_line(false, "Add", "press a", theme));
     }
     lines.push(Line::from(""));
+    let hint = if picker.mode == StickerPickerMode::AddPath {
+        "Enter imports sticker, Esc goes back"
+    } else {
+        "Enter sends selected sticker, a adds from path, Esc closes"
+    };
     lines.push(Line::from(Span::styled(
-        "Enter sends selected sticker, Esc closes",
+        hint,
         Style::default().fg(theme.muted),
     )));
     lines.push(modal_status_line(
@@ -6483,6 +7656,20 @@ fn render_attachment_actions_overlay(
             "direct chat",
             theme,
         ),
+        if modal.content_type == "sticker" {
+            if modal.sticker_saved {
+                attachment_button_line(false, "Saved", "in sticker library", theme)
+            } else {
+                attachment_button_line(
+                    modal.focus == AttachmentActionField::SaveSticker,
+                    "Save sticker",
+                    "add to library",
+                    theme,
+                )
+            }
+        } else {
+            Line::from("")
+        },
         attachment_button_line(
             modal.focus == AttachmentActionField::Close,
             "Close",
@@ -6498,6 +7685,42 @@ fn render_attachment_actions_overlay(
     ];
     let paragraph = Paragraph::new(lines)
         .block(themed_block(" Attachment ", theme))
+        .style(Style::default().bg(theme.surface).fg(theme.text))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_context_menu_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+    let Some(menu) = state.app.context_menu.as_ref() else {
+        return;
+    };
+    let actions = context_menu_actions(menu);
+    let height = (actions.len() as u16).saturating_add(3).max(5);
+    let popup = centered_rect(38, height, area);
+    draw_shadow(frame, popup);
+    frame.render_widget(Clear, popup);
+    let lines = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let selected = index == menu.selected_index;
+            let marker = if selected { ">" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(Span::styled(
+                format!("{marker} {}", context_menu_action_label(*action)),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(lines)
+        .block(themed_block(" Menu ", theme))
         .style(Style::default().bg(theme.surface).fg(theme.text))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
@@ -6669,10 +7892,7 @@ fn render_media_viewer_details(
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            format!(
-                "zoom {}%  pan {},{}",
-                viewer.zoom_percent, viewer.pan_x, viewer.pan_y
-            ),
+            media_viewer_view_label(viewer),
             Style::default().fg(theme.muted),
         )),
         viewer_input_line(
@@ -6713,7 +7933,7 @@ fn render_media_viewer_details(
         viewer_button_line(viewer, MediaViewerAction::Close, "Close", "dismiss", theme),
         Line::from(""),
         Line::from(Span::styled(
-            "+/- zoom  arrows pan  0 reset  s/o/c/r actions  Esc close",
+            media_viewer_shortcuts_label(),
             Style::default().fg(theme.muted),
         )),
         modal_status_line(viewer.status.as_deref(), viewer.error.as_deref(), theme),
@@ -6724,6 +7944,17 @@ fn render_media_viewer_details(
         .style(Style::default().bg(theme.surface).fg(theme.text))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn media_viewer_view_label(viewer: &crate::state::MediaViewerState) -> String {
+    format!(
+        "zoom {}%  offset {},{}",
+        viewer.zoom_percent, viewer.pan_x, viewer.pan_y
+    )
+}
+
+fn media_viewer_shortcuts_label() -> &'static str {
+    "+/- zoom  arrows move image when zoomed  0 reset  s/o/c/r actions  Esc close"
 }
 
 fn viewer_input_line(
@@ -6868,15 +8099,18 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, t
         .iter()
         .enumerate()
         .map(|(index, section)| {
-            let focused = modal.focus == SettingsField::Section(index);
+            let focused = modal.pane == SettingsPane::Menu
+                && modal.focus == SettingsField::Section(index);
             let active = modal.section == *section;
             let marker = if active { ">" } else { " " };
             Line::from(Span::styled(
                 format!("{marker} {}", section.label()),
-                if focused || active {
+                if focused {
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
+                } else if active {
+                    Style::default().fg(theme.warning)
                 } else {
                     Style::default().fg(theme.text)
                 },
@@ -6914,7 +8148,7 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, t
         )));
     }
     lines.push(Line::from(Span::styled(
-        "Esc close | Tab focus | Up/Down section | Enter activate",
+        "Esc close | Tab menu/content | Up/Down move focus | Enter activate",
         Style::default().fg(theme.muted),
     )));
 
@@ -7565,10 +8799,14 @@ fn new_person_lines(
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Tab focus | Enter activate | Esc back/close",
+        new_person_shortcuts_label(),
         Style::default().fg(theme.muted),
     )));
     lines
+}
+
+fn new_person_shortcuts_label() -> &'static str {
+    "Up/Down move | Enter activate | Esc back/close"
 }
 
 fn new_person_step_title(step: NewPersonStep) -> &'static str {
@@ -7783,6 +9021,7 @@ fn short_identifier(value: &str, max_chars: usize) -> String {
     format!("{head}...{tail}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Theme {
     bg: Color,
     surface: Color,
@@ -7805,6 +9044,31 @@ impl Theme {
             error: Color::Rgb(239, 111, 108),
         }
     }
+
+    fn dimmed(self) -> Self {
+        Self {
+            bg: Color::Rgb(8, 10, 14),
+            surface: Color::Rgb(13, 17, 23),
+            accent: Color::Rgb(43, 105, 82),
+            warning: Color::Rgb(117, 97, 58),
+            text: Color::Rgb(94, 105, 122),
+            muted: Color::Rgb(58, 66, 80),
+            error: Color::Rgb(120, 55, 54),
+        }
+    }
+}
+
+fn app_background_theme(state: &UiState) -> Theme {
+    let theme = Theme::rchat();
+    if graphics_obscuring_overlay_active(state) {
+        theme.dimmed()
+    } else {
+        theme
+    }
+}
+
+fn modal_overlay_theme() -> Theme {
+    Theme::rchat()
 }
 
 fn themed_block(title: impl Into<Line<'static>>, theme: &Theme) -> Block<'static> {

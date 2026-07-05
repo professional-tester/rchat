@@ -441,6 +441,11 @@ impl ConfigManager {
         }
         false
     }
+
+    pub fn clear_restored_session(&mut self) {
+        self.key = None;
+        let _ = session::end_session();
+    }
 }
 
 #[derive(Serialize, Deserialize)]

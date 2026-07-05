@@ -81,8 +81,77 @@ pub enum IncomingMessageEffect {
 pub enum FocusPane {
     Chats,
     History,
+    ComposerActions,
     Composer,
     CommandPalette,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerAction {
+    Attach,
+    Stickers,
+    Voice,
+    Video,
+    Screen,
+    Details,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextMenuTarget {
+    Chat(usize),
+    Envelope(String),
+    Message(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuAction {
+    Open,
+    Details,
+    MoveToRoot,
+    DeleteEnvelope,
+    AttachmentActions,
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextMenuState {
+    pub target: ContextMenuTarget,
+    pub selected_index: usize,
+}
+
+impl ContextMenuState {
+    pub fn new(target: ContextMenuTarget) -> Self {
+        Self {
+            target,
+            selected_index: 0,
+        }
+    }
+
+    pub fn move_selection(&mut self, delta: isize, len: usize) {
+        self.selected_index = next_index(self.selected_index, delta, len);
+    }
+}
+
+impl ComposerAction {
+    pub const ALL: [Self; 6] = [
+        Self::Attach,
+        Self::Stickers,
+        Self::Voice,
+        Self::Video,
+        Self::Screen,
+        Self::Details,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Attach => "Attach",
+            Self::Stickers => "Stickers",
+            Self::Voice => "Voice",
+            Self::Video => "Video",
+            Self::Screen => "Screen",
+            Self::Details => "Details",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,12 +316,19 @@ impl NewPersonModalState {
     }
 
     pub fn cycle_focus(&mut self, local_peer_count: usize) {
+        self.move_focus(1, local_peer_count);
+    }
+
+    pub fn move_focus(&mut self, delta: isize, local_peer_count: usize) {
         let fields = self.visible_fields(local_peer_count);
+        if fields.is_empty() {
+            return;
+        }
         let current = fields
             .iter()
             .position(|field| field == &self.focus)
             .unwrap_or(0);
-        self.focus = fields[(current + 1) % fields.len()].clone();
+        self.focus = fields[next_index(current, delta, fields.len())].clone();
     }
 
     pub fn push_char(&mut self, ch: char) {
@@ -350,6 +426,12 @@ pub enum SettingsField {
     StickerDelete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPane {
+    Menu,
+    Content,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiThemePreset {
     pub key: String,
@@ -367,6 +449,7 @@ pub struct TuiSticker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsModalState {
     pub section: SettingsSection,
+    pub pane: SettingsPane,
     pub focus: SettingsField,
     pub profile_alias: String,
     pub profile_avatar_path: String,
@@ -391,6 +474,7 @@ impl Default for SettingsModalState {
     fn default() -> Self {
         Self {
             section: SettingsSection::Profile,
+            pane: SettingsPane::Menu,
             focus: SettingsField::Section(0),
             profile_alias: String::new(),
             profile_avatar_path: String::new(),
@@ -414,13 +498,16 @@ impl Default for SettingsModalState {
 }
 
 impl SettingsModalState {
-    pub fn visible_fields(&self) -> Vec<SettingsField> {
-        let mut fields = SettingsSection::ALL
+    pub fn menu_fields(&self) -> Vec<SettingsField> {
+        SettingsSection::ALL
             .iter()
             .enumerate()
             .map(|(index, _)| SettingsField::Section(index))
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
+    pub fn content_fields(&self) -> Vec<SettingsField> {
+        let mut fields = Vec::new();
         match self.section {
             SettingsSection::Profile => fields.extend([
                 SettingsField::ProfileAlias,
@@ -469,25 +556,36 @@ impl SettingsModalState {
         fields
     }
 
+    pub fn visible_fields(&self) -> Vec<SettingsField> {
+        match self.pane {
+            SettingsPane::Menu => self.menu_fields(),
+            SettingsPane::Content => self.content_fields(),
+        }
+    }
+
     pub fn cycle_focus(&mut self) {
-        let fields = self.visible_fields();
-        let current = fields
-            .iter()
-            .position(|field| field == &self.focus)
-            .unwrap_or(0);
-        self.focus = fields[(current + 1) % fields.len()].clone();
+        match self.pane {
+            SettingsPane::Menu => self.focus_first_content_field(),
+            SettingsPane::Content => {
+                self.pane = SettingsPane::Menu;
+                self.focus = self.section_field();
+            }
+        }
     }
 
     pub fn set_section(&mut self, section: SettingsSection) {
         self.section = section;
+        self.pane = SettingsPane::Menu;
         self.status = None;
         self.error = None;
-        self.focus = SettingsField::Section(
-            SettingsSection::ALL
-                .iter()
-                .position(|candidate| *candidate == section)
-                .unwrap_or(0),
-        );
+        self.focus = self.section_field();
+    }
+
+    pub fn activate_section(&mut self, section: SettingsSection) {
+        self.section = section;
+        self.status = None;
+        self.error = None;
+        self.focus_first_content_field();
     }
 
     pub fn move_section(&mut self, delta: isize) {
@@ -497,6 +595,41 @@ impl SettingsModalState {
             .unwrap_or(0);
         let next = next_index(current, delta, SettingsSection::ALL.len());
         self.set_section(SettingsSection::ALL[next]);
+    }
+
+    pub fn move_content(&mut self, delta: isize) {
+        let fields = self.content_fields();
+        if fields.is_empty() {
+            self.pane = SettingsPane::Menu;
+            self.focus = self.section_field();
+            return;
+        }
+        let current = fields
+            .iter()
+            .position(|field| field == &self.focus)
+            .unwrap_or(0);
+        self.pane = SettingsPane::Content;
+        self.focus = fields[next_index(current, delta, fields.len())].clone();
+    }
+
+    fn focus_first_content_field(&mut self) {
+        let fields = self.content_fields();
+        if let Some(field) = fields.first() {
+            self.pane = SettingsPane::Content;
+            self.focus = field.clone();
+        } else {
+            self.pane = SettingsPane::Menu;
+            self.focus = self.section_field();
+        }
+    }
+
+    fn section_field(&self) -> SettingsField {
+        SettingsField::Section(
+            SettingsSection::ALL
+                .iter()
+                .position(|candidate| *candidate == self.section)
+                .unwrap_or(0),
+        )
     }
 
     pub fn focused_theme_preset_key(&self) -> Option<&str> {
@@ -640,9 +773,17 @@ impl AttachmentModalState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickerPickerMode {
+    Browse,
+    AddPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StickerPickerState {
     pub stickers: Vec<TuiSticker>,
     pub selected_index: usize,
+    pub mode: StickerPickerMode,
+    pub add_path: String,
     pub status: Option<String>,
     pub error: Option<String>,
 }
@@ -652,6 +793,8 @@ impl StickerPickerState {
         Self {
             stickers,
             selected_index: 0,
+            mode: StickerPickerMode::Browse,
+            add_path: String::new(),
             status: None,
             error: None,
         }
@@ -665,6 +808,42 @@ impl StickerPickerState {
         self.stickers
             .get(self.selected_index)
             .map(|sticker| sticker.file_hash.as_str())
+    }
+
+    pub fn select_hash(&mut self, file_hash: &str) {
+        if let Some(index) = self
+            .stickers
+            .iter()
+            .position(|sticker| sticker.file_hash == file_hash)
+        {
+            self.selected_index = index;
+        }
+    }
+
+    pub fn enter_add_path_mode(&mut self) {
+        self.mode = StickerPickerMode::AddPath;
+        self.add_path.clear();
+        self.status = Some("enter sticker image path".to_string());
+        self.error = None;
+    }
+
+    pub fn exit_add_path_mode(&mut self) {
+        self.mode = StickerPickerMode::Browse;
+        self.add_path.clear();
+        self.status = None;
+        self.error = None;
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        if self.mode == StickerPickerMode::AddPath {
+            self.add_path.push(ch);
+        }
+    }
+
+    pub fn pop_char(&mut self) {
+        if self.mode == StickerPickerMode::AddPath {
+            self.add_path.pop();
+        }
     }
 }
 
@@ -814,6 +993,7 @@ pub enum AttachmentActionField {
     Open,
     CopyHash,
     Retry,
+    SaveSticker,
     Close,
 }
 
@@ -824,6 +1004,7 @@ pub struct AttachmentActionModalState {
     pub file_name: String,
     pub content_type: String,
     pub target_path: String,
+    pub sticker_saved: bool,
     pub focus: AttachmentActionField,
     pub status: Option<String>,
     pub error: Option<String>,
@@ -831,6 +1012,13 @@ pub struct AttachmentActionModalState {
 
 impl AttachmentActionModalState {
     pub fn from_message(message: &TuiMessage) -> Option<Self> {
+        Self::from_message_with_sticker_saved(message, false)
+    }
+
+    pub fn from_message_with_sticker_saved(
+        message: &TuiMessage,
+        sticker_saved: bool,
+    ) -> Option<Self> {
         let file_hash = message.file_hash.clone()?;
         if file_hash.trim().is_empty() || !message_is_attachment(message) {
             return None;
@@ -841,6 +1029,7 @@ impl AttachmentActionModalState {
             file_name: attachment_display_name(message),
             content_type: message.content_type.clone(),
             target_path: String::new(),
+            sticker_saved,
             focus: AttachmentActionField::View,
             status: None,
             error: None,
@@ -854,7 +1043,13 @@ impl AttachmentActionModalState {
             AttachmentActionField::Save => AttachmentActionField::Open,
             AttachmentActionField::Open => AttachmentActionField::CopyHash,
             AttachmentActionField::CopyHash => AttachmentActionField::Retry,
+            AttachmentActionField::Retry
+                if self.content_type == "sticker" && !self.sticker_saved =>
+            {
+                AttachmentActionField::SaveSticker
+            }
             AttachmentActionField::Retry => AttachmentActionField::Close,
+            AttachmentActionField::SaveSticker => AttachmentActionField::Close,
             AttachmentActionField::Close => AttachmentActionField::View,
         };
     }
@@ -889,13 +1084,19 @@ pub struct TuiAppState {
     pub envelopes: Vec<TuiEnvelope>,
     pub envelope_assignments: HashMap<String, String>,
     pub selected_chat_index: usize,
+    pub sidebar_scroll_offset: usize,
     pub active_chat_id: Option<String>,
     pub active_conversation_ids: HashSet<String>,
     pub connected_chat_ids: HashSet<String>,
+    pub pinned_chat_keys: HashSet<String>,
     pub local_peers: Vec<TuiLocalPeer>,
     pub messages: Vec<TuiMessage>,
     pub history_scroll_offset: usize,
+    pub selected_message_id: Option<String>,
     pub composer: String,
+    pub selected_composer_action_index: usize,
+    pub sidebar_search: String,
+    pub sidebar_search_active: bool,
     pub command_input: String,
     pub focus: FocusPane,
     pub show_help: bool,
@@ -905,6 +1106,7 @@ pub struct TuiAppState {
     pub attachment_modal: Option<AttachmentModalState>,
     pub sticker_picker: Option<StickerPickerState>,
     pub attachment_actions: Option<AttachmentActionModalState>,
+    pub context_menu: Option<ContextMenuState>,
     pub media_viewer: Option<MediaViewerState>,
     pub selected_attachment_message_id: Option<String>,
     pub chat_details: Option<TuiChatDetails>,
@@ -921,13 +1123,19 @@ impl Default for TuiAppState {
             envelopes: Vec::new(),
             envelope_assignments: HashMap::new(),
             selected_chat_index: 0,
+            sidebar_scroll_offset: 0,
             active_chat_id: None,
             active_conversation_ids: HashSet::new(),
             connected_chat_ids: HashSet::new(),
+            pinned_chat_keys: HashSet::new(),
             local_peers: Vec::new(),
             messages: Vec::new(),
             history_scroll_offset: 0,
+            selected_message_id: None,
             composer: String::new(),
+            selected_composer_action_index: 0,
+            sidebar_search: String::new(),
+            sidebar_search_active: false,
             command_input: String::new(),
             focus: FocusPane::Chats,
             show_help: false,
@@ -937,6 +1145,7 @@ impl Default for TuiAppState {
             attachment_modal: None,
             sticker_picker: None,
             attachment_actions: None,
+            context_menu: None,
             media_viewer: None,
             selected_attachment_message_id: None,
             chat_details: None,
@@ -982,7 +1191,8 @@ impl TuiAppState {
 
     pub fn move_selection(&mut self, delta: isize) {
         match self.focus {
-            FocusPane::History => self.scroll_history(-delta),
+            FocusPane::History => self.move_message_selection(delta),
+            FocusPane::ComposerActions => self.move_composer_action(delta),
             _ => {
                 self.selected_chat_index =
                     next_index(self.selected_chat_index, delta, self.chats.len());
@@ -993,9 +1203,50 @@ impl TuiAppState {
     pub fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             FocusPane::Chats => FocusPane::History,
-            FocusPane::History => FocusPane::Composer,
+            FocusPane::History => FocusPane::ComposerActions,
+            FocusPane::ComposerActions => FocusPane::Composer,
             FocusPane::Composer | FocusPane::CommandPalette => FocusPane::Chats,
         };
+    }
+
+    pub fn selected_composer_action(&self) -> ComposerAction {
+        ComposerAction::ALL
+            .get(self.selected_composer_action_index)
+            .copied()
+            .unwrap_or(ComposerAction::Attach)
+    }
+
+    pub fn move_composer_action(&mut self, delta: isize) {
+        let len = ComposerAction::ALL.len();
+        if len == 0 {
+            self.selected_composer_action_index = 0;
+            return;
+        }
+        let current = self.selected_composer_action_index as isize;
+        self.selected_composer_action_index =
+            (current + delta).rem_euclid(len as isize) as usize;
+    }
+
+    pub fn open_sidebar_search(&mut self) {
+        self.sidebar_search_active = true;
+        self.focus = FocusPane::Chats;
+    }
+
+    pub fn close_sidebar_search(&mut self) {
+        self.sidebar_search_active = false;
+        self.sidebar_search.clear();
+        self.sidebar_scroll_offset = 0;
+    }
+
+    pub fn push_sidebar_search_char(&mut self, ch: char) {
+        self.sidebar_search_active = true;
+        self.sidebar_search.push(ch);
+        self.sidebar_scroll_offset = 0;
+    }
+
+    pub fn pop_sidebar_search_char(&mut self) {
+        self.sidebar_search.pop();
+        self.sidebar_scroll_offset = 0;
     }
 
     pub fn scroll_history(&mut self, delta: isize) {
@@ -1009,6 +1260,7 @@ impl TuiAppState {
                 .saturating_sub(delta.unsigned_abs());
         }
         self.clamp_history_scroll();
+        self.sync_selected_message_to_history_scroll();
     }
 
     pub fn open_command_palette(&mut self) {
@@ -1031,17 +1283,20 @@ impl TuiAppState {
         self.attachment_modal = None;
         self.sticker_picker = None;
         self.attachment_actions = None;
+        self.context_menu = None;
         self.media_viewer = None;
     }
 
     pub fn open_new_person(&mut self) {
         self.show_command_palette = false;
+        self.sidebar_search_active = false;
         self.chat_details = None;
         self.show_help = false;
         self.settings = None;
         self.attachment_modal = None;
         self.sticker_picker = None;
         self.attachment_actions = None;
+        self.context_menu = None;
         self.media_viewer = None;
         self.new_person = Some(NewPersonModalState::default());
     }
@@ -1052,12 +1307,14 @@ impl TuiAppState {
 
     pub fn open_settings(&mut self) {
         self.show_command_palette = false;
+        self.sidebar_search_active = false;
         self.chat_details = None;
         self.show_help = false;
         self.new_person = None;
         self.attachment_modal = None;
         self.sticker_picker = None;
         self.attachment_actions = None;
+        self.context_menu = None;
         self.media_viewer = None;
         self.settings = Some(SettingsModalState::default());
     }
@@ -1068,18 +1325,21 @@ impl TuiAppState {
 
     pub fn open_attachment_modal(&mut self) {
         self.show_command_palette = false;
+        self.sidebar_search_active = false;
         self.chat_details = None;
         self.show_help = false;
         self.new_person = None;
         self.settings = None;
         self.sticker_picker = None;
         self.attachment_actions = None;
+        self.context_menu = None;
         self.media_viewer = None;
         self.attachment_modal = Some(AttachmentModalState::default());
     }
 
     pub fn open_sticker_picker(&mut self, stickers: Vec<TuiSticker>) {
         self.show_command_palette = false;
+        self.sidebar_search_active = false;
         self.chat_details = None;
         self.show_help = false;
         self.new_person = None;
@@ -1100,12 +1360,14 @@ impl TuiAppState {
             return false;
         };
         self.show_command_palette = false;
+        self.sidebar_search_active = false;
         self.chat_details = None;
         self.show_help = false;
         self.new_person = None;
         self.settings = None;
         self.attachment_modal = None;
         self.sticker_picker = None;
+        self.context_menu = None;
         self.media_viewer = None;
         self.attachment_actions = Some(modal);
         true
@@ -1151,16 +1413,14 @@ impl TuiAppState {
     }
 
     pub fn selected_attachment_message(&self) -> Option<&TuiMessage> {
+        if let Some(message) = self.selected_message() {
+            return message_is_attachment(message).then_some(message);
+        }
+
         self.selected_attachment_message_id
             .as_ref()
             .and_then(|id| self.messages.iter().find(|message| message.id == *id))
             .filter(|message| message_is_attachment(message))
-            .or_else(|| {
-                self.messages
-                    .iter()
-                    .rev()
-                    .find(|message| message_is_attachment(message))
-            })
     }
 
     pub fn move_attachment_selection(&mut self, delta: isize) {
@@ -1179,8 +1439,41 @@ impl TuiAppState {
             .as_ref()
             .and_then(|id| attachments.iter().position(|candidate| candidate == id))
             .unwrap_or_else(|| attachments.len().saturating_sub(1));
-        self.selected_attachment_message_id =
-            Some(attachments[next_index(current, delta, attachments.len())].clone());
+        let selected_id = attachments[next_index(current, delta, attachments.len())].clone();
+        self.selected_attachment_message_id = Some(selected_id.clone());
+        self.selected_message_id = Some(selected_id);
+        self.sync_history_scroll_to_selected_message();
+    }
+
+    pub fn selected_message(&self) -> Option<&TuiMessage> {
+        self.selected_message_id
+            .as_ref()
+            .and_then(|id| self.messages.iter().find(|message| message.id == *id))
+            .or_else(|| self.messages.last())
+    }
+
+    pub fn move_message_selection(&mut self, delta: isize) {
+        if self.messages.is_empty() {
+            self.selected_message_id = None;
+            self.selected_attachment_message_id = None;
+            self.history_scroll_offset = 0;
+            return;
+        }
+
+        let current = self
+            .selected_message_id
+            .as_ref()
+            .and_then(|id| self.messages.iter().position(|message| message.id == *id))
+            .unwrap_or_else(|| self.messages.len().saturating_sub(1));
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(self.messages.len().saturating_sub(1))
+        };
+        self.select_message_index(next);
+        self.sync_history_scroll_to_selected_message();
     }
 
     pub fn apply_local_peer_discovered(&mut self, peer: LocalPeerEvent) {
@@ -1212,6 +1505,10 @@ impl TuiAppState {
             .any(|connected| presence_key(connected) == target)
     }
 
+    pub fn is_chat_pinned(&self, chat: &TuiChat) -> bool {
+        self.pinned_chat_keys.contains(&chat.id) || self.pinned_chat_keys.contains(&chat.name)
+    }
+
     pub fn select_chat_with_history(&mut self, chat_id: &str, history: Vec<Message>) {
         let normalized = normalize_chat_id(chat_id);
         self.active_chat_id = Some(normalized.clone());
@@ -1226,6 +1523,7 @@ impl TuiAppState {
             })
             .collect();
         self.history_scroll_offset = 0;
+        self.selected_message_id = self.newest_message_id();
         self.selected_attachment_message_id = self.newest_attachment_message_id();
         self.media_viewer = None;
 
@@ -1258,13 +1556,16 @@ impl TuiAppState {
         self.upsert_chat_activity(&related_chat_id, message.timestamp, !is_active);
         if is_active {
             let tui_message = TuiMessage::from(message);
-            if message_is_attachment(&tui_message) {
-                self.selected_attachment_message_id = Some(tui_message.id.clone());
-            }
+            let appended_message_id = tui_message.id.clone();
+            let appended_attachment_id =
+                message_is_attachment(&tui_message).then(|| tui_message.id.clone());
             self.messages.push(tui_message);
             if self.history_scroll_offset > 0 {
                 self.history_scroll_offset += 1;
                 self.clamp_history_scroll();
+            } else {
+                self.selected_message_id = Some(appended_message_id);
+                self.selected_attachment_message_id = appended_attachment_id;
             }
             IncomingMessageEffect::AppendedToActive
         } else {
@@ -1299,6 +1600,7 @@ impl TuiAppState {
         timestamp: i64,
     ) {
         self.composer.clear();
+        self.selected_message_id = Some(msg_id.clone());
         self.messages.push(TuiMessage {
             id: msg_id,
             chat_id: draft.chat_id.clone(),
@@ -1311,6 +1613,7 @@ impl TuiAppState {
             content_metadata: None,
         });
         self.history_scroll_offset = 0;
+        self.selected_attachment_message_id = None;
         self.upsert_chat_activity(&draft.chat_id, timestamp, false);
     }
 
@@ -1342,12 +1645,54 @@ impl TuiAppState {
             .min(self.messages.len().saturating_sub(1));
     }
 
+    fn sync_selected_message_to_history_scroll(&mut self) {
+        if self.messages.is_empty() {
+            self.selected_message_id = None;
+            self.selected_attachment_message_id = None;
+            return;
+        }
+        let index = self
+            .messages
+            .len()
+            .saturating_sub(self.history_scroll_offset.saturating_add(1));
+        self.select_message_index(index);
+    }
+
+    fn sync_history_scroll_to_selected_message(&mut self) {
+        let Some(index) = self.selected_message_index() else {
+            self.history_scroll_offset = 0;
+            return;
+        };
+        self.history_scroll_offset = self.messages.len().saturating_sub(index.saturating_add(1));
+        self.clamp_history_scroll();
+    }
+
+    fn select_message_index(&mut self, index: usize) {
+        let Some(message) = self.messages.get(index) else {
+            self.selected_message_id = None;
+            self.selected_attachment_message_id = None;
+            return;
+        };
+        self.selected_message_id = Some(message.id.clone());
+        self.selected_attachment_message_id = message_is_attachment(message).then(|| message.id.clone());
+    }
+
+    fn selected_message_index(&self) -> Option<usize> {
+        self.selected_message_id
+            .as_ref()
+            .and_then(|id| self.messages.iter().position(|message| message.id == *id))
+    }
+
     fn newest_attachment_message_id(&self) -> Option<String> {
         self.messages
             .iter()
             .rev()
             .find(|message| message_is_attachment(message))
             .map(|message| message.id.clone())
+    }
+
+    fn newest_message_id(&self) -> Option<String> {
+        self.messages.last().map(|message| message.id.clone())
     }
 }
 
@@ -1533,9 +1878,42 @@ mod tests {
         state.cycle_focus();
         assert_eq!(state.focus, FocusPane::History);
         state.cycle_focus();
+        assert_eq!(state.focus, FocusPane::ComposerActions);
+        state.cycle_focus();
         assert_eq!(state.focus, FocusPane::Composer);
         state.cycle_focus();
         assert_eq!(state.focus, FocusPane::Chats);
+    }
+
+    #[test]
+    fn composer_action_selection_wraps_with_arrows() {
+        let mut state = TuiAppState::default();
+
+        assert_eq!(state.selected_composer_action(), ComposerAction::Attach);
+        state.move_composer_action(1);
+        assert_eq!(state.selected_composer_action(), ComposerAction::Stickers);
+        state.move_composer_action(-1);
+        assert_eq!(state.selected_composer_action(), ComposerAction::Attach);
+        state.move_composer_action(-1);
+        assert_eq!(state.selected_composer_action(), ComposerAction::Details);
+    }
+
+    #[test]
+    fn sidebar_search_state_collects_and_clears_query() {
+        let mut state = TuiAppState::default();
+
+        state.open_sidebar_search();
+        state.push_sidebar_search_char('f');
+        state.push_sidebar_search_char('e');
+        assert_eq!(state.focus, FocusPane::Chats);
+        assert!(state.sidebar_search_active);
+        assert_eq!(state.sidebar_search, "fe");
+
+        state.pop_sidebar_search_char();
+        assert_eq!(state.sidebar_search, "f");
+        state.close_sidebar_search();
+        assert!(!state.sidebar_search_active);
+        assert!(state.sidebar_search.is_empty());
     }
 
     #[test]
@@ -1625,11 +2003,38 @@ mod tests {
             ],
         );
 
+        assert_eq!(state.selected_message().map(|message| message.id.as_str()), Some("m3"));
+
         state.move_selection(-1);
+        assert_eq!(state.selected_message().map(|message| message.id.as_str()), Some("m2"));
         assert_eq!(state.history_scroll_offset, 1);
 
         state.move_selection(1);
+        assert_eq!(state.selected_message().map(|message| message.id.as_str()), Some("m3"));
         assert_eq!(state.history_scroll_offset, 0);
+    }
+
+    #[test]
+    fn selected_message_controls_attachment_actions_only_for_attachment_messages() {
+        let mut state = TuiAppState::default();
+        state.focus = FocusPane::History;
+        let mut image = db_message("peer-1", "Me", "image", "image-1");
+        image.content_type = "image".to_string();
+        image.file_hash = Some("hash-1".to_string());
+        state.select_chat_with_history(
+            "peer-1",
+            vec![db_message("peer-1", "peer-1", "plain", "text-1"), image],
+        );
+
+        assert!(state.open_attachment_actions_for_selected());
+        state.attachment_actions = None;
+        state.move_selection(-1);
+
+        assert_eq!(
+            state.selected_message().map(|message| message.id.as_str()),
+            Some("text-1")
+        );
+        assert!(!state.open_attachment_actions_for_selected());
     }
 
     #[test]
@@ -1830,6 +2235,16 @@ mod tests {
         let picker = state.sticker_picker.as_mut().expect("sticker picker");
         picker.move_selection(1);
         assert_eq!(picker.selected_hash(), Some("second"));
+        picker.enter_add_path_mode();
+        picker.push_char('/');
+        picker.push_char('t');
+        assert_eq!(picker.mode, StickerPickerMode::AddPath);
+        assert_eq!(picker.add_path, "/t");
+        picker.pop_char();
+        assert_eq!(picker.add_path, "/");
+        picker.exit_add_path_mode();
+        assert_eq!(picker.mode, StickerPickerMode::Browse);
+        assert!(picker.add_path.is_empty());
     }
 
     #[test]
@@ -1867,19 +2282,41 @@ mod tests {
     }
 
     #[test]
-    fn new_person_focus_cycles_visible_fields() {
+    fn new_person_focus_moves_across_visible_fields() {
         let mut modal = NewPersonModalState::default();
 
         modal.cycle_focus(0);
         assert_eq!(modal.focus, NewPersonField::OnlineNetwork);
         modal.cycle_focus(0);
+        assert_eq!(modal.focus, NewPersonField::OnlineNetwork);
+        modal.move_focus(-1, 0);
         assert_eq!(modal.focus, NewPersonField::LocalNetwork);
 
         modal.set_step(NewPersonStep::LocalScan);
         modal.cycle_focus(2);
         assert_eq!(modal.focus, NewPersonField::LocalPeer(1));
         modal.cycle_focus(2);
+        assert_eq!(modal.focus, NewPersonField::LocalPeer(1));
+        modal.move_focus(-1, 2);
         assert_eq!(modal.focus, NewPersonField::LocalPeer(0));
+    }
+
+    #[test]
+    fn new_person_arrows_move_through_visible_fields() {
+        let mut modal = NewPersonModalState::default();
+
+        modal.move_focus(1, 0);
+        assert_eq!(modal.focus, NewPersonField::OnlineNetwork);
+        modal.move_focus(-1, 0);
+        assert_eq!(modal.focus, NewPersonField::LocalNetwork);
+
+        modal.set_step(NewPersonStep::AcceptInviteCode);
+        modal.move_focus(1, 0);
+        assert_eq!(modal.focus, NewPersonField::InviteQrPath);
+        modal.move_focus(1, 0);
+        assert_eq!(modal.focus, NewPersonField::DecodeInviteQr);
+        modal.move_focus(-1, 0);
+        assert_eq!(modal.focus, NewPersonField::InviteQrPath);
     }
 
     #[test]
@@ -1915,12 +2352,13 @@ mod tests {
     fn settings_focus_and_section_routing_are_predictable() {
         let mut modal = SettingsModalState::default();
 
+        assert_eq!(modal.pane, SettingsPane::Menu);
         modal.cycle_focus();
-        assert_eq!(modal.focus, SettingsField::Section(1));
-        for _ in 0..SettingsSection::ALL.len().saturating_sub(1) {
-            modal.cycle_focus();
-        }
+        assert_eq!(modal.pane, SettingsPane::Content);
         assert_eq!(modal.focus, SettingsField::ProfileAlias);
+        modal.cycle_focus();
+        assert_eq!(modal.pane, SettingsPane::Menu);
+        assert_eq!(modal.focus, SettingsField::Section(0));
 
         modal.move_section(1);
         assert_eq!(modal.section, SettingsSection::Peers);
@@ -1928,6 +2366,23 @@ mod tests {
 
         modal.move_section(-1);
         assert_eq!(modal.section, SettingsSection::Profile);
+    }
+
+    #[test]
+    fn activating_theme_section_focuses_theme_controls_immediately() {
+        let mut modal = SettingsModalState::default();
+        modal.activate_section(SettingsSection::Theme);
+
+        assert_eq!(modal.section, SettingsSection::Theme);
+        assert_eq!(modal.pane, SettingsPane::Content);
+        assert!(matches!(
+            modal.focus,
+            SettingsField::ThemePreset(_) | SettingsField::ThemeApply
+        ));
+
+        modal.cycle_focus();
+        assert_eq!(modal.pane, SettingsPane::Menu);
+        assert_eq!(modal.focus, SettingsField::Section(3));
     }
 
     #[test]

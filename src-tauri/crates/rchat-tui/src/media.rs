@@ -283,6 +283,11 @@ impl InlineMediaCache {
         self.insert_state(key, InlineMediaState::Ready(protocol));
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
     fn insert_state(&mut self, key: InlineMediaKey, state: InlineMediaState) {
         if self.capacity == 0 {
             self.entries.clear();

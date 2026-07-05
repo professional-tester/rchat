@@ -9,6 +9,7 @@ use crate::{
     storage,
 };
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
@@ -164,6 +165,79 @@ pub fn save_attachment_to_path(
     let loaded = load_attachment_bytes(app_state, file_hash)?;
     fs::write(target_path.as_ref(), loaded.bytes)
         .with_context(|| format!("Failed to save attachment to {}", target_path.as_ref().display()))
+}
+
+pub fn load_attachment_data_url(app_state: &AppState, file_hash: &str) -> Result<String> {
+    let loaded = load_attachment_bytes(app_state, file_hash)?;
+    Ok(data_url(&loaded.mime_type, &loaded.bytes))
+}
+
+pub fn load_image_data_url(app_state: &AppState, file_hash: &str) -> Result<String> {
+    let loaded = load_attachment_bytes(app_state, file_hash)?;
+    let mime_type = if loaded.mime_type.starts_with("image/") {
+        loaded.mime_type
+    } else {
+        detect_image_mime_from_bytes(&loaded.bytes)
+            .unwrap_or("image/png")
+            .to_string()
+    };
+    update_file_mime_type(app_state, file_hash, &mime_type);
+    Ok(data_url(&mime_type, &loaded.bytes))
+}
+
+pub fn load_image_path_data_url(file_path: impl AsRef<Path>) -> Result<String> {
+    let file_path = file_path.as_ref();
+    let data = fs::read(file_path)
+        .with_context(|| format!("Failed to read image file: {}", file_path.display()))?;
+    let mime_type = match file_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("png") => "image/png",
+        _ => "image/png",
+    };
+    Ok(data_url(mime_type, &data))
+}
+
+pub fn load_video_data_url(app_state: &AppState, file_hash: &str) -> Result<String> {
+    let loaded = load_attachment_bytes(app_state, file_hash)?;
+    let mime_type = if loaded.mime_type.starts_with("video/") {
+        loaded.mime_type
+    } else {
+        "video/mp4".to_string()
+    };
+    Ok(data_url(&mime_type, &loaded.bytes))
+}
+
+pub fn load_audio_data_url(app_state: &AppState, file_hash: &str) -> Result<String> {
+    let loaded = load_attachment_bytes(app_state, file_hash)?;
+    let mime_type = if loaded.mime_type.starts_with("audio/") {
+        loaded.mime_type
+    } else {
+        detect_audio_mime_from_bytes(&loaded.bytes)
+            .unwrap_or("audio/webm")
+            .to_string()
+    };
+    update_file_mime_type(app_state, file_hash, &mime_type);
+    Ok(data_url(&mime_type, &loaded.bytes))
+}
+
+fn data_url(mime_type: &str, data: &[u8]) -> String {
+    format!("data:{};base64,{}", mime_type, STANDARD.encode(data))
+}
+
+fn update_file_mime_type(app_state: &AppState, file_hash: &str, mime_type: &str) {
+    if let Ok(conn) = app_state.db_conn.lock() {
+        let _ = conn.execute(
+            "UPDATE files SET mime_type = ?2 WHERE file_hash = ?1",
+            rusqlite::params![file_hash, mime_type],
+        );
+    }
 }
 
 pub async fn retry_direct_attachment_fetch(
@@ -556,5 +630,39 @@ mod tests {
         let target = temp.path().join("saved.txt");
         save_attachment_to_path(&app_state, &file_hash, &target).expect("saved");
         assert_eq!(std::fs::read(target).expect("saved bytes"), b"hello attachment");
+    }
+
+    #[tokio::test]
+    async fn data_url_helpers_return_expected_mime_prefixes() {
+        let (_temp, app_state) = crate::settings::profile::test_app_state().await;
+        let image_hash = {
+            let conn = app_state.db_conn.lock().expect("db");
+            storage::object::create(
+                &conn,
+                b"not a real image but stored as png",
+                Some("image.png"),
+                Some("image/png"),
+                None,
+            )
+            .expect("image stored")
+        };
+        let audio_hash = {
+            let conn = app_state.db_conn.lock().expect("db");
+            storage::object::create(
+                &conn,
+                b"ID3 fake mp3",
+                Some("clip.mp3"),
+                Some("audio/mpeg"),
+                None,
+            )
+            .expect("audio stored")
+        };
+
+        assert!(load_image_data_url(&app_state, &image_hash)
+            .expect("image data url")
+            .starts_with("data:image/png;base64,"));
+        assert!(load_audio_data_url(&app_state, &audio_hash)
+            .expect("audio data url")
+            .starts_with("data:audio/mpeg;base64,"));
     }
 }

@@ -1235,7 +1235,7 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
     let mut peer_stmt = conn.prepare(
         "SELECT id, alias
          FROM peers
-         WHERE id != 'Me'",
+         WHERE id != 'Me' AND method != 'group'",
     )?;
     let peer_rows = peer_stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1923,6 +1923,20 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id(), third.id());
+    }
+
+    #[test]
+    fn chat_list_does_not_promote_group_only_peers_to_direct_chats() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        add_peer(&conn, "peer-local", Some("Local Peer"), None, "local").expect("local peer");
+        add_peer(&conn, "peer-group", Some("Group Peer"), None, "group").expect("group peer");
+
+        let chats = get_chat_list(&conn).expect("chat list");
+        let ids: Vec<String> = chats.into_iter().map(|chat| chat.id).collect();
+
+        assert!(ids.contains(&"peer-local".to_string()));
+        assert!(!ids.contains(&"peer-group".to_string()));
     }
 
     #[test]
