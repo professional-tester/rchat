@@ -55,6 +55,46 @@ struct ActiveCall {
     camera_enabled: bool,
 }
 
+struct IncomingCallRejectDecision<'a> {
+    call: &'a ActiveCall,
+    requested_call_id_matched: bool,
+}
+
+fn incoming_call_reject_decision<'a>(
+    active_call: Option<&'a ActiveCall>,
+    requested_call_id: &str,
+    expected_kind: crate::app_state::CallKind,
+) -> Option<IncomingCallRejectDecision<'a>> {
+    let call = active_call?;
+    if call.phase != ActiveCallPhase::IncomingRinging || call.kind != expected_kind {
+        return None;
+    }
+    Some(IncomingCallRejectDecision {
+        call,
+        requested_call_id_matched: call.call_id == requested_call_id,
+    })
+}
+
+fn ringing_call_peer_liveness_reason(
+    phase: ActiveCallPhase,
+    is_connected: bool,
+    has_quic_path: bool,
+) -> Option<&'static str> {
+    if !matches!(
+        phase,
+        ActiveCallPhase::IncomingRinging | ActiveCallPhase::OutgoingRinging
+    ) {
+        return None;
+    }
+    if !is_connected {
+        return Some("peer_disconnected");
+    }
+    if !has_quic_path {
+        return Some("quic_path_lost");
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveBroadcastPhase {
     OutgoingRinging,

@@ -303,12 +303,6 @@ impl ConfigManager {
         let data = fs::read(&self.file_path).await?;
         let wrapper: ConfigWrapper = serde_json::from_slice(&data)?;
 
-        println!(
-            "Unlock attempt: Password len={}, Stored Hash len={}",
-            password.len(),
-            wrapper.master_hash.len()
-        );
-
         // Verify password against stored hash first (for better UX/error messages)
         if !rvault_core::crypto::verify_password(password.as_bytes(), &wrapper.master_hash) {
             return Err(anyhow::anyhow!("Invalid password"));

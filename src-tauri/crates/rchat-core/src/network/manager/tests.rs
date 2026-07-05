@@ -1,11 +1,13 @@
 use super::{
     build_incoming_dm_db_message, build_incoming_group_db_message, classify_outgoing_error_source,
-    quic_addresses_for_peer, OutgoingDialSource, PeerTransportRegistry, RecentDial,
+    incoming_call_reject_decision, quic_addresses_for_peer, ringing_call_peer_liveness_reason,
+    ActiveCall, ActiveCallPhase, OutgoingDialSource, PeerTransportRegistry, RecentDial,
     VoiceStreamEvent,
 };
+use crate::app_state::CallKind;
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
 
 fn incoming_request(
@@ -25,6 +27,65 @@ fn incoming_request(
         chunk_list: None,
         sender_alias: Some("peer".to_string()),
     }
+}
+
+fn active_call(call_id: &str, kind: CallKind, phase: ActiveCallPhase) -> ActiveCall {
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let peer: PeerId = keypair.public().to_peer_id();
+    ActiveCall {
+        call_id: call_id.to_string(),
+        kind,
+        peer_chat_id: format!("lh:test-{}", peer),
+        remote_peer_id: peer,
+        phase,
+        ring_deadline: None,
+        ring_expires_at: None,
+        started_at: None,
+        muted: false,
+        camera_enabled: false,
+    }
+}
+
+#[test]
+fn incoming_call_reject_accepts_stale_requested_id_for_current_incoming_voice_call() {
+    let call = active_call("call-current", CallKind::Voice, ActiveCallPhase::IncomingRinging);
+
+    let decision = incoming_call_reject_decision(Some(&call), "call-previous", CallKind::Voice)
+        .expect("incoming voice call should be rejectable");
+
+    assert_eq!(decision.call.call_id, "call-current");
+    assert!(!decision.requested_call_id_matched);
+}
+
+#[test]
+fn incoming_call_reject_does_not_target_active_or_wrong_kind_calls() {
+    let active_voice = active_call("call-active", CallKind::Voice, ActiveCallPhase::Active);
+    let incoming_video = active_call("call-video", CallKind::Video, ActiveCallPhase::IncomingRinging);
+
+    assert!(incoming_call_reject_decision(Some(&active_voice), "call-active", CallKind::Voice)
+        .is_none());
+    assert!(incoming_call_reject_decision(Some(&incoming_video), "call-video", CallKind::Voice)
+        .is_none());
+}
+
+#[test]
+fn ringing_call_liveness_clears_when_peer_or_quic_path_is_lost() {
+    assert_eq!(
+        ringing_call_peer_liveness_reason(ActiveCallPhase::IncomingRinging, false, true),
+        Some("peer_disconnected")
+    );
+    assert_eq!(
+        ringing_call_peer_liveness_reason(ActiveCallPhase::OutgoingRinging, true, false),
+        Some("quic_path_lost")
+    );
+    assert_eq!(
+        ringing_call_peer_liveness_reason(ActiveCallPhase::IncomingRinging, true, true),
+        None
+    );
+    assert_eq!(
+        ringing_call_peer_liveness_reason(ActiveCallPhase::Active, false, false),
+        None
+    );
 }
 
 #[test]

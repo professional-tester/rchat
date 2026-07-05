@@ -167,12 +167,7 @@ pub async fn unlock_vault(
     password: String,
     state: State<'_, AppState>,
 ) -> Result<AuthStatus, String> {
-    println!(
-        "[Backend] unlock_vault called. Password len: {}",
-        password.len()
-    );
     let mut mgr = state.config_manager.lock().await;
-    println!("[Backend] Password trimmed len: {}", password.trim().len());
     let config = mgr
         .unlock_with_password(password.trim())
         .await

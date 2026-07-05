@@ -899,11 +899,17 @@ impl NetworkManager {
     }
 
     pub(super) async fn handle_reject_video_call(&mut self, call_id: String) {
-        let Some(call) = self.active_call.as_ref().cloned() else {
+        let Some(decision) =
+            incoming_call_reject_decision(self.active_call.as_ref(), &call_id, CallKind::Video)
+        else {
             return;
         };
-        if call.call_id != call_id || call.kind != CallKind::Video {
-            return;
+        let call = decision.call.clone();
+        if !decision.requested_call_id_matched {
+            eprintln!(
+                "[Video] Reject requested for stale call_id={} while current incoming call_id={}; rejecting current call",
+                call_id, call.call_id
+            );
         }
         self.send_call_signal(
             call.remote_peer_id,

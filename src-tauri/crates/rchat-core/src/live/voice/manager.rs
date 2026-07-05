@@ -397,14 +397,17 @@ impl NetworkManager {
     }
 
     pub(super) async fn handle_reject_voice_call(&mut self, call_id: String) {
-        let Some(call) = self.active_call.as_ref().cloned() else {
+        let Some(decision) =
+            incoming_call_reject_decision(self.active_call.as_ref(), &call_id, CallKind::Voice)
+        else {
             return;
         };
-        if call.call_id != call_id
-            || call.phase != ActiveCallPhase::IncomingRinging
-            || call.kind != CallKind::Voice
-        {
-            return;
+        let call = decision.call.clone();
+        if !decision.requested_call_id_matched {
+            eprintln!(
+                "[Voice] Reject requested for stale call_id={} while current incoming call_id={}; rejecting current call",
+                call_id, call.call_id
+            );
         }
         self.send_call_signal(
             call.remote_peer_id,
@@ -648,15 +651,25 @@ impl NetworkManager {
 
     pub(super) async fn tick_voice_call(&mut self) {
         if let Some(call) = self.active_call.as_ref() {
-            if let Some(deadline) = call.ring_deadline {
-                if std::time::Instant::now() >= deadline {
-                    let call_id = call.call_id.clone();
-                    let peer = call.remote_peer_id;
-                    self.send_call_signal(peer, DirectMessageKind::CallEnd, &call_id);
-                    self.transition_to_idle(Some("ring_timeout".to_string()))
-                        .await;
-                    return;
-                }
+            if let Some(reason) = ringing_call_peer_liveness_reason(
+                call.phase,
+                self.swarm.is_connected(&call.remote_peer_id),
+                self.peer_has_quic_path(&call.remote_peer_id),
+            ) {
+                self.transition_to_idle(Some(reason.to_string())).await;
+                return;
+            }
+
+            if call
+                .ring_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                let call_id = call.call_id.clone();
+                let peer = call.remote_peer_id;
+                self.send_call_signal(peer, DirectMessageKind::CallEnd, &call_id);
+                self.transition_to_idle(Some("ring_timeout".to_string()))
+                    .await;
+                return;
             }
         }
 
