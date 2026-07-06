@@ -1113,13 +1113,23 @@ impl MediaViewerState {
 
     pub fn zoom_out(&mut self) {
         self.zoom_percent = self.zoom_percent.saturating_sub(25).max(25);
-        self.pan_x = self.pan_x.max(0);
-        self.pan_y = self.pan_y.max(0);
+        if self.zoom_percent <= 100 {
+            self.pan_x = 0;
+            self.pan_y = 0;
+        }
     }
 
-    pub fn pan_by(&mut self, x: i32, y: i32) {
-        self.pan_x = self.pan_x.saturating_add(x).max(0);
-        self.pan_y = self.pan_y.saturating_add(y).max(0);
+    pub fn pan_by(&mut self, x: i32, y: i32) -> bool {
+        let previous = (self.pan_x, self.pan_y);
+        if self.zoom_percent <= 100 {
+            self.pan_x = 0;
+            self.pan_y = 0;
+            return previous != (self.pan_x, self.pan_y);
+        }
+
+        self.pan_x = self.pan_x.saturating_add(x);
+        self.pan_y = self.pan_y.saturating_add(y);
+        previous != (self.pan_x, self.pan_y)
     }
 
     pub fn reset_view(&mut self) {
@@ -2369,6 +2379,35 @@ mod tests {
         assert_ne!((viewer.pan_x, viewer.pan_y), (0, 0));
 
         viewer.reset_view();
+
+        assert_eq!(viewer.zoom_percent, 100);
+        assert_eq!((viewer.pan_x, viewer.pan_y), (0, 0));
+    }
+
+    #[test]
+    fn media_viewer_arrows_only_move_zoomed_images() {
+        let mut viewer = MediaViewerState::new(
+            "m1".to_string(),
+            "hash-1".to_string(),
+            "photo.png".to_string(),
+            "image".to_string(),
+            None,
+        );
+
+        assert!(!viewer.pan_by(64, 64));
+
+        assert_eq!((viewer.pan_x, viewer.pan_y), (0, 0));
+
+        viewer.zoom_in();
+        assert!(viewer.pan_by(64, 64));
+
+        assert_eq!((viewer.pan_x, viewer.pan_y), (64, 64));
+
+        assert!(viewer.pan_by(-128, -128));
+
+        assert_eq!((viewer.pan_x, viewer.pan_y), (-64, -64));
+
+        viewer.zoom_out();
 
         assert_eq!(viewer.zoom_percent, 100);
         assert_eq!((viewer.pan_x, viewer.pan_y), (0, 0));

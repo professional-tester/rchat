@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Context, Result};
-use image::{imageops::FilterType, DynamicImage, RgbaImage};
+use image::{
+    imageops::{overlay, FilterType},
+    DynamicImage, RgbaImage,
+};
 use ratatui::layout::Size;
-use ratatui_image::{picker::Picker, protocol::Protocol, Resize};
+use ratatui_image::{picker::Picker, protocol::Protocol, FontSize, Resize};
 use rchat_core::{
     events::VideoEncodedRemoteFrameEvent,
     live::{
@@ -13,7 +16,7 @@ use rchat_core::{
     },
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,7 +349,7 @@ pub enum ProtocolRequestId {
 
 pub struct ProtocolRequest {
     pub id: ProtocolRequestId,
-    pub image: DynamicImage,
+    pub image: Arc<DynamicImage>,
     pub size: Size,
 }
 
@@ -355,7 +358,7 @@ impl ProtocolRequest {
         let seq = frame.seq;
         Ok(Self {
             id: ProtocolRequestId::Screen(seq),
-            image: rgba_frame_to_dynamic_image(&frame)?,
+            image: Arc::new(rgba_frame_to_dynamic_image(&frame)?),
             size,
         })
     }
@@ -365,7 +368,7 @@ impl ProtocolRequest {
         let seq = frame.seq;
         Ok(Self {
             id: ProtocolRequestId::RemoteVideo { call_id, seq },
-            image: rgba_frame_to_dynamic_image(&frame)?,
+            image: Arc::new(rgba_frame_to_dynamic_image(&frame)?),
             size,
         })
     }
@@ -373,12 +376,12 @@ impl ProtocolRequest {
     pub fn inline(key: InlineMediaKey, image: DynamicImage, size: Size) -> Self {
         Self {
             id: ProtocolRequestId::Inline(key),
-            image,
+            image: Arc::new(image),
             size,
         }
     }
 
-    pub fn viewer(key: MediaViewerKey, image: DynamicImage, size: Size) -> Self {
+    pub fn viewer(key: MediaViewerKey, image: Arc<DynamicImage>, size: Size) -> Self {
         Self {
             id: ProtocolRequestId::Viewer(key),
             image,
@@ -408,6 +411,7 @@ impl ProtocolWorker {
         let (response_tx, response_rx) = mpsc::channel::<Result<ProtocolResponse, ProtocolError>>();
 
         thread::spawn(move || {
+            let mut viewer_resize_cache = ViewerResizeCache::default();
             while let Ok(request) = request_rx.recv() {
                 let mut requests = vec![request];
                 while let Ok(newer) = request_rx.try_recv() {
@@ -415,7 +419,12 @@ impl ProtocolWorker {
                 }
 
                 for request in select_protocol_requests_for_processing(requests) {
-                    if !send_protocol_response(&response_tx, &picker, request) {
+                    if !send_protocol_response(
+                        &response_tx,
+                        &picker,
+                        &mut viewer_resize_cache,
+                        request,
+                    ) {
                         return;
                     }
                 }
@@ -479,11 +488,12 @@ fn select_protocol_requests_for_processing(requests: Vec<ProtocolRequest>) -> Ve
 fn send_protocol_response(
     response_tx: &mpsc::Sender<Result<ProtocolResponse, ProtocolError>>,
     picker: &Picker,
+    viewer_resize_cache: &mut ViewerResizeCache,
     request: ProtocolRequest,
 ) -> bool {
     let id = request.id.clone();
     let error_id = id.clone();
-    let result = build_protocol_for_request(picker, request)
+    let result = build_protocol_for_request(picker, request, viewer_resize_cache)
         .map(|protocol| ProtocolResponse { id, protocol })
         .map_err(|error| ProtocolError {
             id: error_id,
@@ -493,14 +503,27 @@ fn send_protocol_response(
     response_tx.send(result).is_ok()
 }
 
-fn build_protocol_for_request(picker: &Picker, request: ProtocolRequest) -> Result<Protocol> {
+fn build_protocol_for_request(
+    picker: &Picker,
+    request: ProtocolRequest,
+    viewer_resize_cache: &mut ViewerResizeCache,
+) -> Result<Protocol> {
     let image = match &request.id {
-        ProtocolRequestId::Viewer(key) => prepare_media_viewer_image(request.image, key),
+        ProtocolRequestId::Viewer(key) => prepare_media_viewer_image(
+            request.image.as_ref(),
+            key,
+            picker.font_size(),
+            viewer_resize_cache,
+        ),
         ProtocolRequestId::Screen(_)
         | ProtocolRequestId::RemoteVideo { .. }
-        | ProtocolRequestId::Inline(_) => request.image,
+        | ProtocolRequestId::Inline(_) => shared_image_into_owned(request.image),
     };
     build_protocol(picker, image, request.size)
+}
+
+fn shared_image_into_owned(image: Arc<DynamicImage>) -> DynamicImage {
+    Arc::try_unwrap(image).unwrap_or_else(|image| image.as_ref().clone())
 }
 
 fn build_protocol(picker: &Picker, image: DynamicImage, size: Size) -> Result<Protocol> {
@@ -509,9 +532,73 @@ fn build_protocol(picker: &Picker, image: DynamicImage, size: Size) -> Result<Pr
         .map_err(|error| anyhow!(error.to_string()))
 }
 
-fn prepare_media_viewer_image(image: DynamicImage, key: &MediaViewerKey) -> DynamicImage {
-    let viewport_width = u32::from(key.size.width.max(1)).saturating_mul(8);
-    let viewport_height = u32::from(key.size.height.max(1)).saturating_mul(16);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewerResizeCacheKey {
+    file_hash: String,
+    size: Size,
+    zoom_percent: u16,
+    font_width: u16,
+    font_height: u16,
+}
+
+impl ViewerResizeCacheKey {
+    fn new(key: &MediaViewerKey, font_size: FontSize) -> Self {
+        Self {
+            file_hash: key.file_hash.clone(),
+            size: key.size,
+            zoom_percent: key.zoom_percent,
+            font_width: font_size.width,
+            font_height: font_size.height,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ViewerResizeCache {
+    key: Option<ViewerResizeCacheKey>,
+    resized: Option<RgbaImage>,
+    resize_count: u64,
+}
+
+impl ViewerResizeCache {
+    fn resized_layer(
+        &mut self,
+        key: ViewerResizeCacheKey,
+        image: &DynamicImage,
+        scaled_width: u32,
+        scaled_height: u32,
+    ) -> &RgbaImage {
+        if self.key.as_ref() != Some(&key) {
+            self.resized = Some(
+                image
+                    .resize(scaled_width, scaled_height, FilterType::Triangle)
+                    .to_rgba8(),
+            );
+            self.key = Some(key);
+            self.resize_count = self.resize_count.saturating_add(1);
+        }
+
+        self.resized
+            .as_ref()
+            .expect("viewer resize cache is populated")
+    }
+
+    #[cfg(test)]
+    fn resize_count(&self) -> u64 {
+        self.resize_count
+    }
+}
+
+fn prepare_media_viewer_image(
+    image: &DynamicImage,
+    key: &MediaViewerKey,
+    font_size: FontSize,
+    viewer_resize_cache: &mut ViewerResizeCache,
+) -> DynamicImage {
+    let viewport_width =
+        u32::from(key.size.width.max(1)).saturating_mul(u32::from(font_size.width.max(1)));
+    let viewport_height =
+        u32::from(key.size.height.max(1)).saturating_mul(u32::from(font_size.height.max(1)));
     let image_width = image.width().max(1);
     let image_height = image.height().max(1);
 
@@ -521,16 +608,47 @@ fn prepare_media_viewer_image(image: DynamicImage, key: &MediaViewerKey) -> Dyna
     let zoom_scale = f32::from(key.zoom_percent.max(25)) / 100.0;
     let scaled_width = ((image_width as f32 * fit_scale * zoom_scale).round() as u32).max(1);
     let scaled_height = ((image_height as f32 * fit_scale * zoom_scale).round() as u32).max(1);
-    let resized = image.resize(scaled_width, scaled_height, FilterType::Triangle);
+    let resized = viewer_resize_cache.resized_layer(
+        ViewerResizeCacheKey::new(key, font_size),
+        image,
+        scaled_width,
+        scaled_height,
+    );
+    let scaled_width = resized.width();
+    let scaled_height = resized.height();
 
-    let crop_width = viewport_width.min(scaled_width).max(1);
-    let crop_height = viewport_height.min(scaled_height).max(1);
-    let max_x = scaled_width.saturating_sub(crop_width) as i32;
-    let max_y = scaled_height.saturating_sub(crop_height) as i32;
-    let crop_x = key.pan_x.clamp(0, max_x) as u32;
-    let crop_y = key.pan_y.clamp(0, max_y) as u32;
+    let mut canvas = RgbaImage::new(viewport_width, viewport_height);
+    let base_x = (i64::from(viewport_width) - i64::from(scaled_width)) / 2;
+    let base_y = (i64::from(viewport_height) - i64::from(scaled_height)) / 2;
+    let image_x = base_x.saturating_sub(i64::from(key.pan_x));
+    let image_y = base_y.saturating_sub(i64::from(key.pan_y));
 
-    resized.crop_imm(crop_x, crop_y, crop_width, crop_height)
+    let src_x = if image_x < 0 {
+        (-image_x).min(i64::from(scaled_width)) as u32
+    } else {
+        0
+    };
+    let src_y = if image_y < 0 {
+        (-image_y).min(i64::from(scaled_height)) as u32
+    } else {
+        0
+    };
+    let dest_x = image_x.max(0).min(i64::from(viewport_width)) as u32;
+    let dest_y = image_y.max(0).min(i64::from(viewport_height)) as u32;
+    let copy_width = scaled_width
+        .saturating_sub(src_x)
+        .min(viewport_width.saturating_sub(dest_x));
+    let copy_height = scaled_height
+        .saturating_sub(src_y)
+        .min(viewport_height.saturating_sub(dest_y));
+
+    if copy_width > 0 && copy_height > 0 {
+        let cropped =
+            image::imageops::crop_imm(resized, src_x, src_y, copy_width, copy_height).to_image();
+        overlay(&mut canvas, &cropped, i64::from(dest_x), i64::from(dest_y));
+    }
+
+    DynamicImage::ImageRgba8(canvas)
 }
 
 #[cfg(test)]
@@ -742,12 +860,117 @@ mod tests {
 
     #[test]
     fn protocol_request_accepts_dynamic_images_for_media_viewer() {
-        let image = DynamicImage::new_rgba8(2, 2);
+        let image = Arc::new(DynamicImage::new_rgba8(2, 2));
         let key = MediaViewerKey::new("hash-1", Size::new(80, 24), 100, 0, 0);
-        let request = ProtocolRequest::viewer(key.clone(), image, Size::new(80, 24));
+        let request = ProtocolRequest::viewer(key.clone(), Arc::clone(&image), Size::new(80, 24));
 
         assert_eq!(request.id, ProtocolRequestId::Viewer(key));
         assert_eq!(request.size, Size::new(80, 24));
+        assert!(Arc::ptr_eq(&request.image, &image));
+        assert_eq!(Arc::strong_count(&image), 2);
+    }
+
+    #[test]
+    fn media_viewer_fit_image_is_centered_on_viewport_canvas() {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            4,
+            2,
+            image::Rgba([240, 10, 20, 255]),
+        ));
+        let key = MediaViewerKey::new("hash-1", Size::new(1, 1), 100, 0, 0);
+
+        let mut cache = ViewerResizeCache::default();
+        let prepared =
+            prepare_media_viewer_image(&image, &key, FontSize::new(10, 20), &mut cache).to_rgba8();
+
+        assert_eq!(prepared.width(), 10);
+        assert_eq!(prepared.height(), 20);
+        assert_eq!(prepared.get_pixel(0, 0)[3], 0);
+        assert_eq!(prepared.get_pixel(0, 7), &image::Rgba([240, 10, 20, 255]));
+        assert_eq!(prepared.get_pixel(0, 11), &image::Rgba([240, 10, 20, 255]));
+        assert_eq!(prepared.get_pixel(0, 19)[3], 0);
+    }
+
+    #[test]
+    fn media_viewer_zoom_starts_from_center_and_pan_moves_crop() {
+        let mut source = RgbaImage::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let value = (x * 16) as u8;
+                source.put_pixel(x, y, image::Rgba([value, value, value, 255]));
+            }
+        }
+
+        let centered_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 200, 0, 0);
+        let moved_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 200, 4, 0);
+
+        let centered = {
+            let mut cache = ViewerResizeCache::default();
+            prepare_media_viewer_image(
+                &DynamicImage::ImageRgba8(source.clone()),
+                &centered_key,
+                FontSize::new(10, 20),
+                &mut cache,
+            )
+        }
+        .to_rgba8();
+        let mut moved_cache = ViewerResizeCache::default();
+        let moved = prepare_media_viewer_image(
+            &DynamicImage::ImageRgba8(source),
+            &moved_key,
+            FontSize::new(10, 20),
+            &mut moved_cache,
+        )
+        .to_rgba8();
+
+        assert!(centered.get_pixel(0, 0)[0] >= 48);
+        assert!(moved.get_pixel(0, 0)[0] > centered.get_pixel(0, 0)[0]);
+    }
+
+    #[test]
+    fn media_viewer_resize_cache_reuses_zoom_layer_for_pan_only() {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            16,
+            16,
+            image::Rgba([10, 200, 50, 255]),
+        ));
+        let mut cache = ViewerResizeCache::default();
+        let centered_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 200, 0, 0);
+        let panned_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 200, 0, -6);
+        let zoomed_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 225, 0, -6);
+
+        let _ = prepare_media_viewer_image(
+            &image,
+            &centered_key,
+            FontSize::new(10, 20),
+            &mut cache,
+        );
+        assert_eq!(cache.resize_count(), 1);
+
+        let _ = prepare_media_viewer_image(&image, &panned_key, FontSize::new(10, 20), &mut cache);
+        assert_eq!(cache.resize_count(), 1);
+
+        let _ = prepare_media_viewer_image(&image, &zoomed_key, FontSize::new(10, 20), &mut cache);
+        assert_eq!(cache.resize_count(), 2);
+    }
+
+    #[test]
+    fn media_viewer_pan_beyond_top_edge_moves_image_on_canvas() {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            16,
+            16,
+            image::Rgba([10, 200, 50, 255]),
+        ));
+        let key = MediaViewerKey::new("hash-1", Size::new(1, 1), 200, 0, -6);
+
+        let mut cache = ViewerResizeCache::default();
+        let prepared =
+            prepare_media_viewer_image(&image, &key, FontSize::new(10, 20), &mut cache).to_rgba8();
+
+        assert_eq!(prepared.width(), 10);
+        assert_eq!(prepared.height(), 20);
+        assert_eq!(prepared.get_pixel(0, 0)[3], 0);
+        assert_eq!(prepared.get_pixel(0, 6), &image::Rgba([10, 200, 50, 255]));
     }
 
     #[test]
@@ -781,7 +1004,7 @@ mod tests {
         let requests = vec![
             ProtocolRequest {
                 id: ProtocolRequestId::Screen(1),
-                image: DynamicImage::new_rgba8(2, 2),
+                image: Arc::new(DynamicImage::new_rgba8(2, 2)),
                 size: Size::new(20, 8),
             },
             ProtocolRequest::inline(
@@ -791,7 +1014,7 @@ mod tests {
             ),
             ProtocolRequest {
                 id: ProtocolRequestId::Screen(2),
-                image: DynamicImage::new_rgba8(2, 2),
+                image: Arc::new(DynamicImage::new_rgba8(2, 2)),
                 size: Size::new(20, 8),
             },
             ProtocolRequest::inline(
@@ -801,7 +1024,7 @@ mod tests {
             ),
             ProtocolRequest::viewer(
                 viewer.clone(),
-                DynamicImage::new_rgba8(2, 2),
+                Arc::new(DynamicImage::new_rgba8(2, 2)),
                 Size::new(80, 24),
             ),
         ];

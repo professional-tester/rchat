@@ -689,8 +689,9 @@ mod tests {
             None,
         );
 
-        assert_eq!(media_viewer_view_label(&viewer), "zoom 100%  offset 0,0");
+        assert_eq!(media_viewer_view_label(&viewer), "zoom 100%  centered");
         assert!(media_viewer_shortcuts_label().contains("arrows move image when zoomed"));
+        assert!(media_viewer_shortcuts_label().contains("0/R reset"));
         assert!(!media_viewer_shortcuts_label().contains("pan"));
     }
 
@@ -773,6 +774,30 @@ mod tests {
         assert!(state.viewer_protocol.is_none());
         assert!(state.viewer_protocol_key.is_none());
         assert!(state.last_protocol_seq.is_none());
+    }
+
+    #[test]
+    fn requesting_new_viewer_protocol_keeps_current_protocol_visible() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        let old_key = MediaViewerKey::new("hash-1", Size::new(80, 24), 100, 0, 0);
+        let new_key = MediaViewerKey::new("hash-1", Size::new(80, 24), 125, 0, 0);
+        let protocol = ratatui_image::picker::Picker::halfblocks()
+            .new_protocol(
+                DynamicImage::new_rgba8(10, 20),
+                Size::new(1, 1),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("test protocol builds");
+        state.viewer_protocol = Some(ProtocolResponse {
+            id: ProtocolRequestId::Viewer(old_key.clone()),
+            protocol,
+        });
+        state.viewer_protocol_key = Some(old_key);
+
+        request_viewer_protocol_key(&mut state, new_key.clone());
+
+        assert!(state.viewer_protocol.is_some());
+        assert_eq!(state.viewer_protocol_key, Some(new_key));
     }
 
     #[test]
@@ -958,6 +983,40 @@ mod tests {
         );
         assert_eq!(plans.first().map(|plan| plan.y_offset), Some(0));
         assert_eq!(plans.last().map(|plan| plan.y_offset), Some(3));
+    }
+
+    #[test]
+    fn visible_message_plans_clip_older_preview_instead_of_leaving_top_blank() {
+        let messages = vec![
+            TuiMessage {
+                id: "older".to_string(),
+                ..media_message("image", Some("hash-older"))
+            },
+            TuiMessage {
+                id: "middle".to_string(),
+                ..media_message("image", Some("hash-middle"))
+            },
+            TuiMessage {
+                id: "newest".to_string(),
+                ..media_message("image", Some("hash-newest"))
+            },
+        ];
+
+        let plans = visible_message_plans(&messages, 80, 15, true, 0);
+
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["middle", "newest"]
+        );
+        assert_eq!(plans.first().map(|plan| plan.y_offset), Some(0));
+        assert_eq!(plans.first().map(|plan| plan.visible_height), Some(3));
+        assert_eq!(plans.first().map(|plan| plan.clip_top), Some(9));
+        assert_eq!(plans.last().map(|plan| plan.y_offset), Some(3));
+        assert_eq!(plans.last().map(|plan| plan.visible_height), Some(12));
+        assert_eq!(plans.last().map(|plan| plan.clip_top), Some(0));
     }
 
     fn synthetic_i420(width: u32, height: u32) -> Vec<u8> {
@@ -1454,7 +1513,6 @@ async fn run_interactive() -> Result<()> {
                             state.inline_media_cache.insert_error(key, error.message);
                         }
                         ProtocolRequestId::Viewer(_) => {
-                            state.viewer_protocol = None;
                             if let Some(viewer) = state.app.media_viewer.as_mut() {
                                 viewer.error = Some(error.message);
                             }
@@ -2213,7 +2271,7 @@ fn load_media_viewer_image(app_state: &AppState, state: &mut UiState) {
         Ok(image) => {
             state.viewer_image = Some(ViewerLoadedImage {
                 file_hash: snapshot.file_hash,
-                image,
+                image: Arc::new(image),
             });
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.status = Some("image loaded".to_string());
@@ -2233,6 +2291,10 @@ fn load_media_viewer_image(app_state: &AppState, state: &mut UiState) {
 fn reset_viewer_protocol(state: &mut UiState) {
     state.viewer_protocol = None;
     state.viewer_protocol_key = None;
+}
+
+fn request_viewer_protocol_key(state: &mut UiState, key: MediaViewerKey) {
+    state.viewer_protocol_key = Some(key);
 }
 
 fn close_media_viewer(state: &mut UiState) {
@@ -3140,43 +3202,36 @@ async fn handle_media_viewer_key(
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.zoom_in();
             }
-            reset_viewer_protocol(state);
         }
         KeyCode::Char('-') => {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.zoom_out();
             }
-            reset_viewer_protocol(state);
         }
-        KeyCode::Char('0') => {
+        KeyCode::Char('0') | KeyCode::Char('R') => {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.reset_view();
             }
-            reset_viewer_protocol(state);
         }
         KeyCode::Left => {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.pan_by(-64, 0);
             }
-            reset_viewer_protocol(state);
         }
         KeyCode::Right => {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.pan_by(64, 0);
             }
-            reset_viewer_protocol(state);
         }
         KeyCode::Up => {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.pan_by(0, -64);
             }
-            reset_viewer_protocol(state);
         }
         KeyCode::Down => {
             if let Some(viewer) = state.app.media_viewer.as_mut() {
                 viewer.pan_by(0, 64);
             }
-            reset_viewer_protocol(state);
         }
         KeyCode::Char('s') => {
             activate_media_viewer_action(app_state, network_state, state, MediaViewerAction::Save)
@@ -5532,7 +5587,7 @@ struct UiState {
 #[derive(Clone)]
 struct ViewerLoadedImage {
     file_hash: String,
-    image: DynamicImage,
+    image: Arc<DynamicImage>,
 }
 
 impl UiState {
@@ -6945,11 +7000,22 @@ fn visible_message_plans(
     for index in (0..end_exclusive).rev() {
         let height = usize::from(heights[index]);
         let render_height = height.min(viewport_height);
-        if !selected.is_empty() && selected_height.saturating_add(render_height) > viewport_height {
+        let remaining_height = viewport_height.saturating_sub(selected_height);
+        if remaining_height == 0 {
             break;
         }
 
-        selected.push((index, render_height));
+        if !selected.is_empty() && selected_height.saturating_add(render_height) > viewport_height {
+            selected.push((
+                index,
+                remaining_height,
+                height.saturating_sub(remaining_height),
+            ));
+            selected_height = selected_height.saturating_add(remaining_height);
+            break;
+        }
+
+        selected.push((index, render_height, 0));
         selected_height = selected_height.saturating_add(render_height);
 
         if selected_height >= viewport_height {
@@ -6961,7 +7027,7 @@ fn visible_message_plans(
     let mut y = viewport_height.saturating_sub(selected_height) as u16;
     let mut plans = Vec::new();
 
-    for (index, render_height) in selected {
+    for (index, render_height, clip_top) in selected {
         if render_height == 0 {
             continue;
         }
@@ -6970,7 +7036,7 @@ fn visible_message_plans(
             inline_preview: inline_flags[index],
             y_offset: y,
             visible_height: render_height as u16,
-            clip_top: 0,
+            clip_top: clip_top as u16,
         });
         y = y.saturating_add(render_height as u16);
     }
@@ -8359,15 +8425,16 @@ fn render_media_viewer_image(
         viewer.pan_y,
     );
 
-    if state.viewer_protocol_key.as_ref() != Some(&key) {
-        state.viewer_protocol_key = Some(key.clone());
-        state.viewer_protocol = None;
+    let request_image = if state.viewer_protocol_key.as_ref() != Some(&key) {
+        Some(Arc::clone(&loaded.image))
+    } else {
+        None
+    };
+
+    if let Some(request_image) = request_image {
+        request_viewer_protocol_key(state, key.clone());
         if let Some(worker) = protocol_worker {
-            worker.request(ProtocolRequest::viewer(
-                key.clone(),
-                loaded.image.clone(),
-                size,
-            ));
+            worker.request(ProtocolRequest::viewer(key.clone(), request_image, size));
         }
     }
 
@@ -8376,7 +8443,11 @@ fn render_media_viewer_image(
             let image = Image::new(&protocol.protocol);
             frame.render_widget(image, inner);
         }
-        _ => render_media_viewer_placeholder(frame, inner, "Preparing image...", theme),
+        Some(protocol) => {
+            let image = Image::new(&protocol.protocol);
+            frame.render_widget(image, inner);
+        }
+        None => render_media_viewer_placeholder(frame, inner, "Preparing image...", theme),
     }
 }
 
@@ -8480,14 +8551,18 @@ fn render_media_viewer_details(
 }
 
 fn media_viewer_view_label(viewer: &crate::state::MediaViewerState) -> String {
-    format!(
-        "zoom {}%  offset {},{}",
-        viewer.zoom_percent, viewer.pan_x, viewer.pan_y
-    )
+    if viewer.zoom_percent <= 100 || (viewer.pan_x == 0 && viewer.pan_y == 0) {
+        format!("zoom {}%  centered", viewer.zoom_percent)
+    } else {
+        format!(
+            "zoom {}%  moved {:+},{:+}",
+            viewer.zoom_percent, viewer.pan_x, viewer.pan_y
+        )
+    }
 }
 
 fn media_viewer_shortcuts_label() -> &'static str {
-    "+/- zoom  arrows move image when zoomed  0 reset  s/o/c/r actions  Esc close"
+    "+/- zoom  arrows move image when zoomed  0/R reset  s/o/c/r actions  Esc close"
 }
 
 fn viewer_input_line(
