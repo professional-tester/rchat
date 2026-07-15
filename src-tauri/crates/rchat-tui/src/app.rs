@@ -1,5 +1,6 @@
 use crate::{
     bridge::{TuiEvent, TuiEventSink},
+    ghostty_import,
     media::{
         decode_inline_media_preview, DecodedRgbaFrame, InlineMediaCache, InlineMediaKey,
         InlineMediaState, LatestFrameSlot, MediaViewerKey, ProtocolRequest, ProtocolRequestId,
@@ -3763,8 +3764,12 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
             size_bytes: sticker.size_bytes,
         })
         .collect::<Vec<_>>();
+    let host_preferences = crate::ratty_host::load_preferences(&app_state.app_dir);
+    let discovery = crate::ratty_host::resolved_ratty(&app_state.app_dir);
+    let imported = ghostty_import::managed_import_status(&app_state.app_dir);
 
     if let Some(modal) = state.app.settings.as_mut() {
+        modal.ratty_warning = None;
         modal.profile_alias = profile.alias.unwrap_or_default();
         modal.profile_avatar_path = profile.avatar_path.unwrap_or_default();
         modal.trusted_peers = trusted_peers;
@@ -3776,6 +3781,50 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
         modal.stickers = stickers;
         if modal.selected_sticker_hash().is_none() {
             modal.selected_sticker_hash = None;
+        }
+        match host_preferences {
+            Ok(preferences) => {
+                modal.ratty_path = preferences
+                    .executable_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+            }
+            Err(error) => {
+                modal.ratty_path.clear();
+                modal.ratty_warning = Some(format!("failed to load Ratty path: {error}"));
+            }
+        }
+        match discovery {
+            Ok(discovery) => {
+                modal.ratty_resolved_path = discovery
+                    .resolved
+                    .as_ref()
+                    .map(|value| value.path.display().to_string());
+                modal.ratty_path_source = discovery
+                    .resolved
+                    .as_ref()
+                    .map(|value| value.source.label().to_string());
+                if discovery.warning.is_some() {
+                    modal.ratty_warning = discovery.warning;
+                }
+            }
+            Err(error) => {
+                modal.ratty_resolved_path = None;
+                modal.ratty_path_source = None;
+                modal.ratty_warning = Some(format!("failed to discover Ratty: {error}"));
+            }
+        }
+        match imported {
+            Ok(Some(_)) => {
+                modal.ratty_config_source = "Imported from Ghostty".to_string();
+            }
+            Ok(None) => {
+                modal.ratty_config_source = "Ratty default/config discovery".to_string();
+            }
+            Err(error) => {
+                modal.ratty_config_source = "Ratty import status unavailable".to_string();
+                modal.ratty_warning = Some(format!("failed to read Ratty import status: {error}"));
+            }
         }
     }
     Ok(())
@@ -3947,6 +3996,77 @@ async fn activate_settings_focus(
             refresh_settings_modal(app_state, state).await?;
             set_settings_status(state, "sticker deleted");
         }
+        SettingsField::RattyPathSave => {
+            let value = state
+                .app
+                .settings
+                .as_ref()
+                .map(|modal| modal.ratty_path.trim().to_string())
+                .unwrap_or_default();
+            let mut preferences = match crate::ratty_host::load_preferences(&app_state.app_dir) {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    set_settings_error(state, format!("failed to load Ratty path: {error}"));
+                    return Ok(());
+                }
+            };
+            preferences.executable_path = if value.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(&value);
+                if !path.is_file() {
+                    set_settings_error(
+                        state,
+                        format!("Ratty executable not found: {}", path.display()),
+                    );
+                    return Ok(());
+                }
+                Some(path)
+            };
+            if let Err(error) =
+                crate::ratty_host::save_preferences(&app_state.app_dir, &preferences)
+            {
+                set_settings_error(state, format!("failed to save Ratty path: {error}"));
+                return Ok(());
+            }
+            refresh_settings_modal(app_state, state).await?;
+            set_settings_status(state, "Ratty path saved; restart RChat to apply");
+        }
+        SettingsField::RattyImportGhostty => {
+            let imported = match ghostty_import::import_from_ghostty(&app_state.app_dir) {
+                Ok(imported) => imported,
+                Err(error) => {
+                    set_settings_error(state, format!("Ghostty import failed: {error}"));
+                    return Ok(());
+                }
+            };
+            refresh_settings_modal(app_state, state).await?;
+            set_settings_status(
+                state,
+                format!(
+                    "Ghostty settings imported to {}; restart RChat to apply",
+                    imported.config_path.display()
+                ),
+            );
+        }
+        SettingsField::RattyReset => {
+            let changed = match ghostty_import::reset_managed_ratty_config(&app_state.app_dir) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    set_settings_error(state, format!("failed to reset Ratty settings: {error}"));
+                    return Ok(());
+                }
+            };
+            refresh_settings_modal(app_state, state).await?;
+            set_settings_status(
+                state,
+                if changed {
+                    "Ratty import reset; restart RChat to use Ratty defaults"
+                } else {
+                    "Ratty is already using its defaults"
+                },
+            );
+        }
         SettingsField::ProfileAlias
         | SettingsField::ProfileAvatar
         | SettingsField::Peer(_)
@@ -3955,7 +4075,8 @@ async fn activate_settings_focus(
         | SettingsField::ThemePrimary
         | SettingsField::ThemeSecondary
         | SettingsField::ThemeText
-        | SettingsField::StickerPath => {}
+        | SettingsField::StickerPath
+        | SettingsField::RattyPath => {}
         SettingsField::Sticker(index) => {
             if let Some(modal) = state.app.settings.as_mut() {
                 modal.select_sticker(index);
@@ -9282,7 +9403,41 @@ fn settings_sticker_lines(
 }
 
 fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
-    vec![
+    let modal = state
+        .app
+        .settings
+        .as_ref()
+        .expect("settings media lines require an open settings modal");
+    let lines = vec![
+        Line::from("Ratty terminal host"),
+        Line::from(format!(
+            "Resolved: {} ({})",
+            modal.ratty_resolved_path.as_deref().unwrap_or("not found"),
+            modal.ratty_path_source.as_deref().unwrap_or("none")
+        )),
+        Line::from(format!("Configuration: {}", modal.ratty_config_source)),
+        Line::from(modal.ratty_warning.clone().unwrap_or_default()),
+        settings_input_line(
+            modal,
+            SettingsField::RattyPath,
+            "Executable path",
+            &modal.ratty_path,
+            theme,
+        ),
+        settings_button_line(modal, SettingsField::RattyPathSave, "Save Ratty path", theme),
+        settings_button_line(
+            modal,
+            SettingsField::RattyImportGhostty,
+            "Import from Ghostty",
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::RattyReset,
+            "Reset imported Ratty settings",
+            theme,
+        ),
+        Line::from(""),
         Line::from("Media diagnostics"),
         Line::from(format!("Protocol: {:?}", state.protocol_type)),
         Line::from(format!(
@@ -9304,11 +9459,8 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
             state.pending_frame_drops
         )),
         Line::from(format!("Decoder errors: {}", state.decoder_errors)),
-        Line::from(Span::styled(
-            "Read-only for this iteration",
-            Style::default().fg(theme.muted),
-        )),
-    ]
+    ];
+    lines
 }
 
 fn settings_about_lines(theme: &Theme) -> Vec<Line<'static>> {

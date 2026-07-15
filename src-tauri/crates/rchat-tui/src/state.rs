@@ -428,6 +428,10 @@ pub enum SettingsField {
     StickerPath,
     StickerImport,
     StickerDelete,
+    RattyPath,
+    RattyPathSave,
+    RattyImportGhostty,
+    RattyReset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +474,11 @@ pub struct SettingsModalState {
     pub stickers: Vec<TuiSticker>,
     pub selected_sticker_hash: Option<String>,
     pub sticker_path: String,
+    pub ratty_path: String,
+    pub ratty_resolved_path: Option<String>,
+    pub ratty_path_source: Option<String>,
+    pub ratty_config_source: String,
+    pub ratty_warning: Option<String>,
     pub status: Option<String>,
     pub error: Option<String>,
 }
@@ -495,6 +504,11 @@ impl Default for SettingsModalState {
             stickers: Vec::new(),
             selected_sticker_hash: None,
             sticker_path: String::new(),
+            ratty_path: String::new(),
+            ratty_resolved_path: None,
+            ratty_path_source: None,
+            ratty_config_source: "Ratty default/config discovery".to_string(),
+            ratty_warning: None,
             status: None,
             error: None,
         }
@@ -555,7 +569,13 @@ impl SettingsModalState {
                     SettingsField::StickerDelete,
                 ]);
             }
-            SettingsSection::Media | SettingsSection::About => {}
+            SettingsSection::Media => fields.extend([
+                SettingsField::RattyPath,
+                SettingsField::RattyPathSave,
+                SettingsField::RattyImportGhostty,
+                SettingsField::RattyReset,
+            ]),
+            SettingsSection::About => {}
         }
         fields
     }
@@ -680,6 +700,7 @@ impl SettingsModalState {
             SettingsField::ThemeSecondary => self.theme_secondary.push(ch),
             SettingsField::ThemeText => self.theme_text.push(ch),
             SettingsField::StickerPath => self.sticker_path.push(ch),
+            SettingsField::RattyPath => self.ratty_path.push(ch),
             _ => {}
         }
     }
@@ -706,6 +727,9 @@ impl SettingsModalState {
             }
             SettingsField::StickerPath => {
                 self.sticker_path.pop();
+            }
+            SettingsField::RattyPath => {
+                self.ratty_path.pop();
             }
             _ => {}
         }
@@ -2654,6 +2678,39 @@ mod tests {
         }
 
         assert_eq!(modal.sticker_path, "/tmp/sticker.png");
+    }
+
+    #[test]
+    fn media_settings_expose_ratty_path_import_and_reset_controls() {
+        let mut modal = SettingsModalState::default();
+        modal.activate_section(SettingsSection::Media);
+
+        assert_eq!(
+            modal.content_fields(),
+            vec![
+                SettingsField::RattyPath,
+                SettingsField::RattyPathSave,
+                SettingsField::RattyImportGhostty,
+                SettingsField::RattyReset,
+            ]
+        );
+        assert_eq!(modal.focus, SettingsField::RattyPath);
+    }
+
+    #[test]
+    fn only_ratty_path_accepts_text_input() {
+        let mut modal = SettingsModalState::default();
+        modal.activate_section(SettingsSection::Media);
+        modal.push_char('/');
+        modal.push_char('x');
+        assert_eq!(modal.ratty_path, "/x");
+
+        modal.focus = SettingsField::RattyImportGhostty;
+        modal.push_char('z');
+        assert_eq!(modal.ratty_path, "/x");
+        modal.focus = SettingsField::RattyPath;
+        modal.pop_char();
+        assert_eq!(modal.ratty_path, "/");
     }
 
     #[test]
