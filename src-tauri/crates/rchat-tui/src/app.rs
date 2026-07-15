@@ -101,6 +101,8 @@ const KITTY_DELETE_VISIBLE_PLACEMENTS: &[u8] = b"\x1b_Ga=d,q=2\x1b\\";
 #[command(name = "rchat-tui")]
 #[command(about = "Terminal RChat client media spike")]
 pub struct Cli {
+    #[arg(long, global = true, hide = true)]
+    no_ratty: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -210,6 +212,14 @@ mod tests {
     #[test]
     fn parses_default_interactive_shell() {
         let cli = Cli::try_parse_from(["rchat-tui"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.no_ratty);
+    }
+
+    #[test]
+    fn parses_hidden_ratty_host_bypass() {
+        let cli = Cli::try_parse_from(["rchat-tui", "--no-ratty"]).unwrap();
+        assert!(cli.no_ratty);
         assert!(cli.command.is_none());
     }
 
