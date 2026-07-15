@@ -63,23 +63,43 @@ pub fn load_preferences(app_dir: &Path) -> Result<RattyHostPreferences> {
     if !path.is_file() {
         return Ok(RattyHostPreferences::default());
     }
-    let bytes = fs::read(&path)
-        .with_context(|| format!("failed to read Ratty host preferences at {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse Ratty host preferences at {}", path.display()))
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "failed to read Ratty host preferences at {}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse Ratty host preferences at {}",
+            path.display()
+        )
+    })
 }
 
 pub fn save_preferences(app_dir: &Path, preferences: &RattyHostPreferences) -> Result<()> {
-    fs::create_dir_all(app_dir)
-        .with_context(|| format!("failed to create application data directory {}", app_dir.display()))?;
+    fs::create_dir_all(app_dir).with_context(|| {
+        format!(
+            "failed to create application data directory {}",
+            app_dir.display()
+        )
+    })?;
     let path = preferences_path(app_dir);
     let bytes = serde_json::to_vec_pretty(preferences)?;
-    fs::write(&path, bytes)
-        .with_context(|| format!("failed to write Ratty host preferences at {}", path.display()))
+    fs::write(&path, bytes).with_context(|| {
+        format!(
+            "failed to write Ratty host preferences at {}",
+            path.display()
+        )
+    })
 }
 
 fn ratty_file_name() -> &'static str {
-    if cfg!(windows) { "ratty.exe" } else { "ratty" }
+    if cfg!(windows) {
+        "ratty.exe"
+    } else {
+        "ratty"
+    }
 }
 
 fn file_candidate(path: PathBuf, source: RattyPathSource) -> Option<ResolvedRatty> {
@@ -94,7 +114,9 @@ fn resolve_ratty_executable(
 ) -> DiscoveryResult {
     let mut warning = None;
     if let Some(configured) = configured.filter(|path| !path.as_os_str().is_empty()) {
-        if let Some(resolved) = file_candidate(configured.to_path_buf(), RattyPathSource::Configured) {
+        if let Some(resolved) =
+            file_candidate(configured.to_path_buf(), RattyPathSource::Configured)
+        {
             return DiscoveryResult {
                 resolved: Some(resolved),
                 warning,
@@ -107,10 +129,9 @@ fn resolve_ratty_executable(
     }
 
     if let Some(environment) = environment.filter(|value| !value.is_empty()) {
-        if let Some(resolved) = file_candidate(
-            PathBuf::from(environment),
-            RattyPathSource::Environment,
-        ) {
+        if let Some(resolved) =
+            file_candidate(PathBuf::from(environment), RattyPathSource::Environment)
+        {
             return DiscoveryResult {
                 resolved: Some(resolved),
                 warning,
@@ -119,10 +140,9 @@ fn resolve_ratty_executable(
     }
 
     if let Some(parent) = current_exe.parent() {
-        if let Some(resolved) = file_candidate(
-            parent.join(ratty_file_name()),
-            RattyPathSource::Sibling,
-        ) {
+        if let Some(resolved) =
+            file_candidate(parent.join(ratty_file_name()), RattyPathSource::Sibling)
+        {
             return DiscoveryResult {
                 resolved: Some(resolved),
                 warning,
@@ -132,10 +152,9 @@ fn resolve_ratty_executable(
 
     if let Some(path) = path {
         for directory in env::split_paths(path) {
-            if let Some(resolved) = file_candidate(
-                directory.join(ratty_file_name()),
-                RattyPathSource::Path,
-            ) {
+            if let Some(resolved) =
+                file_candidate(directory.join(ratty_file_name()), RattyPathSource::Path)
+            {
                 return DiscoveryResult {
                     resolved: Some(resolved),
                     warning,
@@ -152,7 +171,8 @@ fn resolve_ratty_executable(
 
 pub fn resolved_ratty(app_dir: &Path) -> Result<DiscoveryResult> {
     let preferences = load_preferences(app_dir)?;
-    let current_exe = env::current_exe().context("failed to resolve the current RChat executable")?;
+    let current_exe =
+        env::current_exe().context("failed to resolve the current RChat executable")?;
     Ok(resolve_ratty_executable(
         preferences.executable_path.as_deref(),
         env::var_os("RCHAT_RATTY_PATH").as_deref(),
@@ -233,7 +253,8 @@ pub fn launch_if_needed(args: &[OsString]) -> Result<LaunchOutcome> {
         eprintln!("{warning}");
     }
 
-    let current_exe = env::current_exe().context("failed to resolve the current RChat executable")?;
+    let current_exe =
+        env::current_exe().context("failed to resolve the current RChat executable")?;
     let current_dir = env::current_dir().context("failed to resolve the current directory")?;
     let child_args = args.iter().skip(1).cloned().collect::<Vec<_>>();
     let managed_config = managed_ratty_config_path(&app_dir);
@@ -299,14 +320,18 @@ mod tests {
             &current,
             Some(path_dir.as_os_str()),
         );
-        assert_eq!(environment_result.resolved.unwrap().source, RattyPathSource::Environment);
+        assert_eq!(
+            environment_result.resolved.unwrap().source,
+            RattyPathSource::Environment
+        );
 
         let sibling_result =
             resolve_ratty_executable(None, None, &current, Some(path_dir.as_os_str()));
         assert_eq!(sibling_result.resolved.unwrap().path, sibling);
 
         fs::remove_file(sibling).unwrap();
-        let path_result = resolve_ratty_executable(None, None, &current, Some(path_dir.as_os_str()));
+        let path_result =
+            resolve_ratty_executable(None, None, &current, Some(path_dir.as_os_str()));
         assert_eq!(path_result.resolved.unwrap().path, path_ratty);
     }
 
@@ -317,15 +342,14 @@ mod tests {
         let current = temp.path().join("rchat-tui");
         let missing = temp.path().join("missing-ratty");
 
-        let result = resolve_ratty_executable(
-            Some(&missing),
-            Some(fallback.as_os_str()),
-            &current,
-            None,
-        );
+        let result =
+            resolve_ratty_executable(Some(&missing), Some(fallback.as_os_str()), &current, None);
 
         assert_eq!(result.resolved.unwrap().path, fallback);
-        assert!(result.warning.unwrap().contains(&missing.display().to_string()));
+        assert!(result
+            .warning
+            .unwrap()
+            .contains(&missing.display().to_string()));
     }
 
     #[test]

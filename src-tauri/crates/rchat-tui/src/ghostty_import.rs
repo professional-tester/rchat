@@ -112,7 +112,10 @@ fn load_ghostty_file(
         .canonicalize()
         .with_context(|| format!("failed to resolve Ghostty config {}", path.display()))?;
     if !active.insert(canonical.clone()) {
-        bail!("Ghostty config include cycle detected at {}", path.display());
+        bail!(
+            "Ghostty config include cycle detected at {}",
+            path.display()
+        );
     }
     loaded.source_files.push(canonical.clone());
     let text = fs::read_to_string(&canonical)
@@ -126,7 +129,8 @@ fn load_ghostty_file(
                 canonical.display(),
                 line_index + 1
             )
-        })? else {
+        })?
+        else {
             continue;
         };
         if key == "config-file" {
@@ -164,14 +168,16 @@ fn parse_ghostty_line(line: &str) -> Result<Option<(String, String)>> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(None);
     }
-    let separator = find_unquoted(trimmed, '=')
-        .context("expected a `key = value` assignment")?;
+    let separator = find_unquoted(trimmed, '=').context("expected a `key = value` assignment")?;
     let key = trimmed[..separator].trim();
     if key.is_empty() {
         bail!("configuration key is empty");
     }
     let value = strip_unquoted_trailing_comment(trimmed[separator + 1..].trim());
-    Ok(Some((key.to_string(), remove_outer_quotes(value).to_string())))
+    Ok(Some((
+        key.to_string(),
+        remove_outer_quotes(value).to_string(),
+    )))
 }
 
 fn find_unquoted(value: &str, needle: char) -> Option<usize> {
@@ -221,10 +227,7 @@ fn strip_unquoted_trailing_comment(value: &str) -> &str {
             } else if quote.is_none() {
                 quote = Some(character);
             }
-        } else if quote.is_none()
-            && character == '#'
-            && seen_non_whitespace
-            && previous_whitespace
+        } else if quote.is_none() && character == '#' && seen_non_whitespace && previous_whitespace
         {
             return value[..index].trim_end();
         }
@@ -404,14 +407,8 @@ fn translated_config(values: &GhosttyValues) -> Result<ManagedRattyConfig> {
             Ok(opacity.clamp(0.0, 1.0))
         })
         .transpose()?;
-    let foreground = values
-        .last("foreground")
-        .map(normalize_color)
-        .transpose()?;
-    let background = values
-        .last("background")
-        .map(normalize_color)
-        .transpose()?;
+    let foreground = values.last("foreground").map(normalize_color).transpose()?;
+    let background = values.last("background").map(normalize_color).transpose()?;
     let cursor = values
         .last("cursor-color")
         .map(normalize_color)
@@ -481,9 +478,8 @@ fn translated_palettes(
     values: &GhosttyValues,
 ) -> Result<(Option<ManagedPalette>, Option<ManagedPalette>)> {
     const DEFAULTS: [&str; 16] = [
-        "#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd",
-        "#e5e5e5", "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6",
-        "#29b8db", "#ffffff",
+        "#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+        "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
     ];
     let mut colors = DEFAULTS.map(str::to_string);
     let mut seen_normal = false;
@@ -530,14 +526,10 @@ fn translate_binding(value: &str) -> Option<ManagedBinding> {
         "copy_to_clipboard" => "Copy",
         "paste_from_clipboard" => "Paste",
         "reset_font_size" => "ResetFontSize",
-        action
-            if action == "increase_font_size" || action.starts_with("increase_font_size:") =>
-        {
+        action if action == "increase_font_size" || action.starts_with("increase_font_size:") => {
             "IncreaseFontSize"
         }
-        action
-            if action == "decrease_font_size" || action.starts_with("decrease_font_size:") =>
-        {
+        action if action == "decrease_font_size" || action.starts_with("decrease_font_size:") => {
             "DecreaseFontSize"
         }
         _ => return None,
@@ -608,13 +600,20 @@ fn import_from_ghostty_with_locations(
     }
     merged.values_from(&loaded.values);
     let config = translated_config(&merged)?;
-    let text = toml::to_string_pretty(&config).context("failed to serialize managed Ratty config")?;
+    let text =
+        toml::to_string_pretty(&config).context("failed to serialize managed Ratty config")?;
     toml::from_str::<toml::Value>(&text).context("generated managed Ratty config is invalid")?;
 
     let config_path = crate::ratty_host::managed_ratty_config_path(app_dir);
-    let directory = config_path.parent().context("managed Ratty config has no parent")?;
-    fs::create_dir_all(directory)
-        .with_context(|| format!("failed to create managed Ratty directory {}", directory.display()))?;
+    let directory = config_path
+        .parent()
+        .context("managed Ratty config has no parent")?;
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create managed Ratty directory {}",
+            directory.display()
+        )
+    })?;
     let temporary_path = directory.join("ratty.toml.tmp");
     let mut temporary = File::create(&temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
@@ -702,16 +701,15 @@ mod tests {
     }
 
     fn write_adventure_theme(locations: &GhosttyLocations) {
-        let mut theme = String::from(
-            "foreground = #f8f8f2\nbackground = #101010\ncursor-color = #eeeeee\n",
-        );
+        let mut theme =
+            String::from("foreground = #f8f8f2\nbackground = #101010\ncursor-color = #eeeeee\n");
         for index in 0..16 {
-            theme.push_str(&format!("palette = {index}=#{index:02x}{index:02x}{index:02x}\n"));
+            theme.push_str(&format!(
+                "palette = {index}=#{index:02x}{index:02x}{index:02x}\n"
+            ));
         }
         write(
-            &locations
-                .xdg_config_home
-                .join("ghostty/themes/Adventure"),
+            &locations.xdg_config_home.join("ghostty/themes/Adventure"),
             &theme,
         );
     }
@@ -725,7 +723,11 @@ mod tests {
             "font-size = 11\n",
         );
         write(
-            &locations.macos_config_dir.as_ref().unwrap().join("included"),
+            &locations
+                .macos_config_dir
+                .as_ref()
+                .unwrap()
+                .join("included"),
             "font-size = 15\n",
         );
         write(
@@ -765,7 +767,10 @@ mod tests {
         assert_eq!(value["theme"]["normal"]["black"].as_str(), Some("#000000"));
         assert_eq!(value["theme"]["bright"]["white"].as_str(), Some("#0f0f0f"));
         assert_eq!(result.metadata.theme.as_deref(), Some("Adventure"));
-        assert_eq!(managed_import_status(temp.path()).unwrap(), Some(result.metadata));
+        assert_eq!(
+            managed_import_status(temp.path()).unwrap(),
+            Some(result.metadata)
+        );
     }
 
     #[test]
@@ -782,7 +787,10 @@ mod tests {
         let text = fs::read_to_string(result.config_path).unwrap();
         let value = text.parse::<toml::Value>().unwrap();
 
-        assert_eq!(value["font"]["family"].as_str(), Some("FiraCode Nerd Font Mono"));
+        assert_eq!(
+            value["font"]["family"].as_str(),
+            Some("FiraCode Nerd Font Mono")
+        );
         assert_eq!(value["font"]["style"].as_str(), Some("BoldItalic"));
         assert_eq!(value["font"]["size"].as_integer(), Some(13));
         assert!(!text.contains("padding"));
@@ -836,7 +844,10 @@ mod tests {
         assert!(!temporary.exists());
         assert_eq!(fs::read_to_string(unrelated_managed).unwrap(), "keep");
         assert_eq!(fs::read_to_string(ghostty).unwrap(), "font-size = 13\n");
-        assert_eq!(fs::read_to_string(standalone_ratty).unwrap(), "[font]\nsize = 20\n");
+        assert_eq!(
+            fs::read_to_string(standalone_ratty).unwrap(),
+            "[font]\nsize = 20\n"
+        );
         assert!(!reset_managed_ratty_config(&app_dir).unwrap());
     }
 
@@ -898,7 +909,10 @@ mod tests {
         );
 
         write(&config, "config-file = nested\n");
-        write(&config.parent().unwrap().join("nested"), "config-file = config\n");
+        write(
+            &config.parent().unwrap().join("nested"),
+            "config-file = config\n",
+        );
         let error = load_ghostty_values(&locations).unwrap_err();
         assert!(error.to_string().contains("cycle"));
     }
