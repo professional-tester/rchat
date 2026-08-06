@@ -26,22 +26,6 @@ pub async fn sync_runtime_connectivity(
     }
 }
 
-pub async fn toggle_online_status(
-    app_state: &AppState,
-    network_state: Option<&NetworkState>,
-    online: bool,
-) -> Result<()> {
-    let mapped = if online {
-        ConnectivitySettings::from_mode(ConnectivityMode::Reachable)
-    } else {
-        ConnectivitySettings::from_mode(ConnectivityMode::Invisible)
-    };
-
-    save_connectivity(app_state, &mapped).await?;
-    sync_runtime_connectivity(network_state, &mapped).await;
-    Ok(())
-}
-
 pub async fn get_connectivity_settings(app_state: &AppState) -> Result<ConnectivitySettings> {
     let mgr = app_state.config_manager.lock().await;
     let config = mgr.load().await?;

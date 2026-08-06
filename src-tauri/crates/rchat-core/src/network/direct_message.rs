@@ -27,6 +27,7 @@ pub enum DirectMessageKind {
     ChunkRequest,
     ChunkResponse,
     GroupInvite,
+    GroupDissolution,
     GroupSyncRequest,
     GroupSyncResponse,
     InviteHandshake,
@@ -60,6 +61,7 @@ impl DirectMessageKind {
             Self::ChunkRequest => "chunk_request",
             Self::ChunkResponse => "chunk_response",
             Self::GroupInvite => "group_invite",
+            Self::GroupDissolution => "group_dissolution",
             Self::GroupSyncRequest => "group_sync_request",
             Self::GroupSyncResponse => "group_sync_response",
             Self::InviteHandshake => "invite_handshake",
@@ -151,6 +153,7 @@ mod tests {
             (DirectMessageKind::ChunkRequest, "\"chunk_request\""),
             (DirectMessageKind::ChunkResponse, "\"chunk_response\""),
             (DirectMessageKind::GroupInvite, "\"group_invite\""),
+            (DirectMessageKind::GroupDissolution, "\"group_dissolution\""),
             (
                 DirectMessageKind::GroupSyncRequest,
                 "\"group_sync_request\"",

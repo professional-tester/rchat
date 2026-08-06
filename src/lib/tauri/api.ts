@@ -6,7 +6,6 @@ export const COMMANDS = {
   getConnectivitySettings: "get_connectivity_settings",
   setConnectivityMode: "set_connectivity_mode",
   updateConnectivitySettings: "update_connectivity_settings",
-  toggleOnlineStatus: "toggle_online_status",
   frontendLog: "frontend_log",
   initVault: "init_vault",
   unlockVault: "unlock_vault",
@@ -22,7 +21,6 @@ export const COMMANDS = {
   removeFriend: "remove_friend",
   getUserProfile: "get_user_profile",
   getTheme: "get_theme",
-  updateTheme: "update_theme",
   listThemePresets: "list_theme_presets",
   applyPreset: "apply_preset",
   getSelectedPreset: "get_selected_preset",
@@ -42,8 +40,9 @@ export const COMMANDS = {
   forceChatReconnect: "force_chat_reconnect",
   saveTemporaryChatToArchive: "save_temporary_chat_to_archive",
   createGroupChat: "create_group_chat",
-  joinGroupChat: "join_group_chat",
   leaveGroupChat: "leave_group_chat",
+  previewGroupLeave: "preview_group_leave",
+  transferGroupAdmin: "transfer_group_admin",
   inviteGroupMember: "invite_group_member",
   getGroupPolicy: "get_group_policy",
   updateGroupSettings: "update_group_settings",
@@ -84,6 +83,7 @@ export const COMMANDS = {
   saveStickerFromMessage: "save_sticker_from_message",
   generateInvitePassword: "generate_invite_password",
   createInvite: "create_invite",
+  getInviteEmailDraft: "get_invite_email_draft",
   redeemAndConnect: "redeem_and_connect",
   createTemporaryInvite: "create_temporary_invite",
   createTemporaryGroupInvite: "create_temporary_group_invite",
@@ -211,6 +211,13 @@ export type ChatListItem = {
   id: string;
   name: string;
   is_group: boolean;
+  image_hash?: string | null;
+};
+
+export type InviteEmailDraft = {
+  subject: string;
+  body: string;
+  mailto_uri: string;
 };
 
 export type ChatConnectionView = {
@@ -270,6 +277,7 @@ export type ChatFileRow = {
 export type GroupChatResult = {
   chat_id: string;
   name: string;
+  image_hash?: string | null;
 };
 
 export type GroupPolicy = {
@@ -279,7 +287,15 @@ export type GroupPolicy = {
   members_can_invite: boolean;
   active_members: string[];
   invited_members: string[];
+  member_aliases: Record<string, string>;
+  automatic_successor_peer_id?: string | null;
+  dissolved: boolean;
 };
+
+export type GroupLeaveOutcome =
+  | { outcome: "left" }
+  | { outcome: "transferred_then_left"; successor_peer_id: string }
+  | { outcome: "dissolved" };
 
 export type ArchivedChatResult = {
   chat_id: string;
@@ -431,7 +447,6 @@ type CommandSpec = {
     args: { patch: ConnectivitySettingsPatch };
     result: ConnectivitySettings;
   };
-  [COMMANDS.toggleOnlineStatus]: { args: { online: boolean }; result: void };
   [COMMANDS.frontendLog]: { args: { message: string }; result: void };
   [COMMANDS.initVault]: { args: { password: string }; result: AuthStatus };
   [COMMANDS.unlockVault]: { args: { password: string }; result: AuthStatus };
@@ -454,7 +469,6 @@ type CommandSpec = {
   [COMMANDS.removeFriend]: { args: { username: string }; result: void };
   [COMMANDS.getUserProfile]: { args?: undefined; result: UserProfile };
   [COMMANDS.getTheme]: { args?: undefined; result: ThemeConfig };
-  [COMMANDS.updateTheme]: { args: { theme: ThemeConfig }; result: void };
   [COMMANDS.listThemePresets]: { args?: undefined; result: PresetInfo[] };
   [COMMANDS.applyPreset]: { args: { name: string }; result: ThemeConfig };
   [COMMANDS.getSelectedPreset]: { args?: undefined; result: string | null };
@@ -517,15 +531,23 @@ type CommandSpec = {
     result: ArchivedChatResult;
   };
   [COMMANDS.createGroupChat]: {
-    args: { name?: string | null };
-    result: GroupChatResult;
-  };
-  [COMMANDS.joinGroupChat]: {
-    args: { chat_id: string; name?: string | null };
+    args: {
+      name: string;
+      image_path?: string | null;
+      members_can_invite?: boolean | null;
+    };
     result: GroupChatResult;
   };
   [COMMANDS.leaveGroupChat]: {
     args: { chat_id: string };
+    result: GroupLeaveOutcome;
+  };
+  [COMMANDS.previewGroupLeave]: {
+    args: { group_id: string };
+    result: GroupLeaveOutcome;
+  };
+  [COMMANDS.transferGroupAdmin]: {
+    args: { group_id: string; peer_id: string };
     result: void;
   };
   [COMMANDS.inviteGroupMember]: {
@@ -648,6 +670,10 @@ type CommandSpec = {
   [COMMANDS.createInvite]: {
     args: { invitee: string; password: string };
     result: void;
+  };
+  [COMMANDS.getInviteEmailDraft]: {
+    args: { invitee: string; password: string };
+    result: InviteEmailDraft;
   };
   [COMMANDS.redeemAndConnect]: {
     args: { inviter: string; password: string };
@@ -812,8 +838,6 @@ export const api = {
     invokeCommand(COMMANDS.setConnectivityMode, { mode }),
   updateConnectivitySettings: (patch: ConnectivitySettingsPatch) =>
     invokeCommand(COMMANDS.updateConnectivitySettings, { patch }),
-  toggleOnlineStatus: (online: boolean) =>
-    invokeCommand(COMMANDS.toggleOnlineStatus, { online }),
   frontendLog: (message: string) =>
     invokeCommand(COMMANDS.frontendLog, { message }),
   initVault: (password: string) => invokeCommand(COMMANDS.initVault, { password }),
@@ -843,8 +867,6 @@ export const api = {
     invokeCommand(COMMANDS.removeFriend, { username }),
   getUserProfile: () => invokeCommand(COMMANDS.getUserProfile),
   getTheme: () => invokeCommand(COMMANDS.getTheme),
-  updateTheme: (theme: ThemeConfig) =>
-    invokeCommand(COMMANDS.updateTheme, { theme }),
   listThemePresets: () => invokeCommand(COMMANDS.listThemePresets),
   applyPreset: (name: string) => invokeCommand(COMMANDS.applyPreset, { name }),
   getSelectedPreset: () => invokeCommand(COMMANDS.getSelectedPreset),
@@ -901,12 +923,25 @@ export const api = {
     invokeCommand(COMMANDS.forceChatReconnect, { chat_id: chatId }),
   saveTemporaryChatToArchive: (chatId: string) =>
     invokeCommand(COMMANDS.saveTemporaryChatToArchive, { chat_id: chatId }),
-  createGroupChat: (name?: string | null) =>
-    invokeCommand(COMMANDS.createGroupChat, { name }),
-  joinGroupChat: (chatId: string, name?: string | null) =>
-    invokeCommand(COMMANDS.joinGroupChat, { chat_id: chatId, name }),
+  createGroupChat: (
+    name: string,
+    imagePath?: string | null,
+    membersCanInvite?: boolean | null
+  ) =>
+    invokeCommand(COMMANDS.createGroupChat, {
+      name,
+      image_path: imagePath,
+      members_can_invite: membersCanInvite,
+    }),
   leaveGroupChat: (chatId: string) =>
     invokeCommand(COMMANDS.leaveGroupChat, { chat_id: chatId }),
+  previewGroupLeave: (groupId: string) =>
+    invokeCommand(COMMANDS.previewGroupLeave, { group_id: groupId }),
+  transferGroupAdmin: (groupId: string, peerId: string) =>
+    invokeCommand(COMMANDS.transferGroupAdmin, {
+      group_id: groupId,
+      peer_id: peerId,
+    }),
   inviteGroupMember: (groupId: string, peerId: string) =>
     invokeCommand(COMMANDS.inviteGroupMember, {
       group_id: groupId,
@@ -1017,6 +1052,8 @@ export const api = {
   generateInvitePassword: () => invokeCommand(COMMANDS.generateInvitePassword),
   createInvite: (invitee: string, password: string) =>
     invokeCommand(COMMANDS.createInvite, { invitee, password }),
+  getInviteEmailDraft: (invitee: string, password: string) =>
+    invokeCommand(COMMANDS.getInviteEmailDraft, { invitee, password }),
   redeemAndConnect: (inviter: string, password: string) =>
     invokeCommand(COMMANDS.redeemAndConnect, { inviter, password }),
   createTemporaryInvite: (kind: "dm" | "group", name?: string | null) =>

@@ -4,6 +4,7 @@
   import QRCode from "qrcode";
   import { Html5Qrcode } from "html5-qrcode";
   import { api } from "$lib/tauri/api";
+  import { openUrl } from "@tauri-apps/plugin-opener";
 
   type StepType =
     | "select-network"
@@ -30,10 +31,10 @@
 
   onMount(async () => {
     // Listen for successful connection event
-    unlistenConnected = await listen<string>("peer-connected", (event) => {
+    unlistenConnected = await listen<string>("peer-connected", async (event) => {
       console.log("Peer connected:", event.payload);
       waitingForPeer = null;
-      onconnect(event.payload);
+      await onconnect(event.payload);
       handleClose();
     });
 
@@ -62,6 +63,8 @@
     showQrCode = false;
     qrDataUrl = "";
     createError = "";
+    createStatus = "";
+    createPublished = false;
     acceptInviter = "";
     acceptPassword = "";
     acceptError = "";
@@ -126,6 +129,8 @@
   let qrDataUrl = $state("");
   let createError = $state("");
   let createLoading = $state(false);
+  let createPublished = $state(false);
+  let createStatus = $state("");
 
   // Accept Invitation state
   let acceptInviter = $state("");
@@ -193,6 +198,8 @@
     try {
       // Generate password
       createPassword = await api.generateInvitePassword();
+      createPublished = false;
+      createStatus = "";
       // Generate QR code
       qrDataUrl = await QRCode.toDataURL(createPassword, {
         width: 200,
@@ -212,11 +219,36 @@
     createError = "";
 
     try {
-      await api.createInvite(createInvitee.trim(), createPassword);
+      await publishCreateInvite();
       console.log("Invite created successfully");
       handleClose();
     } catch (e: any) {
       createError = e.toString();
+    } finally {
+      createLoading = false;
+    }
+  }
+
+  async function publishCreateInvite() {
+    if (createPublished) return;
+    await api.createInvite(createInvitee.trim(), createPassword);
+    createPublished = true;
+  }
+
+  async function emailCreateInvite() {
+    createLoading = true;
+    createError = "";
+    createStatus = "";
+    try {
+      await publishCreateInvite();
+      const draft = await api.getInviteEmailDraft(createInvitee.trim(), createPassword);
+      await openUrl(draft.mailto_uri);
+      createStatus = "Invitation published. Your email application has the draft; send it when ready.";
+    } catch (e: any) {
+      createError = e?.toString?.() || "Failed to open your email application";
+      if (createPublished) {
+        createStatus = "Invitation published. You can copy the password or try Email invite again.";
+      }
     } finally {
       createLoading = false;
     }
@@ -879,13 +911,23 @@
               ← Back
             </button>
             <button
+              onclick={emailCreateInvite}
+              disabled={createLoading}
+              class="flex-1 px-4 py-2.5 bg-theme-base-800 hover:bg-theme-base-700 text-theme-base-200 font-semibold rounded-lg transition-all disabled:opacity-50"
+            >
+              {createPublished ? "Email invite" : "Publish & email invite"}
+            </button>
+            <button
               onclick={confirmCreateInvite}
               disabled={createLoading}
               class="flex-1 px-6 py-2.5 bg-theme-primary-600 hover:bg-theme-primary-500 text-theme-base-950 font-semibold rounded-lg transition-all disabled:opacity-50"
             >
-              {createLoading ? "Creating..." : "Confirm"}
+              {createLoading ? "Publishing..." : "Publish invite"}
             </button>
           </div>
+          {#if createStatus}
+            <p class="text-sm text-theme-primary-400">{createStatus}</p>
+          {/if}
           {#if createError}
             <p class="text-sm text-theme-error-400">{createError}</p>
           {/if}

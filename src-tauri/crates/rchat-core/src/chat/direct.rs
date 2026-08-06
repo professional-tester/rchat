@@ -21,6 +21,23 @@ pub fn generate_invite_password() -> String {
     rvault_core::crypto::generate_password(14, false)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InviteEmailDraft {
+    pub subject: String,
+    pub body: String,
+    pub mailto_uri: String,
+}
+
+pub fn build_invite_email_draft(inviter: &str, invitee: &str, password: &str) -> InviteEmailDraft {
+    let subject = format!("@{inviter} invited you to connect on RChat");
+    let body = format!("@{inviter} invited you to connect on RChat.\n\nThis invitation is intended for @{invitee}.\n\nInviter GitHub username: {inviter}\nInvitation password: {password}\n\nIn RChat, choose New Person → Internet Discovery → Accept Invitation. Enter the inviter GitHub username and invitation password shown above.\n\nThis invitation expires about two minutes after it is published. Do not forward it. If you were not expecting this invitation, ignore this email.");
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("subject", &subject)
+        .append_pair("body", &body)
+        .finish();
+    InviteEmailDraft { subject, body, mailto_uri: format!("mailto:?{query}") }
+}
+
 pub async fn list_direct_chats(
     app_state: &AppState,
     net_state: &NetworkState,
@@ -159,6 +176,13 @@ pub async fn send_direct_text(
 
     if is_temporary {
         let mut temp_state = net_state.temporary_state.lock().await;
+        if temp_state
+            .chats
+            .get(&canonical_chat_id)
+            .is_some_and(|session| session.archived)
+        {
+            return Err(anyhow!("Temporary chat is being archived"));
+        }
         temp_state
             .messages
             .entry(canonical_chat_id.clone())
@@ -733,6 +757,7 @@ mod tests {
             id: PEER_ID.to_string(),
             name: "fedora".to_string(),
             is_group: false,
+            image_hash: None,
         };
         let mapped_id = chat_identity::build_github_chat_id("ata", PEER_ID);
         let mapped_by_peer = HashMap::from([(PEER_ID.to_string(), mapped_id.clone())]);
@@ -776,5 +801,30 @@ mod tests {
     #[test]
     fn generated_invite_password_has_expected_length() {
         assert_eq!(generate_invite_password().chars().count(), 14);
+    }
+
+    #[test]
+    fn invite_email_draft_matches_product_copy() {
+        let draft = build_invite_email_draft("alice", "bob", "12345678901234");
+        assert_eq!(draft.subject, "@alice invited you to connect on RChat");
+        assert_eq!(draft.body, "@alice invited you to connect on RChat.\n\nThis invitation is intended for @bob.\n\nInviter GitHub username: alice\nInvitation password: 12345678901234\n\nIn RChat, choose New Person → Internet Discovery → Accept Invitation. Enter the inviter GitHub username and invitation password shown above.\n\nThis invitation expires about two minutes after it is published. Do not forward it. If you were not expecting this invitation, ignore this email.");
+        let parsed = url::Url::parse(&draft.mailto_uri).unwrap();
+        assert_eq!(parsed.scheme(), "mailto");
+        assert_eq!(parsed.path(), "");
+        let pairs = parsed.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(pairs.get("subject").unwrap(), draft.subject.as_str());
+        assert_eq!(pairs.get("body").unwrap(), draft.body.as_str());
+    }
+
+    #[test]
+    fn invite_email_draft_percent_encodes_untrusted_values() {
+        let draft = build_invite_email_draft("alice&bcc=attacker@example.com", "bob #1", "a?b&c#d e");
+        let parsed = url::Url::parse(&draft.mailto_uri).unwrap();
+        let pairs = parsed.query_pairs().collect::<Vec<_>>();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "subject");
+        assert_eq!(pairs[1].0, "body");
+        assert!(draft.body.contains("a?b&c#d e"));
+        assert!(!pairs.iter().any(|(key, _)| key == "bcc"));
     }
 }

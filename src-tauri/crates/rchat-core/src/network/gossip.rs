@@ -126,6 +126,8 @@ pub enum GroupRecordBody {
         name: String,
         #[serde(default)]
         settings: Option<GroupSettings>,
+        #[serde(default)]
+        image_hash: Option<String>,
     },
     MemberInvited {
         peer_id: String,
@@ -146,6 +148,10 @@ pub enum GroupRecordBody {
     MemberRemoved {
         peer_id: String,
     },
+    AdminTransferred {
+        new_admin_peer_id: String,
+    },
+    GroupDissolved,
     Message {
         content_type: GroupContentType,
         #[serde(default)]
@@ -177,6 +183,8 @@ impl GroupRecordBody {
             Self::GroupRenamed { .. } => "group_renamed",
             Self::GroupSettingsUpdated { .. } => "group_settings_updated",
             Self::MemberRemoved { .. } => "member_removed",
+            Self::AdminTransferred { .. } => "admin_transferred",
+            Self::GroupDissolved => "group_dissolved",
             Self::Message { .. } => "message",
             Self::Receipt { .. } => "receipt",
             Self::Head { .. } => "head",
@@ -238,7 +246,7 @@ pub struct GroupSyncResponse {
 }
 
 impl SignedGroupRecord {
-    pub const VERSION: u16 = 1;
+    pub const VERSION: u16 = 2;
 
     pub fn new(
         keypair: &identity::Keypair,
@@ -268,6 +276,9 @@ impl SignedGroupRecord {
     }
 
     pub fn verify(&self) -> bool {
+        if !(1..=Self::VERSION).contains(&self.unsigned.version) {
+            return false;
+        }
         let Ok(public_key_bytes) = BASE64.decode(&self.public_key_b64) else {
             return false;
         };
@@ -371,6 +382,7 @@ mod tests {
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
                 settings: None,
+                image_hash: None,
             },
         )
         .expect("sign");
@@ -378,6 +390,34 @@ mod tests {
         let json = serde_json::to_string(&record).expect("serialize");
         let decoded: SignedGroupRecord = serde_json::from_str(&json).expect("decode");
         assert!(decoded.verify());
+    }
+
+    #[test]
+    fn version_one_group_records_remain_verifiable() {
+        let key = identity::Keypair::generate_ed25519();
+        let unsigned = UnsignedGroupRecord {
+            version: 1,
+            id: "legacy-record".to_string(),
+            group_id: "group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            author_peer_id: PeerId::from_public_key(&key.public()).to_string(),
+            timestamp: 42,
+            parents: Vec::new(),
+            body: GroupRecordBody::GroupCreated {
+                name: "Legacy".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        };
+        let signature = key
+            .sign(&serde_json::to_vec(&unsigned).expect("serialize"))
+            .expect("sign");
+        let record = SignedGroupRecord {
+            unsigned,
+            public_key_b64: BASE64.encode(key.public().encode_protobuf()),
+            signature_b64: BASE64.encode(signature),
+        };
+
+        assert!(record.verify());
     }
 
     #[test]
@@ -395,5 +435,52 @@ mod tests {
         assert_eq!(decoded.id, "m1");
         assert_eq!(decoded.protocol_version, None);
         assert_eq!(decoded.signed_record_id, None);
+    }
+
+    #[test]
+    fn group_created_roundtrips_with_image_hash() {
+        let key = identity::Keypair::generate_ed25519();
+        let record = SignedGroupRecord::new(
+            &key,
+            "group:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            "rec-1".to_string(),
+            42,
+            Vec::new(),
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: Some(GroupSettings {
+                    members_can_invite: true,
+                }),
+                image_hash: Some("image-hash-123".to_string()),
+            },
+        )
+        .expect("sign");
+
+        let json = serde_json::to_string(&record).expect("serialize");
+        let decoded: SignedGroupRecord = serde_json::from_str(&json).expect("decode");
+        assert!(decoded.verify());
+        match decoded.body() {
+            GroupRecordBody::GroupCreated { image_hash, .. } => {
+                assert_eq!(image_hash.as_deref(), Some("image-hash-123"));
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_group_created_decodes_without_image_hash() {
+        let raw = r#"{
+            "record_type":"group_created",
+            "name":"Legacy",
+            "settings":null
+        }"#;
+
+        let decoded: GroupRecordBody = serde_json::from_str(raw).expect("legacy group-created");
+        match decoded {
+            GroupRecordBody::GroupCreated { image_hash, .. } => {
+                assert_eq!(image_hash, None);
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
     }
 }

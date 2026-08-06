@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { derived, get, writable } from "svelte/store";
-import { defaultGroupName, getChatKind } from "$lib/chatKind";
+import { getChatKind } from "$lib/chatKind";
 import { extractPeerIdFromChatId } from "$lib/chatIdentity";
 import {
   api,
@@ -543,17 +543,12 @@ export async function deleteEnvelope(id: string): Promise<void> {
   }));
 }
 
-export async function createGroup(name: string): Promise<GroupChatResult> {
-  const result = await api.createGroupChat(name || null);
-  await refreshChats();
-  return result;
-}
-
-export async function joinGroup(
-  chatId: string,
+export async function createGroup(
   name: string,
+  imagePath?: string | null,
+  membersCanInvite = false,
 ): Promise<GroupChatResult> {
-  const result = await api.joinGroupChat(chatId, name || defaultGroupName(chatId));
+  const result = await api.createGroupChat(name, imagePath, membersCanInvite);
   await refreshChats();
   return result;
 }

@@ -8,8 +8,8 @@ pub use rchat_core::{
 
 use crate::commands::auth::{
     check_auth_status, get_connectivity_settings, init_vault, poll_github_auth, reset_vault,
-    save_api_token, set_connectivity_mode, start_github_auth, start_network, toggle_online_status,
-    unlock_vault, update_connectivity_settings,
+    save_api_token, set_connectivity_mode, start_github_auth, start_network, unlock_vault,
+    update_connectivity_settings,
 };
 use crate::commands::call::{
     accept_screen_broadcast, accept_video_call, accept_voice_call, end_screen_broadcast,
@@ -22,10 +22,10 @@ use crate::commands::call::{
 };
 use crate::commands::chat::{
     accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list,
-    get_group_policy, get_unread_counts, invite_group_member, join_group_chat, leave_group_chat,
-    mark_messages_read, reject_group_invite, remove_group_member, rename_group_chat,
-    save_temporary_chat_to_archive, send_message, send_message_to_self, sync_group_chat,
-    update_group_settings,
+    get_group_policy, get_unread_counts, invite_group_member, leave_group_chat, mark_messages_read,
+    preview_group_leave, reject_group_invite, remove_group_member, rename_group_chat,
+    save_temporary_chat_to_archive, send_message, send_message_to_self,
+    sync_group_chat, transfer_group_admin, update_group_settings,
 };
 use crate::commands::chat_details::{
     drop_chat_connection, force_chat_reconnect, get_chat_details_overview, get_chat_stats,
@@ -38,8 +38,8 @@ use crate::commands::envelopes::{
 };
 use crate::commands::invite::{
     cancel_temporary_invite, create_invite, create_temporary_group_invite, create_temporary_invite,
-    generate_invite_password, get_active_temporary_invite, redeem_and_connect,
-    redeem_temporary_invite,
+    get_active_temporary_invite, get_invite_email_draft, redeem_and_connect, redeem_temporary_invite,
+    generate_invite_password,
 };
 use crate::commands::media::{
     add_sticker, add_stickers_batch, delete_sticker, get_audio_data, get_image_data,
@@ -52,7 +52,7 @@ use crate::commands::peer_profile::{
     add_friend, apply_preset, create_custom_theme, delete_custom_theme, delete_peer,
     generate_simple_theme, get_friends, get_peer_aliases, get_pinned_peers, get_selected_preset,
     get_theme, get_trusted_peers, get_user_profile, list_theme_presets, remove_friend,
-    toggle_pin_peer, update_custom_theme, update_theme, update_user_profile,
+    toggle_pin_peer, update_custom_theme, update_user_profile,
 };
 use crate::storage::config::ConfigManager;
 use std::sync::Arc;
@@ -131,6 +131,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             println!("RChat is initializing...");
 
@@ -165,7 +166,6 @@ pub fn run() {
             get_connectivity_settings,
             set_connectivity_mode,
             update_connectivity_settings,
-            toggle_online_status,
             frontend_log,
             init_vault,
             unlock_vault,
@@ -181,7 +181,6 @@ pub fn run() {
             remove_friend,
             get_user_profile,
             get_theme,
-            update_theme,
             list_theme_presets,
             apply_preset,
             get_selected_preset,
@@ -231,6 +230,7 @@ pub fn run() {
             save_sticker_from_message,
             generate_invite_password,
             create_invite,
+            get_invite_email_draft,
             redeem_and_connect,
             create_temporary_invite,
             create_temporary_group_invite,
@@ -238,8 +238,9 @@ pub fn run() {
             get_active_temporary_invite,
             cancel_temporary_invite,
             create_group_chat,
-            join_group_chat,
             leave_group_chat,
+            preview_group_leave,
+            transfer_group_admin,
             invite_group_member,
             get_group_policy,
             update_group_settings,

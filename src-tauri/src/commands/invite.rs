@@ -12,6 +12,24 @@ pub async fn generate_invite_password() -> Result<String, String> {
     Ok(direct::generate_invite_password())
 }
 
+#[tauri::command]
+pub async fn get_invite_email_draft(
+    invitee: String,
+    password: String,
+    app_state: State<'_, AppState>,
+) -> Result<direct::InviteEmailDraft, String> {
+    let inviter = {
+        let mgr = app_state.config_manager.lock().await;
+        mgr.load()
+            .await
+            .map_err(|error| error.to_string())?
+            .system
+            .github_username
+            .ok_or_else(|| "GitHub username not set".to_string())?
+    };
+    Ok(direct::build_invite_email_draft(&inviter, &invitee, &password))
+}
+
 /// Create an invitation for a friend
 #[tauri::command]
 pub async fn create_invite(

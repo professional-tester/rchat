@@ -145,10 +145,11 @@ pub async fn start(
         None
     };
 
-    // NOTE: STUN socket closed, QUIC now owns the port
-    // On most NATs, QUIC will get the same external port mapping
-    // If the invite is used quickly, this should work
-    // TODO: If NAT mapping expires, we'd need bidirectional punching
+    // The STUN socket is now closed and QUIC owns the same local port. Reachable mode
+    // keeps the mapping active and coordinates bidirectional punching through shadow
+    // invites. The discovered public endpoint is not periodically revalidated, so a
+    // NAT that changes or assigns destination-specific mappings can still prevent a
+    // direct connection; RChat intentionally has no relay fallback.
 
     let (ctx, crx) = mpsc::channel(32);
     let connectivity_settings = {

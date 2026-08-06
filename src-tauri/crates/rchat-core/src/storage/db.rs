@@ -56,6 +56,7 @@ pub struct ChatListItem {
     pub id: String,
     pub name: String,
     pub is_group: bool,
+    pub image_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -77,6 +78,33 @@ pub struct GroupFileSource {
     pub file_hash: String,
     pub peer_id: String,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct GroupMemberRow {
+    pub peer_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub membership_state: String,
+    pub invited_by: Option<String>,
+    pub last_event_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct GroupMessageReceiptRow {
+    pub message_id: String,
+    pub group_id: String,
+    pub peer_id: String,
+    pub display_name: String,
+    pub status: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct GroupPendingRecordSummary {
+    pub count: i64,
+    pub oldest_received_at: Option<i64>,
+    pub record_types: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -180,10 +208,12 @@ pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
              id TEXT NOT NULL PRIMARY KEY,
              name TEXT NOT NULL,
              is_group INTEGER DEFAULT 0 NOT NULL,
-             encryption_key BLOB NOT NULL
+             encryption_key BLOB NOT NULL,
+             image_hash TEXT
          )",
         [],
     )?;
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN image_hash TEXT", []);
 
     // SEED: Ensure 'Me' user exists
     let me_exists: bool = conn
@@ -864,6 +894,18 @@ pub fn upsert_chat(
     Ok(())
 }
 
+pub fn update_chat_image_hash(
+    conn: &Connection,
+    chat_id: &str,
+    image_hash: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE chats SET image_hash = ?2 WHERE id = ?1",
+        rusqlite::params![chat_id, image_hash],
+    )?;
+    Ok(())
+}
+
 pub fn add_chat_member(
     conn: &Connection,
     chat_id: &str,
@@ -920,6 +962,25 @@ pub fn remove_chat_member(conn: &Connection, chat_id: &str, peer_id: &str) -> an
         (chat_id, peer_id),
     )?;
     Ok(())
+}
+
+pub fn revoke_group_invites(conn: &Connection, group_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE group_invites SET status = 'revoked', updated_at = ?2 WHERE group_id = ?1 AND status IN ('sent', 'pending')",
+        rusqlite::params![group_id, unix_now()],
+    )?;
+    Ok(())
+}
+
+pub fn get_open_group_invitee_peer_ids(
+    conn: &Connection,
+    group_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT invitee_peer_id FROM group_invites WHERE group_id = ?1 AND status IN ('sent', 'pending') ORDER BY invitee_peer_id",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub fn delete_group_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()> {
@@ -1034,6 +1095,35 @@ pub fn get_group_record_ids(conn: &Connection, group_id: &str) -> anyhow::Result
     Ok(out)
 }
 
+pub fn get_group_pending_record_summary(
+    conn: &Connection,
+    group_id: &str,
+) -> anyhow::Result<GroupPendingRecordSummary> {
+    let (count, oldest_received_at) = conn.query_row(
+        "SELECT COUNT(*), MIN(received_at)
+         FROM group_records
+         WHERE group_id = ?1 AND pending = 1",
+        [group_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT record_type
+         FROM group_records
+         WHERE group_id = ?1 AND pending = 1
+         ORDER BY record_type ASC",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    let mut record_types = Vec::new();
+    for row in rows {
+        record_types.push(row?);
+    }
+    Ok(GroupPendingRecordSummary {
+        count,
+        oldest_received_at,
+        record_types,
+    })
+}
+
 pub fn upsert_group_invite(
     conn: &Connection,
     invite: &crate::network::gossip::GroupInvitePayload,
@@ -1115,6 +1205,40 @@ pub fn upsert_group_message_receipt(
         (message_id, group_id, peer_id, status, timestamp),
     )?;
     Ok(())
+}
+
+pub fn get_group_message_receipts(
+    conn: &Connection,
+    group_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Vec<GroupMessageReceiptRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.message_id,
+                r.group_id,
+                r.peer_id,
+                COALESCE(NULLIF(p.alias, ''), r.peer_id),
+                r.status,
+                r.timestamp
+         FROM group_message_receipts r
+         LEFT JOIN peers p ON p.id = r.peer_id
+         WHERE r.group_id = ?1 AND r.message_id = ?2
+         ORDER BY r.timestamp ASC, r.peer_id ASC",
+    )?;
+    let rows = stmt.query_map((group_id, message_id), |row| {
+        Ok(GroupMessageReceiptRow {
+            message_id: row.get(0)?,
+            group_id: row.get(1)?,
+            peer_id: row.get(2)?,
+            display_name: row.get(3)?,
+            status: row.get(4)?,
+            timestamp: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 pub fn upsert_group_file_source(
@@ -1209,12 +1333,49 @@ pub fn get_group_member_peer_ids(
     Ok(out)
 }
 
+pub fn get_group_roster(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<GroupMemberRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT cp.peer_id,
+                COALESCE(NULLIF(p.alias, ''), cp.peer_id),
+                cp.role,
+                cp.membership_state,
+                cp.invited_by,
+                cp.last_event_id
+         FROM chat_peers cp
+         LEFT JOIN peers p ON p.id = cp.peer_id
+         WHERE cp.chat_id = ?1
+         ORDER BY CASE cp.membership_state
+                      WHEN 'joined' THEN 0
+                      WHEN 'invited' THEN 1
+                      ELSE 2
+                  END,
+                  CASE cp.role WHEN 'admin' THEN 0 ELSE 1 END,
+                  COALESCE(NULLIF(p.alias, ''), cp.peer_id) COLLATE NOCASE ASC,
+                  cp.peer_id ASC",
+    )?;
+    let rows = stmt.query_map([group_id], |row| {
+        Ok(GroupMemberRow {
+            peer_id: row.get(0)?,
+            display_name: row.get(1)?,
+            role: row.get(2)?,
+            membership_state: row.get(3)?,
+            invited_by: row.get(4)?,
+            last_event_id: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
     let mut items = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
 
     let mut stmt = conn.prepare(
-        "SELECT id, name, is_group
+        "SELECT id, name, is_group, image_hash
          FROM chats",
     )?;
     let chat_rows = stmt.query_map([], |row| {
@@ -1222,6 +1383,7 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
             id: row.get(0)?,
             name: row.get(1)?,
             is_group: row.get::<_, i64>(2)? != 0,
+            image_hash: row.get(3)?,
         })
     })?;
 
@@ -1251,6 +1413,7 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
                 id: peer_id.clone(),
                 name: alias,
                 is_group: false,
+                image_hash: None,
             });
             seen_ids.insert(peer_id);
         }
@@ -1262,6 +1425,7 @@ pub fn get_chat_list(conn: &Connection) -> anyhow::Result<Vec<ChatListItem>> {
             id: "self".to_string(),
             name: "Note to Self".to_string(),
             is_group: false,
+            image_hash: None,
         });
     }
 
@@ -1275,6 +1439,17 @@ pub fn get_chat_name(conn: &Connection, chat_id: &str) -> anyhow::Result<Option<
         return Ok(Some(row.get(0)?));
     }
     Ok(None)
+}
+
+pub fn get_group_image_hash(conn: &Connection, group_id: &str) -> anyhow::Result<Option<String>> {
+    conn.query_row(
+        "SELECT image_hash FROM chats WHERE id = ?1 AND is_group = 1",
+        [group_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(Into::into)
 }
 
 pub fn get_peer_alias(conn: &Connection, peer_id: &str) -> anyhow::Result<Option<String>> {
@@ -1923,6 +2098,132 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id(), third.id());
+    }
+
+    #[test]
+    fn group_inspection_queries_return_ordered_roster_receipts_and_pending_summary() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        let group_id = "group:inspection";
+        upsert_chat(&conn, group_id, "Inspection", true).expect("group chat");
+        update_chat_image_hash(&conn, group_id, Some("group-image")).expect("group image");
+        add_peer(&conn, "peer-admin", Some("Admin"), None, "group").expect("admin peer");
+        add_peer(&conn, "peer-member", Some("Member"), None, "group").expect("member peer");
+        add_peer(&conn, "peer-invited", Some("Invitee"), None, "group").expect("invited peer");
+        upsert_chat_member_state(
+            &conn,
+            group_id,
+            "peer-invited",
+            "member",
+            "invited",
+            Some("peer-admin"),
+            Some("invite-record"),
+        )
+        .expect("invited member");
+        upsert_chat_member_state(
+            &conn,
+            group_id,
+            "peer-member",
+            "member",
+            "joined",
+            None,
+            Some("join-record"),
+        )
+        .expect("joined member");
+        upsert_chat_member_state(
+            &conn,
+            group_id,
+            "peer-admin",
+            "admin",
+            "joined",
+            None,
+            Some("create-record"),
+        )
+        .expect("admin member");
+
+        upsert_group_message_receipt(
+            &conn,
+            group_id,
+            "message-1",
+            "peer-member",
+            "delivered",
+            20,
+        )
+        .expect("member receipt");
+        upsert_group_message_receipt(
+            &conn,
+            group_id,
+            "message-1",
+            "peer-admin",
+            "read",
+            10,
+        )
+        .expect("admin receipt");
+        conn.execute(
+            "INSERT INTO group_records
+             (id, group_id, record_type, author_peer_id, timestamp, payload_json, public_key_b64, signature_b64, verified, pending, received_at)
+             VALUES ('pending-message', ?1, 'message', 'peer-member', 1, '{}', '', '', 0, 1, 40),
+                    ('pending-receipt', ?1, 'receipt', 'peer-member', 2, '{}', '', '', 0, 1, 30)",
+            [group_id],
+        )
+        .expect("pending records");
+
+        let roster = get_group_roster(&conn, group_id).expect("roster");
+        assert_eq!(
+            roster
+                .iter()
+                .map(|member| member.peer_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["peer-admin", "peer-member", "peer-invited"]
+        );
+        assert_eq!(roster[0].display_name, "Admin");
+        assert_eq!(roster[0].role, "admin");
+        assert_eq!(roster[2].membership_state, "invited");
+        assert_eq!(roster[2].invited_by.as_deref(), Some("peer-admin"));
+        assert_eq!(get_group_image_hash(&conn, group_id).expect("group image"), Some("group-image".to_string()));
+
+        let receipts = get_group_message_receipts(&conn, group_id, "message-1")
+            .expect("message receipts");
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.peer_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["peer-admin", "peer-member"]
+        );
+        assert_eq!(receipts[0].display_name, "Admin");
+        assert_eq!(receipts[0].status, "read");
+
+        let pending = get_group_pending_record_summary(&conn, group_id).expect("pending summary");
+        assert_eq!(pending.count, 2);
+        assert_eq!(pending.oldest_received_at, Some(30));
+        assert_eq!(pending.record_types, vec!["message", "receipt"]);
+    }
+
+    #[test]
+    fn group_inspection_queries_return_empty_rows_for_unknown_group() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        create_tables(&conn).expect("schema");
+        upsert_chat(&conn, "group:no-image", "No Image", true).expect("group chat");
+
+        assert!(get_group_roster(&conn, "group:missing")
+            .expect("roster")
+            .is_empty());
+        assert!(get_group_message_receipts(&conn, "group:missing", "message")
+            .expect("receipts")
+            .is_empty());
+        assert_eq!(
+            get_group_image_hash(&conn, "group:missing").expect("image"),
+            None
+        );
+        assert_eq!(
+            get_group_image_hash(&conn, "group:no-image").expect("empty image"),
+            None
+        );
+        assert_eq!(
+            get_group_pending_record_summary(&conn, "group:missing").expect("pending"),
+            GroupPendingRecordSummary::default()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -6,6 +6,7 @@ use libp2p::{identity, PeerId};
 use rusqlite::OptionalExtension;
 
 use crate::{
+    chat::media::{self, MediaKind},
     chat_kind,
     events::{
         CoreEvent, GroupMessageReceiptUpdatedEvent, GroupRecordAppliedEvent,
@@ -27,6 +28,15 @@ use crate::{
 pub struct GroupChatResult {
     pub chat_id: String,
     pub name: String,
+    pub image_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreateGroupOptions {
+    pub name: Option<String>,
+    pub image_path: Option<String>,
+    pub settings: Option<GroupSettings>,
+    pub require_name: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +45,16 @@ pub struct GroupPolicy {
     pub settings: GroupSettings,
     pub active_members: HashSet<String>,
     pub invited_members: HashSet<String>,
+    pub automatic_successor_peer_id: Option<String>,
+    pub dissolved: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum GroupLeaveOutcome {
+    Left,
+    TransferredThenLeft { successor_peer_id: String },
+    Dissolved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,26 +68,77 @@ pub async fn create_group(
     network_state: Option<&NetworkState>,
     name: Option<String>,
 ) -> anyhow::Result<GroupChatResult> {
+    create_group_with_options(
+        app_state,
+        network_state,
+        CreateGroupOptions {
+            name,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub async fn create_group_with_options(
+    app_state: &AppState,
+    network_state: Option<&NetworkState>,
+    options: CreateGroupOptions,
+) -> anyhow::Result<GroupChatResult> {
     let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
     let group_id = chat_kind::generate_group_chat_id();
-    let resolved_name = name
+    let resolved_name = options
+        .name
         .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| chat_kind::default_group_name(&group_id));
+        .unwrap_or_default();
+    if options.require_name && resolved_name.is_empty() {
+        return Err(anyhow!("Group name is required"));
+    }
+    let resolved_name = if resolved_name.is_empty() {
+        chat_kind::default_group_name(&group_id)
+    } else {
+        resolved_name
+    };
+    let image_hash = if let Some(image_path) = options.image_path.filter(|path| !path.is_empty()) {
+        Some(
+            media::store_file_object_from_path(app_state, MediaKind::Image, image_path)?
+                .file_hash,
+        )
+    } else {
+        None
+    };
     let record = sign_record(
         &keypair,
         group_id.clone(),
         GroupRecordBody::GroupCreated {
             name: resolved_name.clone(),
-            settings: None,
+            settings: options.settings,
+            image_hash: image_hash.clone(),
         },
     )?;
+    let file_availability_record = image_hash
+        .as_ref()
+        .map(|file_hash| {
+            sign_record(
+                &keypair,
+                group_id.clone(),
+                GroupRecordBody::FileAvailability {
+                    file_hash: file_hash.clone(),
+                },
+            )
+        })
+        .transpose()?;
 
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         db::upsert_chat(&conn, &group_id, &resolved_name, true)?;
+        db::update_chat_image_hash(&conn, &group_id, image_hash.as_deref())?;
         db::add_chat_member(&conn, &group_id, "Me", "admin")?;
         db::insert_group_record(&conn, &record, true, false)?;
+        if let (Some(image_hash), Some(file_record)) = (&image_hash, &file_availability_record) {
+            db::upsert_group_file_source(&conn, &group_id, image_hash, &local_peer_id)?;
+            db::insert_group_record(&conn, file_record, true, false)?;
+        }
     }
 
     if let Some(network_state) = network_state {
@@ -78,30 +149,64 @@ pub async fn create_group(
             },
         )
         .await?;
+        if let Some(file_record) = file_availability_record {
+            send_network_command(
+                network_state,
+                NetworkCommand::PublishGroupRecord {
+                    record: file_record,
+                },
+            )
+            .await?;
+        }
     }
 
     Ok(GroupChatResult {
         chat_id: group_id,
         name: resolved_name,
+        image_hash,
     })
-}
-
-pub async fn join_group_legacy(
-    app_state: &AppState,
-    network_state: Option<&NetworkState>,
-    group_id: String,
-    name: Option<String>,
-) -> anyhow::Result<GroupChatResult> {
-    let _ = (app_state, network_state, group_id, name);
-    Err(anyhow!(
-        "Groups are invite-gated; accept an invite instead."
-    ))
 }
 
 pub fn get_group_policy(app_state: &AppState, group_id: &str) -> anyhow::Result<GroupPolicy> {
     let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
     let records = db::get_group_records_for_sync(&conn, group_id, &[], 10_000)?;
     derive_group_policy(&records).ok_or_else(|| anyhow!("Group has no valid founder record"))
+}
+
+pub fn get_group_roster(
+    app_state: &AppState,
+    group_id: &str,
+) -> anyhow::Result<Vec<db::GroupMemberRow>> {
+    let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+    db::get_group_roster(&conn, group_id)
+}
+
+pub fn get_group_image_hash(app_state: &AppState, group_id: &str) -> anyhow::Result<Option<String>> {
+    let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+    db::get_group_image_hash(&conn, group_id)
+}
+
+pub fn get_group_message_receipts(
+    app_state: &AppState,
+    group_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Vec<db::GroupMessageReceiptRow>> {
+    let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+    db::get_group_message_receipts(&conn, group_id, message_id)
+}
+
+pub fn get_group_pending_record_summary(
+    app_state: &AppState,
+    group_id: &str,
+) -> anyhow::Result<db::GroupPendingRecordSummary> {
+    let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+    db::get_group_pending_record_summary(&conn, group_id)
+}
+
+pub async fn is_local_group_admin(app_state: &AppState, group_id: &str) -> anyhow::Result<bool> {
+    let policy = get_group_policy(app_state, group_id)?;
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    Ok(PeerId::from_public_key(&keypair.public()).to_string() == policy.admin_peer_id)
 }
 
 pub fn can_peer_sync_group_records(
@@ -148,7 +253,9 @@ pub async fn remove_member(
         return Err(anyhow!("Only the group admin can remove members"));
     }
     if peer_id == policy.admin_peer_id {
-        return Err(anyhow!("Admin removal is blocked until succession is implemented"));
+        return Err(anyhow!(
+            "The current administrator cannot be removed; transfer administration first"
+        ));
     }
 
     let record = sign_record(
@@ -158,6 +265,49 @@ pub async fn remove_member(
     )?;
     apply_signed_record(app_state, None, &record, true)?;
     send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await
+}
+
+pub async fn transfer_group_admin(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    group_id: String,
+    new_admin_peer_id: String,
+) -> anyhow::Result<()> {
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, &group_id)?;
+    if policy.admin_peer_id != local_peer_id {
+        return Err(anyhow!("Only the group admin can transfer administration"));
+    }
+    if new_admin_peer_id == local_peer_id {
+        return Err(anyhow!("The current admin is already the group administrator"));
+    }
+    if !policy.active_members.contains(&new_admin_peer_id) {
+        return Err(anyhow!("The new administrator must be an active member"));
+    }
+    let record = sign_record(
+        &keypair,
+        group_id,
+        GroupRecordBody::AdminTransferred { new_admin_peer_id },
+    )?;
+    apply_signed_record(app_state, None, &record, true)?;
+    send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await
+}
+
+pub async fn preview_leave_group(
+    app_state: &AppState,
+    group_id: &str,
+) -> anyhow::Result<GroupLeaveOutcome> {
+    let keypair = load_or_create_local_keypair(app_state).await?;
+    let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
+    let policy = get_group_policy(app_state, group_id)?;
+    if policy.admin_peer_id != local_peer_id {
+        return Ok(GroupLeaveOutcome::Left);
+    }
+    match policy.automatic_successor_peer_id {
+        Some(successor_peer_id) => Ok(GroupLeaveOutcome::TransferredThenLeft { successor_peer_id }),
+        None => Ok(GroupLeaveOutcome::Dissolved),
+    }
 }
 
 pub async fn invite_member(
@@ -260,6 +410,11 @@ pub async fn accept_invite(
     {
         apply_signed_record(app_state, None, record, true)?;
     }
+    if get_group_policy(app_state, &invite.group_id)?.dissolved {
+        let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+        db::update_group_invite_status(&conn, &invite_id, "revoked")?;
+        return Err(anyhow!("This group has been dissolved"));
+    }
 
     let joined_record = sign_record(
         &keypair,
@@ -310,27 +465,87 @@ pub async fn leave_group(
     app_state: &AppState,
     network_state: &NetworkState,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<GroupLeaveOutcome> {
     let keypair = load_or_create_local_keypair(app_state).await?;
     let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
     let policy = get_group_policy(app_state, &group_id)?;
+    let outcome;
     if policy.admin_peer_id == local_peer_id {
-        return Err(anyhow!("Admin leave is blocked until succession is implemented"));
+        if let Some(successor_peer_id) = policy.automatic_successor_peer_id {
+            let transfer_timestamp = timestamp_now();
+            let transfer = sign_record_at(
+                &keypair,
+                group_id.clone(),
+                transfer_timestamp,
+                Vec::new(),
+                GroupRecordBody::AdminTransferred {
+                    new_admin_peer_id: successor_peer_id.clone(),
+                },
+            )?;
+            apply_signed_record(app_state, None, &transfer, true)?;
+            send_network_command(
+                network_state,
+                NetworkCommand::PublishGroupRecord {
+                    record: transfer.clone(),
+                },
+            )
+            .await?;
+            let leave = sign_record_at(
+                &keypair,
+                group_id.clone(),
+                transfer_timestamp.saturating_add(1),
+                vec![transfer.id().to_string()],
+                GroupRecordBody::MemberLeft {
+                    peer_id: local_peer_id,
+                },
+            )?;
+            apply_signed_record(app_state, None, &leave, true)?;
+            send_network_command(network_state, NetworkCommand::PublishGroupRecord { record: leave })
+                .await?;
+            outcome = GroupLeaveOutcome::TransferredThenLeft { successor_peer_id };
+        } else {
+            let invitees = {
+                let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+                db::get_open_group_invitee_peer_ids(&conn, &group_id)?
+            };
+            let dissolution = sign_record(&keypair, group_id.clone(), GroupRecordBody::GroupDissolved)?;
+            apply_signed_record(app_state, None, &dissolution, true)?;
+            send_network_command(
+                network_state,
+                NetworkCommand::PublishGroupRecord {
+                    record: dissolution.clone(),
+                },
+            )
+            .await?;
+            for target_peer_id in invitees {
+                send_network_command(
+                    network_state,
+                    NetworkCommand::SendGroupDissolution {
+                        target_peer_id,
+                        record: dissolution.clone(),
+                    },
+                )
+                .await?;
+            }
+            outcome = GroupLeaveOutcome::Dissolved;
+        }
+    } else {
+        let leave = sign_record(
+            &keypair,
+            group_id.clone(),
+            GroupRecordBody::MemberLeft {
+                peer_id: local_peer_id,
+            },
+        )?;
+        apply_signed_record(app_state, None, &leave, true)?;
+        send_network_command(network_state, NetworkCommand::PublishGroupRecord { record: leave })
+            .await?;
+        outcome = GroupLeaveOutcome::Left;
     }
-    let record = sign_record(
-        &keypair,
-        group_id.clone(),
-        GroupRecordBody::MemberLeft {
-            peer_id: local_peer_id,
-        },
-    )?;
-    {
+    if !matches!(outcome, GroupLeaveOutcome::Dissolved) {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        let _ = db::insert_group_record(&conn, &record, true, false)?;
-        let _ = db::remove_chat_member(&conn, &group_id, "Me");
         db::delete_group_chat(&conn, &group_id)?;
     }
-    send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await?;
     send_network_command(
         network_state,
         NetworkCommand::UnsubscribeGroup {
@@ -338,7 +553,7 @@ pub async fn leave_group(
         },
     )
     .await?;
-    Ok(())
+    Ok(outcome)
 }
 
 pub async fn rename_group(
@@ -470,8 +685,13 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
     let mut settings = GroupSettings::default();
     let mut active_members = HashSet::new();
     let mut invited_members = HashSet::new();
+    let mut membership_order: HashMap<String, (i64, String)> = HashMap::new();
+    let mut dissolved = false;
 
     for record in ordered {
+        if dissolved {
+            continue;
+        }
         match record.body() {
             GroupRecordBody::GroupCreated {
                 settings: group_settings,
@@ -480,7 +700,8 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                 if admin_peer_id.is_none() {
                     let author = record.author_peer_id().to_string();
                     admin_peer_id = Some(author.clone());
-                    active_members.insert(author);
+                    active_members.insert(author.clone());
+                    membership_order.insert(author, (record.timestamp(), record.id().to_string()));
                     settings = group_settings.clone().unwrap_or_default();
                 }
             }
@@ -498,6 +719,10 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                 if record.author_peer_id() == peer_id && invited_members.contains(peer_id) {
                     active_members.insert(peer_id.clone());
                     invited_members.remove(peer_id);
+                    membership_order.insert(
+                        peer_id.clone(),
+                        (record.timestamp(), record.id().to_string()),
+                    );
                 }
             }
             GroupRecordBody::MemberLeft { peer_id } => {
@@ -506,6 +731,7 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                 {
                     active_members.remove(peer_id);
                     invited_members.remove(peer_id);
+                    membership_order.remove(peer_id);
                 }
             }
             GroupRecordBody::MemberRemoved { peer_id } => {
@@ -514,6 +740,24 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                 {
                     active_members.remove(peer_id);
                     invited_members.remove(peer_id);
+                    membership_order.remove(peer_id);
+                }
+            }
+            GroupRecordBody::AdminTransferred { new_admin_peer_id } => {
+                if Some(record.author_peer_id()) == admin_peer_id.as_deref()
+                    && active_members.contains(new_admin_peer_id)
+                    && record.author_peer_id() != new_admin_peer_id
+                {
+                    admin_peer_id = Some(new_admin_peer_id.clone());
+                }
+            }
+            GroupRecordBody::GroupDissolved => {
+                if Some(record.author_peer_id()) == admin_peer_id.as_deref()
+                    && active_members.len() == 1
+                {
+                    dissolved = true;
+                    active_members.clear();
+                    invited_members.clear();
                 }
             }
             GroupRecordBody::GroupSettingsUpdated {
@@ -531,11 +775,25 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
         }
     }
 
-    admin_peer_id.map(|admin_peer_id| GroupPolicy {
-        admin_peer_id,
-        settings,
-        active_members,
-        invited_members,
+    admin_peer_id.map(|admin_peer_id| {
+        let automatic_successor_peer_id = active_members
+            .iter()
+            .filter(|peer_id| peer_id.as_str() != admin_peer_id)
+            .min_by_key(|peer_id| {
+                membership_order
+                    .get(*peer_id)
+                    .cloned()
+                    .unwrap_or((i64::MAX, (*peer_id).clone()))
+            })
+            .cloned();
+        GroupPolicy {
+            admin_peer_id,
+            settings,
+            active_members,
+            invited_members,
+            automatic_successor_peer_id,
+            dissolved,
+        }
     })
 }
 
@@ -606,9 +864,18 @@ fn validate_group_record(
     conn: &rusqlite::Connection,
     record: &SignedGroupRecord,
 ) -> anyhow::Result<RecordDisposition> {
+    for parent_id in &record.unsigned.parents {
+        if !matches!(group_record_state(conn, parent_id)?, Some((true, false))) {
+            return Ok(RecordDisposition::PendingDependency);
+        }
+    }
     let existing_records = db::get_group_records_for_sync(conn, record.group_id(), &[], 10_000)?;
     let current_policy = derive_group_policy(&existing_records);
     let policy_before_record = derive_group_policy_before(&existing_records, record);
+
+    if current_policy.as_ref().is_some_and(|policy| policy.dissolved) {
+        return Err(anyhow!("Group has been dissolved"));
+    }
 
     match record.body() {
         GroupRecordBody::GroupCreated { .. } => {
@@ -651,7 +918,7 @@ fn validate_group_record(
             }
             if policy.admin_peer_id == *peer_id {
                 return Err(anyhow!(
-                    "Admin leave is blocked until succession is implemented"
+                    "The administrator must transfer administration before leaving"
                 ));
             }
             if policy.active_members.contains(peer_id) {
@@ -672,9 +939,36 @@ fn validate_group_record(
             if let GroupRecordBody::MemberRemoved { peer_id } = record.body() {
                 if policy.admin_peer_id == *peer_id {
                     return Err(anyhow!(
-                        "Admin removal is blocked until succession is implemented"
+                        "The current administrator cannot be removed; transfer administration first"
                     ));
                 }
+            }
+            Ok(RecordDisposition::Apply)
+        }
+        GroupRecordBody::AdminTransferred { new_admin_peer_id } => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if policy.admin_peer_id != record.author_peer_id() {
+                return Err(anyhow!("Only the group admin can transfer administration"));
+            }
+            if new_admin_peer_id == record.author_peer_id() {
+                return Err(anyhow!("The current admin is already the group administrator"));
+            }
+            if !policy.active_members.contains(new_admin_peer_id) {
+                return Err(anyhow!("The new administrator must be an active member"));
+            }
+            Ok(RecordDisposition::Apply)
+        }
+        GroupRecordBody::GroupDissolved => {
+            let Some(policy) = policy_before_record else {
+                return Ok(RecordDisposition::PendingDependency);
+            };
+            if policy.admin_peer_id != record.author_peer_id() {
+                return Err(anyhow!("Only the group admin can dissolve the group"));
+            }
+            if policy.active_members.len() != 1 {
+                return Err(anyhow!("A group can only be dissolved by its sole active member"));
             }
             Ok(RecordDisposition::Apply)
         }
@@ -759,8 +1053,20 @@ pub fn apply_signed_record(
         }
 
         match record.body() {
-            GroupRecordBody::GroupCreated { name, .. } => {
+            GroupRecordBody::GroupCreated {
+                name, image_hash, ..
+            } => {
                 db::upsert_chat(&conn, record.group_id(), name, true)?;
+                db::update_chat_image_hash(&conn, record.group_id(), image_hash.as_deref())?;
+                if let Some(image_hash) = image_hash {
+                    ensure_incomplete_file_row(&conn, image_hash)?;
+                    db::upsert_group_file_source(
+                        &conn,
+                        record.group_id(),
+                        image_hash,
+                        record.author_peer_id(),
+                    )?;
+                }
                 ensure_peer(&conn, record.author_peer_id(), "group")?;
                 db::upsert_chat_member_state(
                     &conn,
@@ -830,6 +1136,38 @@ pub fn apply_signed_record(
                     peer_id: peer_id.clone(),
                     membership_state: "removed".to_string(),
                 });
+            }
+            GroupRecordBody::AdminTransferred { new_admin_peer_id } => {
+                let records = db::get_group_records_for_sync(&conn, record.group_id(), &[], 10_000)?;
+                if let Some(policy) = derive_group_policy(&records) {
+                    for member in db::get_group_roster(&conn, record.group_id())? {
+                        if member.membership_state == "joined" {
+                            let role = if member.peer_id == policy.admin_peer_id {
+                                "admin"
+                            } else {
+                                "member"
+                            };
+                            db::upsert_chat_member_state(
+                                &conn,
+                                record.group_id(),
+                                &member.peer_id,
+                                role,
+                                "joined",
+                                member.invited_by.as_deref(),
+                                member.last_event_id.as_deref(),
+                            )?;
+                        }
+                    }
+                }
+                roster_event = Some(GroupRosterUpdatedEvent {
+                    group_id: record.group_id().to_string(),
+                    peer_id: new_admin_peer_id.clone(),
+                    membership_state: "admin".to_string(),
+                });
+            }
+            GroupRecordBody::GroupDissolved => {
+                db::revoke_group_invites(&conn, record.group_id())?;
+                db::delete_group_chat(&conn, record.group_id())?;
             }
             GroupRecordBody::Message {
                 content_type,
@@ -909,6 +1247,7 @@ pub fn apply_signed_record(
             }
             GroupRecordBody::Head { .. } => {}
             GroupRecordBody::FileAvailability { file_hash } => {
+                ensure_incomplete_file_row(&conn, file_hash)?;
                 db::upsert_group_file_source(
                     &conn,
                     record.group_id(),
@@ -1065,12 +1404,22 @@ fn sign_record(
     group_id: String,
     body: GroupRecordBody,
 ) -> anyhow::Result<SignedGroupRecord> {
+    sign_record_at(keypair, group_id, timestamp_now(), Vec::new(), body)
+}
+
+fn sign_record_at(
+    keypair: &identity::Keypair,
+    group_id: String,
+    timestamp: i64,
+    parents: Vec<String>,
+    body: GroupRecordBody,
+) -> anyhow::Result<SignedGroupRecord> {
     SignedGroupRecord::new(
         keypair,
         group_id,
-        format!("group-rec-{}-{}", timestamp_now(), rand::random::<u32>()),
-        timestamp_now(),
-        Vec::new(),
+        format!("group-rec-{}-{}", timestamp, rand::random::<u32>()),
+        timestamp,
+        parents,
         body,
     )
 }
@@ -1144,8 +1493,18 @@ mod tests {
     use super::*;
 
     fn app_state() -> AppState {
-        let temp = tempfile::tempdir().expect("temp");
-        crate::runtime::create_app_state(temp.path().to_path_buf()).expect("app state")
+        use crate::storage::config::ConfigManager;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let app_dir = tempfile::tempdir_in("/tmp").expect("temp").keep();
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        db::create_tables(&conn).expect("schema");
+        AppState {
+            config_manager: Arc::new(Mutex::new(ConfigManager::new(app_dir.clone()))),
+            db_conn: Arc::new(std::sync::Mutex::new(conn)),
+            app_dir,
+        }
     }
 
     fn keypair() -> identity::Keypair {
@@ -1199,6 +1558,7 @@ mod tests {
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
                 settings: None,
+                image_hash: None,
             },
         );
 
@@ -1206,6 +1566,216 @@ mod tests {
         let policy = get_group_policy(&app_state, &group_id).expect("policy");
         assert_eq!(policy.admin_peer_id, peer_id(&founder));
         assert!(!policy.settings.members_can_invite);
+    }
+
+    #[test]
+    fn administrator_transfer_and_successor_order_are_deterministic() {
+        let app_state = app_state();
+        let founder = keypair();
+        let older = keypair();
+        let newer = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let older_id = peer_id(&older);
+        let newer_id = peer_id(&newer);
+        let founder_id = peer_id(&founder);
+
+        let records = [
+            signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+            signed(&founder, &group_id, "invite-older", 2, GroupRecordBody::MemberInvited {
+                peer_id: older_id.clone(), role: "member".to_string(),
+            }),
+            signed(&older, &group_id, "join-older", 3, GroupRecordBody::MemberJoined {
+                peer_id: older_id.clone(),
+            }),
+            signed(&founder, &group_id, "invite-newer", 4, GroupRecordBody::MemberInvited {
+                peer_id: newer_id.clone(), role: "member".to_string(),
+            }),
+            signed(&newer, &group_id, "join-newer", 5, GroupRecordBody::MemberJoined {
+                peer_id: newer_id.clone(),
+            }),
+        ];
+        for record in &records {
+            apply(&app_state, record).expect("membership record");
+        }
+
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert_eq!(policy.automatic_successor_peer_id.as_deref(), Some(older_id.as_str()));
+
+        apply(&app_state, &signed(
+            &founder,
+            &group_id,
+            "transfer",
+            6,
+            GroupRecordBody::AdminTransferred { new_admin_peer_id: newer_id.clone() },
+        )).expect("transfer");
+        let policy = get_group_policy(&app_state, &group_id).expect("transferred policy");
+        assert_eq!(policy.admin_peer_id, newer_id);
+        assert_eq!(policy.automatic_successor_peer_id.as_deref(), Some(founder_id.as_str()));
+    }
+
+    #[test]
+    fn sole_administrator_can_dissolve_and_later_records_are_rejected() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        apply(&app_state, &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+            name: "Test".to_string(), settings: None, image_hash: None,
+        })).expect("created");
+        apply(&app_state, &signed(&founder, &group_id, "dissolved", 2, GroupRecordBody::GroupDissolved))
+            .expect("dissolved");
+
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(policy.dissolved);
+        let error = apply(&app_state, &signed(&founder, &group_id, "message", 3, GroupRecordBody::Message {
+            content_type: GroupContentType::Text,
+            text_content: Some("too late".to_string()),
+            file_hash: None,
+            sender_alias: Some("Founder".to_string()),
+        })).expect_err("records after dissolution must fail");
+        assert!(error.to_string().contains("dissolved"));
+
+        let error = apply(&app_state, &signed(&founder, &group_id, "backdated", 1, GroupRecordBody::Message {
+            content_type: GroupContentType::Text,
+            text_content: Some("backdated after tombstone".to_string()),
+            file_hash: None,
+            sender_alias: None,
+        })).expect_err("a known dissolution must reject backdated records too");
+        assert!(error.to_string().contains("dissolved"));
+    }
+
+    #[test]
+    fn leave_waits_for_parent_admin_transfer() {
+        let app_state = app_state();
+        let founder = keypair();
+        let successor = keypair();
+        let founder_id = peer_id(&founder);
+        let successor_id = peer_id(&successor);
+        let group_id = chat_kind::generate_group_chat_id();
+        for record in [
+            signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+            signed(&founder, &group_id, "invited", 2, GroupRecordBody::MemberInvited {
+                peer_id: successor_id.clone(), role: "member".to_string(),
+            }),
+            signed(&successor, &group_id, "joined", 3, GroupRecordBody::MemberJoined {
+                peer_id: successor_id.clone(),
+            }),
+        ] {
+            apply(&app_state, &record).expect("setup record");
+        }
+        let transfer = signed(&founder, &group_id, "transfer-parent", 4,
+            GroupRecordBody::AdminTransferred { new_admin_peer_id: successor_id.clone() });
+        let leave = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            "leave-child".to_string(),
+            5,
+            vec![transfer.id().to_string()],
+            GroupRecordBody::MemberLeft { peer_id: founder_id.clone() },
+        ).expect("leave record");
+
+        assert!(!apply(&app_state, &leave).expect("pending leave"));
+        apply(&app_state, &transfer).expect("transfer");
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert_eq!(policy.admin_peer_id, successor_id);
+        assert!(!policy.active_members.contains(&founder_id));
+    }
+
+    #[test]
+    fn applying_group_created_stores_group_image_hash() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let image_hash = "group-image-hash";
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Visual Group".to_string(),
+                    settings: None,
+                    image_hash: Some(image_hash.to_string()),
+                },
+            ),
+        )
+        .expect("created");
+
+        let conn = app_state.db_conn.lock().expect("db");
+        let chat = db::get_chat_list(&conn)
+            .expect("chat list")
+            .into_iter()
+            .find(|chat| chat.id == group_id)
+            .expect("group chat");
+        assert_eq!(chat.image_hash.as_deref(), Some(image_hash));
+        let (mime_type, is_complete): (String, i64) = conn
+            .query_row(
+                "SELECT mime_type, is_complete FROM files WHERE file_hash = ?1",
+                [image_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("placeholder file row");
+        assert_eq!(mime_type, "application/octet-stream");
+        assert_eq!(is_complete, 0);
+        let sources = db::get_group_file_sources(&conn, &group_id, image_hash).expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].peer_id, peer_id(&founder));
+    }
+
+    #[test]
+    fn file_availability_creates_placeholder_file_row() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let file_hash = "available-group-image-hash";
+
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "created",
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Visual Group".to_string(),
+                    settings: None,
+                    image_hash: None,
+                },
+            ),
+        )
+        .expect("created");
+        apply(
+            &app_state,
+            &signed(
+                &founder,
+                &group_id,
+                "available",
+                2,
+                GroupRecordBody::FileAvailability {
+                    file_hash: file_hash.to_string(),
+                },
+            ),
+        )
+        .expect("availability");
+
+        let conn = app_state.db_conn.lock().expect("db");
+        let is_complete: i64 = conn
+            .query_row(
+                "SELECT is_complete FROM files WHERE file_hash = ?1",
+                [file_hash],
+                |row| row.get(0),
+            )
+            .expect("placeholder file row");
+        assert_eq!(is_complete, 0);
+        let sources = db::get_group_file_sources(&conn, &group_id, file_hash).expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].peer_id, peer_id(&founder));
     }
 
     #[test]
@@ -1225,6 +1795,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1290,6 +1861,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1330,6 +1902,7 @@ mod tests {
                     settings: Some(GroupSettings {
                         members_can_invite: true,
                     }),
+                image_hash: None,
                 },
             ),
         )
@@ -1399,6 +1972,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1464,6 +2038,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1530,6 +2105,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1586,6 +2162,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1624,6 +2201,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )
@@ -1691,6 +2269,7 @@ mod tests {
                 GroupRecordBody::GroupCreated {
                     name: "Test".to_string(),
                     settings: None,
+                image_hash: None,
                 },
             ),
         )

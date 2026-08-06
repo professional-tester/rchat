@@ -91,6 +91,13 @@
 	  let showGroupSettings = false;
 	  let groupSettingsSaving = false;
 	  let groupSettingsError: string | null = null;
+	  let selectedAdminPeerId = "";
+	  $: eligibleAdminMembers = groupPolicy
+	    ? groupPolicy.active_members.filter((peerId) => peerId !== groupPolicy?.local_peer_id)
+	    : [];
+	  function groupMemberLabel(peerId: string) {
+	    return groupPolicy?.member_aliases[peerId] || truncateId(peerId, 24);
+	  }
 
 	  async function refreshGroupPolicy(chatId = activePeer) {
 	    try {
@@ -116,6 +123,23 @@
 	      await refreshGroupPolicy(activePeer);
 	    } catch (e: any) {
 	      groupSettingsError = e?.toString?.() || "Unable to update group settings";
+	    } finally {
+	      groupSettingsSaving = false;
+	    }
+	  }
+
+	  async function transferAdministrator() {
+	    if (!isGroupChat || !selectedAdminPeerId || groupSettingsSaving) return;
+	    const label = groupMemberLabel(selectedAdminPeerId);
+	    if (!window.confirm(`Make ${label} the group administrator? You will become a regular member.`)) return;
+	    groupSettingsSaving = true;
+	    groupSettingsError = null;
+	    try {
+	      await api.transferGroupAdmin(activePeer, selectedAdminPeerId);
+	      selectedAdminPeerId = "";
+	      await refreshGroupPolicy(activePeer);
+	    } catch (e: any) {
+	      groupSettingsError = e?.toString?.() || "Unable to transfer administration";
 	    } finally {
 	      groupSettingsSaving = false;
 	    }
@@ -203,6 +227,8 @@
   let callClockSec = 0;
   let callClockTimer: ReturnType<typeof setInterval> | null = null;
   let encodedVideoFrameUnlisten: (() => void) | null = null;
+  let groupRecordUnlisten: (() => void) | null = null;
+  let groupRosterUnlisten: (() => void) | null = null;
   let broadcastFrameUnlisten: (() => void) | null = null;
   let localPreviewFrameUnlisten: (() => void) | null = null;
   let screenPreviewFrameUnlisten: (() => void) | null = null;
@@ -1788,9 +1814,19 @@
       reportVideoRenderStats,
       VIDEO_RENDER_STATS_REPORT_INTERVAL_MS,
     );
+    groupRecordUnlisten = await listen("group-record-applied", (event: any) => {
+      if (isGroupChat && event.payload?.group_id === activePeer) void refreshGroupPolicy(activePeer);
+    });
+    groupRosterUnlisten = await listen("group-roster-updated", (event: any) => {
+      if (isGroupChat && event.payload?.group_id === activePeer) void refreshGroupPolicy(activePeer);
+    });
   });
 
   onDestroy(() => {
+    groupRecordUnlisten?.();
+    groupRecordUnlisten = null;
+    groupRosterUnlisten?.();
+    groupRosterUnlisten = null;
     if (callClockTimer) {
       clearInterval(callClockTimer);
       callClockTimer = null;
@@ -1907,6 +1943,32 @@
 	                </span>
 	              </span>
 	            </label>
+	            {#if eligibleAdminMembers.length > 0}
+	              <div class="mt-3 border-t border-theme-base-700 pt-3">
+	                <label class="block text-xs font-medium text-theme-base-100" for="group-admin-select">
+	                  Transfer administration
+	                </label>
+	                <select
+	                  id="group-admin-select"
+	                  bind:value={selectedAdminPeerId}
+	                  disabled={groupSettingsSaving}
+	                  class="mt-2 w-full rounded-md border border-theme-base-700 bg-theme-base-950 px-2 py-1.5 text-xs text-theme-base-100"
+	                >
+	                  <option value="">Select member</option>
+	                  {#each eligibleAdminMembers as peerId}
+	                    <option value={peerId}>{groupMemberLabel(peerId)}</option>
+	                  {/each}
+	                </select>
+	                <button
+	                  type="button"
+	                  disabled={!selectedAdminPeerId || groupSettingsSaving}
+	                  onclick={transferAdministrator}
+	                  class="mt-2 w-full rounded-md bg-theme-primary-600 px-2 py-1.5 text-xs text-white disabled:opacity-50"
+	                >
+	                  Make administrator
+	                </button>
+	              </div>
+	            {/if}
 	            {#if groupSettingsError}
 	              <p class="mt-2 text-xs text-theme-error-400">{groupSettingsError}</p>
 	            {/if}

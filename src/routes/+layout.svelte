@@ -10,8 +10,10 @@
   import { page } from "$app/stores";
   import {
     type ConnectivityMode,
+    api,
   } from "$lib/tauri/api";
   import { getChatKind } from "$lib/chatKind";
+  import { extractPeerIdFromChatId } from "$lib/chatIdentity";
   import {
     appSession,
     applyConnectivitySettings,
@@ -72,6 +74,8 @@
   let showCreateMenu = false;
   let showNewPersonModal = false;
   let showNewGroupModal = false;
+  let groupWizardNewPersonMode = false;
+  let groupWizardAddedPeerId: string | null = null;
   let showChatDetailsModal = false;
   let chatDetailsChatId: string | null = null;
   let newPersonStep:
@@ -334,6 +338,19 @@
           await togglePinPeer(id);
         }
         if (action === "delete-peer") {
+          if (getChatKind(id) === "group") {
+            const preview = await api.previewGroupLeave(id);
+            const policy = await api.getGroupPolicy(id);
+            const successorLabel = preview.outcome === "transferred_then_left"
+              ? policy.member_aliases[preview.successor_peer_id] || `${preview.successor_peer_id.slice(0, 18)}…`
+              : "";
+            const message = preview.outcome === "transferred_then_left"
+              ? `Leave this group? Administration will pass to ${successorLabel} automatically.`
+              : preview.outcome === "dissolved"
+                ? "You are the only active member. Leaving will permanently dissolve this group and revoke outstanding invitations."
+                : "Leave this group?";
+            if (!window.confirm(message)) return;
+          }
           await deleteChat(id);
           if (activePeer === id) {
             goto("/");
@@ -448,22 +465,55 @@
   }
 
   function handleOpenNewPerson() {
+    groupWizardNewPersonMode = false;
     showNewPersonModal = true;
     showCreateMenu = false;
   }
 
   function handleOpenNewGroup() {
+    groupWizardNewPersonMode = false;
+    groupWizardAddedPeerId = null;
     showNewGroupModal = true;
     showCreateMenu = false;
   }
 
-  async function handleCreateGroup(name: string) {
+  async function handleCreateGroup(payload: {
+    name: string;
+    imagePath: string | null;
+    membersCanInvite: boolean;
+    invitePeerIds: string[];
+  }) {
     try {
-      const result = await createGroup(name || "");
+      const result = await createGroup(
+        payload.name,
+        payload.imagePath,
+        payload.membersCanInvite,
+      );
+      const failedInvites: string[] = [];
+      for (const chatId of payload.invitePeerIds) {
+        const peerId = extractPeerIdFromChatId(chatId);
+        if (!peerId) {
+          failedInvites.push(chatId);
+          continue;
+        }
+        try {
+          await api.inviteGroupMember(result.chat_id, peerId);
+        } catch (err) {
+          console.error("Group invite failed:", err);
+          failedInvites.push(chatId);
+        }
+      }
+      if (failedInvites.length > 0) {
+        console.warn("Group created with failed invites:", failedInvites);
+        alert(
+          `Group created, but ${failedInvites.length} invite${failedInvites.length === 1 ? "" : "s"} could not be sent.`,
+        );
+      }
       showNewGroupModal = false;
       goto(`/chat/${result.chat_id}`);
     } catch (e) {
       console.error("Create group failed:", e);
+      throw e;
     }
   }
 
@@ -537,8 +587,8 @@
       ontoggleSidebar={() => (isSidebarOpen = !isSidebarOpen)}
       onopenSettings={() => goto("/settings")}
       onselectPeer={handleSelectPeer}
-      onopenNewPerson={() => (showNewPersonModal = true)}
-      onopenNewGroup={() => (showNewGroupModal = true)}
+      onopenNewPerson={handleOpenNewPerson}
+      onopenNewGroup={handleOpenNewGroup}
       onopenEnvelopeModal={openEnvelopeModal}
       ontoggleCreateMenu={() => (showCreateMenu = !showCreateMenu)}
       onenterEnvelope={selectEnvelope}
@@ -616,20 +666,42 @@
         localPeers={$chatState.localPeers}
         onclose={() => {
           showNewPersonModal = false;
+          groupWizardNewPersonMode = false;
           newPersonStep = "select-network";
         }}
         onconnect={async (peerId: string) => {
           console.log("Peer connected:", peerId);
           // Refresh data to show the new peer (already in known_devices from backend)
           await refreshChats();
+          if (groupWizardNewPersonMode) {
+            groupWizardAddedPeerId = peerId;
+            groupWizardNewPersonMode = false;
+            showNewPersonModal = false;
+            newPersonStep = "select-network";
+          }
         }}
       />
 
       <GroupChatModal
         show={showNewGroupModal}
+        peers={$chatState.peers}
+        peerAliases={$chatState.peerAliases}
+        chatNames={$chatState.chatNames}
+        groupChats={$chatState.groupChats}
+        connectedChatIds={Array.from($connectedChatIds)}
+        addedPeerId={groupWizardAddedPeerId}
+        waitingForNewPerson={groupWizardNewPersonMode}
         onclose={() => (showNewGroupModal = false)}
         oncreate={handleCreateGroup}
         ontempjoin={handleTempGroupJoin}
+        onnewperson={() => {
+          groupWizardNewPersonMode = true;
+          showNewPersonModal = true;
+          newPersonStep = "select-network";
+        }}
+        onconsumeaddedpeer={() => {
+          groupWizardAddedPeerId = null;
+        }}
       />
 
       <ContextMenu

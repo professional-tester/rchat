@@ -6,10 +6,12 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.100"
 arboard = "3.6.1"
+base64 = "0.22.1"
 clap = { version = "4.5.53", features = ["derive"] }
 crossterm = "0.29.0"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libc = "0.2"
+open = "5"
 qrcode = "0.14.1"
 ratatui = "0.30.1"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults", "tokio"] }

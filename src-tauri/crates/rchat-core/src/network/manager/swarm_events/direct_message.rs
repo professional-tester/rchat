@@ -151,6 +151,12 @@ impl NetworkManager {
                                 ),
                             }
                         }
+                        DirectMessageKind::GroupDissolution => {
+                            match self.handle_group_dissolution(&request).await {
+                                Ok(()) => self.send_status_response(channel, request.id, "delivered", None),
+                                Err(err) => self.send_status_response(channel, request.id, "error", Some(err)),
+                            }
+                        }
                         DirectMessageKind::GroupSyncRequest => {
                             match self.handle_group_sync_request(peer, &request).await {
                                 Ok(()) => self.send_status_response(
@@ -311,6 +317,31 @@ impl NetworkManager {
             Some(&self.event_sink),
             &invite,
         )
+        .map_err(|e| e.to_string())
+    }
+
+    async fn handle_group_dissolution(
+        &mut self,
+        request: &crate::network::direct_message::DirectMessageRequest,
+    ) -> Result<(), String> {
+        let payload = request
+            .text_content
+            .as_deref()
+            .ok_or_else(|| "missing group dissolution payload".to_string())?;
+        let record: crate::network::gossip::SignedGroupRecord =
+            serde_json::from_str(payload).map_err(|e| format!("invalid group dissolution: {e}"))?;
+        if !matches!(record.body(), crate::network::gossip::GroupRecordBody::GroupDissolved)
+            || !record.verify()
+        {
+            return Err("invalid signed group dissolution".to_string());
+        }
+        crate::chat::group::apply_signed_record(
+            &self.app_state,
+            Some(&self.event_sink),
+            &record,
+            true,
+        )
+        .map(|_| ())
         .map_err(|e| e.to_string())
     }
 

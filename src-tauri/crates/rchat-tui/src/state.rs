@@ -67,6 +67,18 @@ pub struct TuiChatDetails {
     pub sent_total: i64,
     pub received_total: i64,
     pub recent_files: Vec<TuiChatFileSummary>,
+    pub group: Option<TuiGroupDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiGroupDetails {
+    pub image_hash: Option<String>,
+    pub is_admin: bool,
+    pub members_can_invite: bool,
+    pub roster: Vec<String>,
+    pub receipts: Vec<String>,
+    pub pending_count: i64,
+    pub sync_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +123,7 @@ pub enum ContextMenuTarget {
 pub enum ContextMenuAction {
     Open,
     Details,
+    Archive,
     MoveToRoot,
     DeleteEnvelope,
     AttachmentActions,
@@ -170,6 +183,78 @@ pub enum NewPersonStep {
     AcceptInviteCode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewItemChoice {
+    Person,
+    Group,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewGroupStep {
+    Settings,
+    InvitePeople,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewGroupModalState {
+    pub step: NewGroupStep,
+    pub selected_index: usize,
+    pub name: String,
+    pub image_path: String,
+    pub members_can_invite: bool,
+    pub selected_peer_ids: HashSet<String>,
+    pub return_from_new_person: bool,
+    pub error: Option<String>,
+}
+
+impl Default for NewGroupModalState {
+    fn default() -> Self {
+        Self {
+            step: NewGroupStep::Settings,
+            selected_index: 0,
+            name: String::new(),
+            image_path: String::new(),
+            members_can_invite: false,
+            selected_peer_ids: HashSet::new(),
+            return_from_new_person: false,
+            error: None,
+        }
+    }
+}
+
+impl NewGroupModalState {
+    pub fn field_count(&self, peer_count: usize) -> usize {
+        match self.step {
+            NewGroupStep::Settings => 4,
+            NewGroupStep::InvitePeople => peer_count.saturating_add(3),
+        }
+    }
+
+    pub fn move_focus(&mut self, delta: isize, peer_count: usize) {
+        self.selected_index = next_index(self.selected_index, delta, self.field_count(peer_count));
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        match (self.step, self.selected_index) {
+            (NewGroupStep::Settings, 0) => self.name.push(ch),
+            (NewGroupStep::Settings, 1) => self.image_path.push(ch),
+            _ => {}
+        }
+    }
+
+    pub fn pop_char(&mut self) {
+        match (self.step, self.selected_index) {
+            (NewGroupStep::Settings, 0) => {
+                self.name.pop();
+            }
+            (NewGroupStep::Settings, 1) => {
+                self.image_path.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewPersonField {
     LocalNetwork,
@@ -180,6 +265,7 @@ pub enum NewPersonField {
     TemporaryChat,
     InviteeUsername,
     CreateInviteNext,
+    EmailInvite,
     CreateInviteConfirm,
     InviterUsername,
     AcceptInviteNext,
@@ -201,6 +287,7 @@ pub struct NewPersonModalState {
     pub focus: NewPersonField,
     pub invitee_username: String,
     pub create_invite_password: String,
+    pub create_invite_published: bool,
     pub inviter_username: String,
     pub invite_password: String,
     pub invite_qr_path: String,
@@ -222,6 +309,7 @@ impl Default for NewPersonModalState {
             focus: NewPersonField::LocalNetwork,
             invitee_username: String::new(),
             create_invite_password: String::new(),
+            create_invite_published: false,
             inviter_username: String::new(),
             invite_password: String::new(),
             invite_qr_path: String::new(),
@@ -264,7 +352,10 @@ impl NewPersonModalState {
                     NewPersonField::CreateInviteNext,
                 ]
             }
-            NewPersonStep::CreateInviteCode => vec![NewPersonField::CreateInviteConfirm],
+            NewPersonStep::CreateInviteCode => vec![
+                NewPersonField::EmailInvite,
+                NewPersonField::CreateInviteConfirm,
+            ],
             NewPersonStep::AcceptInviteUser => {
                 vec![
                     NewPersonField::InviterUsername,
@@ -298,7 +389,7 @@ impl NewPersonModalState {
             NewPersonStep::Online => NewPersonField::CreateInvite,
             NewPersonStep::TemporaryChat => NewPersonField::CreateTemporary,
             NewPersonStep::CreateInviteUser => NewPersonField::InviteeUsername,
-            NewPersonStep::CreateInviteCode => NewPersonField::CreateInviteConfirm,
+            NewPersonStep::CreateInviteCode => NewPersonField::EmailInvite,
             NewPersonStep::AcceptInviteUser => NewPersonField::InviterUsername,
             NewPersonStep::AcceptInviteCode => NewPersonField::InvitePassword,
         };
@@ -432,6 +523,7 @@ pub enum SettingsField {
     RattyPathSave,
     RattyImportGhostty,
     RattyReset,
+    ScreenShareTest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +666,7 @@ impl SettingsModalState {
                 SettingsField::RattyPathSave,
                 SettingsField::RattyImportGhostty,
                 SettingsField::RattyReset,
+                SettingsField::ScreenShareTest,
             ]),
             SettingsSection::About => {}
         }
@@ -922,7 +1015,10 @@ impl StickerPickerState {
             id: format!("sticker-preview-{}", sticker.file_hash),
             chat_id: "sticker-picker".to_string(),
             sender: "Me".to_string(),
-            text: sticker.name.clone().unwrap_or_else(|| "sticker".to_string()),
+            text: sticker
+                .name
+                .clone()
+                .unwrap_or_else(|| "sticker".to_string()),
             timestamp: 0,
             status: String::new(),
             content_type: "sticker".to_string(),
@@ -1303,7 +1399,9 @@ pub struct TuiAppState {
     pub focus: FocusPane,
     pub show_help: bool,
     pub show_command_palette: bool,
+    pub new_item_choice: Option<NewItemChoice>,
     pub new_person: Option<NewPersonModalState>,
+    pub new_group: Option<NewGroupModalState>,
     pub settings: Option<SettingsModalState>,
     pub attachment_modal: Option<AttachmentModalState>,
     pub sticker_picker: Option<StickerPickerState>,
@@ -1312,6 +1410,7 @@ pub struct TuiAppState {
     pub media_viewer: Option<MediaViewerState>,
     pub selected_attachment_message_id: Option<String>,
     pub chat_details: Option<TuiChatDetails>,
+    pub group_sync_status: HashMap<String, String>,
     pub last_error: Option<String>,
 }
 
@@ -1342,7 +1441,9 @@ impl Default for TuiAppState {
             focus: FocusPane::Chats,
             show_help: false,
             show_command_palette: false,
+            new_item_choice: None,
             new_person: None,
+            new_group: None,
             settings: None,
             attachment_modal: None,
             sticker_picker: None,
@@ -1351,6 +1452,7 @@ impl Default for TuiAppState {
             media_viewer: None,
             selected_attachment_message_id: None,
             chat_details: None,
+            group_sync_status: HashMap::new(),
             last_error: None,
         }
     }
@@ -1425,8 +1527,7 @@ impl TuiAppState {
             return;
         }
         let current = self.selected_composer_action_index as isize;
-        self.selected_composer_action_index =
-            (current + delta).rem_euclid(len as isize) as usize;
+        self.selected_composer_action_index = (current + delta).rem_euclid(len as isize) as usize;
     }
 
     pub fn open_sidebar_search(&mut self) {
@@ -1481,6 +1582,8 @@ impl TuiAppState {
         self.chat_details = None;
         self.show_help = false;
         self.new_person = None;
+        self.new_item_choice = None;
+        self.new_group = None;
         self.settings = None;
         self.attachment_modal = None;
         self.sticker_picker = None;
@@ -1501,6 +1604,16 @@ impl TuiAppState {
         self.context_menu = None;
         self.media_viewer = None;
         self.new_person = Some(NewPersonModalState::default());
+    }
+
+    pub fn open_new_item_choice(&mut self) {
+        self.close_modal();
+        self.new_item_choice = Some(NewItemChoice::Person);
+    }
+
+    pub fn open_new_group(&mut self) {
+        self.close_modal();
+        self.new_group = Some(NewGroupModalState::default());
     }
 
     pub fn close_new_person(&mut self) {
@@ -1876,7 +1989,8 @@ impl TuiAppState {
             return;
         };
         self.selected_message_id = Some(message.id.clone());
-        self.selected_attachment_message_id = message_is_attachment(message).then(|| message.id.clone());
+        self.selected_attachment_message_id =
+            message_is_attachment(message).then(|| message.id.clone());
     }
 
     fn selected_message_index(&self) -> Option<usize> {
@@ -2139,6 +2253,7 @@ mod tests {
             sent_total: 0,
             received_total: 0,
             recent_files: Vec::new(),
+            group: None,
         });
 
         state.close_modal();
@@ -2210,14 +2325,23 @@ mod tests {
             ],
         );
 
-        assert_eq!(state.selected_message().map(|message| message.id.as_str()), Some("m3"));
+        assert_eq!(
+            state.selected_message().map(|message| message.id.as_str()),
+            Some("m3")
+        );
 
         state.move_selection(-1);
-        assert_eq!(state.selected_message().map(|message| message.id.as_str()), Some("m2"));
+        assert_eq!(
+            state.selected_message().map(|message| message.id.as_str()),
+            Some("m2")
+        );
         assert_eq!(state.history_scroll_offset, 1);
 
         state.move_selection(1);
-        assert_eq!(state.selected_message().map(|message| message.id.as_str()), Some("m3"));
+        assert_eq!(
+            state.selected_message().map(|message| message.id.as_str()),
+            Some("m3")
+        );
         assert_eq!(state.history_scroll_offset, 0);
     }
 
@@ -2514,6 +2638,24 @@ mod tests {
     }
 
     #[test]
+    fn new_item_choice_opens_resumable_group_wizard() {
+        let mut state = TuiAppState::default();
+        state.open_new_item_choice();
+        assert_eq!(state.new_item_choice, Some(NewItemChoice::Person));
+
+        state.open_new_group();
+        let modal = state.new_group.as_mut().expect("group wizard");
+        modal.name = "Design Crew".to_string();
+        modal.step = NewGroupStep::InvitePeople;
+        modal.return_from_new_person = true;
+        modal.selected_peer_ids.insert("peer-1".to_string());
+
+        assert_eq!(modal.step, NewGroupStep::InvitePeople);
+        assert!(modal.return_from_new_person);
+        assert!(modal.selected_peer_ids.contains("peer-1"));
+    }
+
+    #[test]
     fn new_person_back_navigation_matches_step_tree() {
         let mut modal = NewPersonModalState::default();
 
@@ -2533,6 +2675,29 @@ mod tests {
         modal.set_step(NewPersonStep::TemporaryChat);
         assert!(modal.go_back());
         assert_eq!(modal.step, NewPersonStep::Online);
+    }
+
+    #[test]
+    fn create_invite_code_exposes_email_before_publish_and_starts_unpublished() {
+        let mut modal = NewPersonModalState::default();
+        modal.invitee_username = "bob".to_string();
+        modal.create_invite_password = "12345678901234".to_string();
+        modal.set_step(NewPersonStep::CreateInviteCode);
+
+        assert_eq!(
+            modal.visible_fields(0),
+            vec![
+                NewPersonField::EmailInvite,
+                NewPersonField::CreateInviteConfirm
+            ]
+        );
+        assert_eq!(modal.focus, NewPersonField::EmailInvite);
+        modal.move_focus(1, 0);
+        assert_eq!(modal.focus, NewPersonField::CreateInviteConfirm);
+        modal.go_back();
+        assert_eq!(modal.invitee_username, "bob");
+        assert_eq!(modal.create_invite_password, "12345678901234");
+        assert!(!NewPersonModalState::default().create_invite_published);
     }
 
     #[test]
@@ -2692,6 +2857,7 @@ mod tests {
                 SettingsField::RattyPathSave,
                 SettingsField::RattyImportGhostty,
                 SettingsField::RattyReset,
+                SettingsField::ScreenShareTest,
             ]
         );
         assert_eq!(modal.focus, SettingsField::RattyPath);

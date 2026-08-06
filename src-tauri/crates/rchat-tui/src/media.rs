@@ -872,11 +872,8 @@ mod tests {
 
     #[test]
     fn media_viewer_fit_image_is_centered_on_viewport_canvas() {
-        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
-            4,
-            2,
-            image::Rgba([240, 10, 20, 255]),
-        ));
+        let image =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 2, image::Rgba([240, 10, 20, 255])));
         let key = MediaViewerKey::new("hash-1", Size::new(1, 1), 100, 0, 0);
 
         let mut cache = ViewerResizeCache::default();
@@ -939,12 +936,8 @@ mod tests {
         let panned_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 200, 0, -6);
         let zoomed_key = MediaViewerKey::new("hash-1", Size::new(1, 1), 225, 0, -6);
 
-        let _ = prepare_media_viewer_image(
-            &image,
-            &centered_key,
-            FontSize::new(10, 20),
-            &mut cache,
-        );
+        let _ =
+            prepare_media_viewer_image(&image, &centered_key, FontSize::new(10, 20), &mut cache);
         assert_eq!(cache.resize_count(), 1);
 
         let _ = prepare_media_viewer_image(&image, &panned_key, FontSize::new(10, 20), &mut cache);

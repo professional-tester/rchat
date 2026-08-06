@@ -46,6 +46,7 @@ rchat-screen-capture = { path = "../rchat-screen-capture" }
 rchat-video-capture = { path = "../rchat-video-capture" }
 rubato = { version = "2.0.0", default-features = false }
 tempfile = { version = "3.23.0", optional = true }
+url = "2"
 
 [features]
 # Shared test-support helpers (`testing` module) used by rchat-core and

@@ -2275,7 +2275,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -4056,6 +4056,25 @@ checksum = "4f867b9d1d896b67beb18518eda36fdb77a32ea590de864f1325b294a6d14397"
 dependencies = [
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "is-docker"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
+name = "is-wsl"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
+dependencies = [
+ "is-docker",
+ "once_cell",
 ]
 
 [[package]]
@@ -5940,6 +5959,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "open"
+version = "5.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8d3b65c44123a56e0133d2cd06ce4361bd3ca99d41198b2f25e3c3db9b8b4a"
+dependencies = [
+ "dunce",
+ "is-wsl",
+ "libc",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7299,6 +7329,7 @@ dependencies = [
  "tauri-plugin-deep-link",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
+ "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
@@ -7345,6 +7376,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "url",
  "x25519-dalek",
  "zeroconf",
  "zeroize",
@@ -7377,10 +7409,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "clap",
  "crossterm",
  "image",
  "libc",
+ "open",
  "qrcode",
  "ratatui",
  "ratatui-image",
@@ -9018,6 +9052,28 @@ dependencies = [
  "thiserror 2.0.17",
  "toml 0.9.10+spec-1.1.0",
  "url",
+]
+
+[[package]]
+name = "tauri-plugin-opener"
+version = "2.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17e1bea14edce6b793a04e2417e3fd924b9bc4faae83cdee7d714156cceeed29"
+dependencies = [
+ "dunce",
+ "glob",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "open",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.17",
+ "url",
+ "windows 0.61.3",
+ "zbus",
 ]
 
 [[package]]

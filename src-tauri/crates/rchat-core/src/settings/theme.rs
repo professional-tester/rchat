@@ -24,16 +24,6 @@ pub async fn get_theme(app_state: &AppState) -> Result<ThemeConfig> {
     Ok(mgr.load().await?.user.theme)
 }
 
-pub async fn update_theme(app_state: &AppState, theme: ThemeConfig) -> Result<()> {
-    let normalized = theme_storage::validate_and_normalize_theme(&theme)?;
-    let mgr = app_state.config_manager.lock().await;
-    let mut config = mgr.load().await?;
-    config.user.theme = normalized;
-    config.user.selected_preset = None;
-    mgr.save(&config).await?;
-    Ok(())
-}
-
 pub fn generate_simple_theme(primary: &str, secondary: &str, text: &str) -> Result<ThemeConfig> {
     theme_storage::generate_simple_theme(primary, secondary, text)
 }

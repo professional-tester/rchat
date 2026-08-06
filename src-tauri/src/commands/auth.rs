@@ -104,18 +104,6 @@ pub async fn check_auth_status(state: State<'_, AppState>) -> Result<AuthStatus,
 }
 
 #[tauri::command]
-pub async fn toggle_online_status(
-    online: bool,
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    let runtime = app_handle.try_state::<NetworkState>();
-    connectivity::toggle_online_status(&state, runtime.as_ref().map(|value| value.inner()), online)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub async fn get_connectivity_settings(
     state: State<'_, AppState>,
 ) -> Result<ConnectivitySettings, String> {

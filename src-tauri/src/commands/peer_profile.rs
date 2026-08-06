@@ -95,14 +95,6 @@ pub async fn get_theme(state: State<'_, AppState>) -> Result<ThemeConfig, String
 }
 
 #[tauri::command]
-pub async fn update_theme(theme: ThemeConfig, state: State<'_, AppState>) -> Result<(), String> {
-    println!("[Backend] update_theme called");
-    theme_settings::update_theme(&state, theme)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub async fn generate_simple_theme(
     primary: String,
     secondary: String,

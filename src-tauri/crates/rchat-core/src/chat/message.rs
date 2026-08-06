@@ -114,6 +114,8 @@ pub struct Message {
     pub id: String,
     pub chat_id: String,
     pub peer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_alias: Option<String>,
     pub timestamp: i64,
     pub status: MessageStatus,
     pub content: MessageContent,
@@ -165,6 +167,7 @@ impl Message {
             id: db_msg.id.clone(),
             chat_id: db_msg.chat_id.clone(),
             peer_id: db_msg.peer_id.clone(),
+            sender_alias: db_msg.sender_alias.clone(),
             timestamp: db_msg.timestamp,
             status: MessageStatus::from_str(&db_msg.status),
             content,
@@ -219,7 +222,7 @@ impl Message {
             file_hash,
             status: self.status.as_str().to_string(),
             content_metadata,
-            sender_alias: None, // TODO: add sender_alias field to ChatMessage
+            sender_alias: self.sender_alias.clone(),
         }
     }
 
@@ -352,5 +355,29 @@ mod tests {
         let json = serde_json::to_string(&content).unwrap();
         assert!(json.contains("\"type\":\"photo\""));
         assert!(json.contains("\"width\":1920"));
+    }
+
+    #[test]
+    fn sender_alias_survives_db_round_trip_and_legacy_json() {
+        let db_message = crate::storage::db::Message {
+            id: "message-1".to_string(),
+            chat_id: "group:test".to_string(),
+            peer_id: "peer-1".to_string(),
+            timestamp: 42,
+            content_type: "text".to_string(),
+            text_content: Some("hello".to_string()),
+            file_hash: None,
+            status: "delivered".to_string(),
+            content_metadata: None,
+            sender_alias: Some("Alice".to_string()),
+        };
+
+        let rich = Message::from_db_row(&db_message);
+        assert_eq!(rich.sender_alias.as_deref(), Some("Alice"));
+        assert_eq!(rich.to_db_row().sender_alias.as_deref(), Some("Alice"));
+
+        let legacy = r#"{"id":"message-2","chat_id":"chat","peer_id":"peer","timestamp":1,"status":"delivered","content":{"type":"text","text":"hi"}}"#;
+        let decoded: Message = serde_json::from_str(legacy).expect("legacy message");
+        assert_eq!(decoded.sender_alias, None);
     }
 }

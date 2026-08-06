@@ -6,14 +6,17 @@ use crate::{
         InlineMediaState, LatestFrameSlot, MediaViewerKey, ProtocolRequest, ProtocolRequestId,
         ProtocolResponse, ProtocolWorker, RemoteVideoFrameDecoder, ScreenFrameDecoder,
     },
+    ratty_bitmap::{
+        self, Destination as RattyDestination, LiveSurface, RattyBitmapManager, ViewerView,
+    },
     smoke::SmokeFrameGenerator,
     state::{
         db_chat_id, message_is_attachment, AppSessionPhase, AttachmentActionField,
         AttachmentFileEntry, AttachmentModalField, ComposerAction, ContextMenuAction,
         ContextMenuState, ContextMenuTarget, FocusPane, MediaViewerAction, MediaViewerKind,
-        NewPersonField, NewPersonStep, SettingsField, SettingsPane, SettingsSection,
-        StickerPickerMode, StickerPickerState, TuiAppState, TuiChat, TuiChatDetails,
-        TuiEnvelope, TuiMessage, TuiSticker, TuiThemePreset,
+        NewGroupStep, NewItemChoice, NewPersonField, NewPersonStep, SettingsField, SettingsPane,
+        SettingsSection, StickerPickerMode, StickerPickerState, TuiAppState, TuiChat,
+        TuiChatDetails, TuiEnvelope, TuiGroupDetails, TuiMessage, TuiSticker, TuiThemePreset,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -41,7 +44,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use ratatui_image::{picker::ProtocolType, Image};
-use rfd::FileDialog;
 use rchat_core::{
     app_state::{
         BroadcastPhase, BroadcastState, CallKind, TemporaryChatKind, VoiceCallPhase, VoiceCallState,
@@ -67,6 +69,7 @@ use rchat_core::{
     AppState, NetworkState,
 };
 use rchat_screen_capture::{ScreenCaptureConfig, ScreenCaptureProfile, ScreenCaptureSession};
+use rfd::FileDialog;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::{
@@ -97,6 +100,122 @@ const PASSWORD_MASK_SYMBOL: &str = "•";
 const NEW_PERSON_QR_WIDTH: u16 = 28;
 const NEW_PERSON_QR_HEIGHT: u16 = 12;
 const KITTY_DELETE_VISIBLE_PLACEMENTS: &[u8] = b"\x1b_Ga=d,q=2\x1b\\";
+const RATTY_BITMAP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+struct RattyRenderTargets {
+    screen: Option<RattyDestination>,
+    remote_video: Option<RattyDestination>,
+    viewer: Option<RattyDestination>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RattyViewerViewSnapshot {
+    file_hash: String,
+    zoom_percent: u16,
+    pan_x: i32,
+    pan_y: i32,
+}
+
+impl RattyViewerViewSnapshot {
+    fn from_viewer(viewer: &crate::state::MediaViewerState) -> Self {
+        Self {
+            file_hash: viewer.file_hash.clone(),
+            zoom_percent: viewer.zoom_percent,
+            pan_x: viewer.pan_x,
+            pan_y: viewer.pan_y,
+        }
+    }
+}
+
+fn ratty_viewer_snapshot(state: &UiState) -> Option<RattyViewerViewSnapshot> {
+    state
+        .app
+        .media_viewer
+        .as_ref()
+        .map(RattyViewerViewSnapshot::from_viewer)
+}
+
+fn trace_ratty_viewer_latency(stage: &str, started: std::time::Instant, command_count: usize) {
+    if std::env::var_os("RCHAT_RATTY_TRACE").is_none() {
+        return;
+    }
+    let timestamp_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_micros());
+    eprintln!(
+        "[ratty-viewer] stage={stage} timestamp_us={timestamp_us} elapsed_us={} commands={command_count}",
+        started.elapsed().as_micros()
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MediaCapabilities {
+    kitty: bool,
+    ratty_bitmap: bool,
+}
+
+fn detect_media_backends_with<P>(
+    probe_ratty: impl FnOnce() -> bool,
+    detect_fallback: impl FnOnce() -> P,
+) -> (P, bool) {
+    // Probe Ratty before ratatui-image starts its timeout-backed stdin reader. On terminals that
+    // do not answer ratatui-image's sizing queries, that reader can otherwise consume this reply.
+    let ratty_bitmap_available = probe_ratty();
+    let picker = detect_fallback();
+    (picker, ratty_bitmap_available)
+}
+
+struct MediaBackendDetection {
+    picker: ratatui_image::picker::Picker,
+    ratty_bitmap: bool,
+    kitty_forced: bool,
+}
+
+fn finalize_media_detection(
+    mut picker: ratatui_image::picker::Picker,
+    ratty_bitmap: bool,
+) -> MediaBackendDetection {
+    let kitty_forced = ratty_bitmap && picker.protocol_type() != ProtocolType::Kitty;
+    if kitty_forced {
+        picker.set_protocol_type(ProtocolType::Kitty);
+    }
+    MediaBackendDetection {
+        picker,
+        ratty_bitmap,
+        kitty_forced,
+    }
+}
+
+fn detect_media_backends() -> MediaBackendDetection {
+    let (picker, ratty_bitmap) = detect_media_backends_with(
+        || {
+            ratty_bitmap::probe_support(RATTY_BITMAP_PROBE_TIMEOUT)
+                .unwrap_or(None)
+                .is_some()
+        },
+        || {
+            ratatui_image::picker::Picker::from_query_stdio()
+                .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+        },
+    );
+    finalize_media_detection(picker, ratty_bitmap)
+}
+
+fn kitty_media_enabled(protocol_type: ProtocolType) -> bool {
+    protocol_type == ProtocolType::Kitty
+}
+
+fn ratty_destination(area: Rect) -> Option<RattyDestination> {
+    (area.width > 0 && area.height > 0).then(|| {
+        RattyDestination::new(
+            area.y,
+            area.x,
+            u32::from(area.width),
+            u32::from(area.height),
+        )
+    })
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "rchat-tui")]
@@ -209,6 +328,83 @@ fn should_request_qr_protocol(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn ratty_view_snapshot_changes_only_for_render_geometry() {
+        let mut viewer = crate::state::MediaViewerState::new(
+            "m1".to_string(),
+            "hash-1".to_string(),
+            "image.png".to_string(),
+            "image/png".to_string(),
+            None,
+        );
+        let initial = RattyViewerViewSnapshot::from_viewer(&viewer);
+
+        viewer.target_path.push_str("/tmp/image.png");
+        viewer.status = Some("saved".to_string());
+        assert_eq!(initial, RattyViewerViewSnapshot::from_viewer(&viewer));
+
+        viewer.zoom_in();
+        assert_ne!(initial, RattyViewerViewSnapshot::from_viewer(&viewer));
+        let zoomed = RattyViewerViewSnapshot::from_viewer(&viewer);
+
+        viewer.pan_by(64, 0);
+        assert_ne!(zoomed, RattyViewerViewSnapshot::from_viewer(&viewer));
+    }
+
+    #[test]
+    fn media_detection_probes_ratty_before_starting_fallback_reader() {
+        let order = RefCell::new(Vec::new());
+
+        let _ = detect_media_backends_with(
+            || {
+                order.borrow_mut().push("ratty");
+                true
+            },
+            || {
+                order.borrow_mut().push("fallback");
+            },
+        );
+
+        assert_eq!(*order.borrow(), ["ratty", "fallback"]);
+    }
+
+    #[test]
+    fn ratty_bitmap_support_forces_kitty_for_inline_previews() {
+        let detection = finalize_media_detection(ratatui_image::picker::Picker::halfblocks(), true);
+
+        assert_eq!(detection.picker.protocol_type(), ProtocolType::Kitty);
+        assert!(detection.ratty_bitmap);
+        assert!(detection.kitty_forced);
+    }
+
+    #[test]
+    fn non_ratty_terminal_keeps_detected_fallback_protocol() {
+        let detection =
+            finalize_media_detection(ratatui_image::picker::Picker::halfblocks(), false);
+
+        assert_eq!(detection.picker.protocol_type(), ProtocolType::Halfblocks);
+        assert!(!detection.ratty_bitmap);
+        assert!(!detection.kitty_forced);
+    }
+
+    #[test]
+    fn native_ratty_kitty_detection_is_not_marked_forced() {
+        let mut picker = ratatui_image::picker::Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+
+        let detection = finalize_media_detection(picker, true);
+
+        assert_eq!(detection.picker.protocol_type(), ProtocolType::Kitty);
+        assert!(!detection.kitty_forced);
+    }
+
+    #[test]
+    fn ratty_detection_enables_inline_media_worker() {
+        let detection = finalize_media_detection(ratatui_image::picker::Picker::halfblocks(), true);
+        assert!(kitty_media_enabled(detection.picker.protocol_type()));
+    }
 
     #[test]
     fn parses_default_interactive_shell() {
@@ -669,6 +865,30 @@ mod tests {
     }
 
     #[test]
+    fn durable_group_chats_use_group_transport() {
+        assert!(chat_uses_group_transport(
+            "group:550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(!chat_uses_group_transport("alice"));
+        assert!(!chat_uses_group_transport(
+            "temp-group:550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn only_direct_like_chats_use_the_direct_loader() {
+        assert!(requires_direct_chat_loader("alice"));
+        assert!(!requires_direct_chat_loader(
+            "group:550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(!requires_direct_chat_loader(
+            "temp-group:550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(group_wizard_invitable_chat("alice"));
+        assert!(!group_wizard_invitable_chat("Me"));
+    }
+
+    #[test]
     fn sidebar_visible_rows_keep_selected_chat_in_view() {
         let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
         state.app.replace_chats(
@@ -745,7 +965,31 @@ mod tests {
             composer_printable_char(FocusPane::Composer, KeyCode::Char('q')),
             Some('q')
         );
-        assert_eq!(composer_printable_char(FocusPane::Chats, KeyCode::Char('/')), None);
+        assert_eq!(
+            composer_printable_char(FocusPane::Chats, KeyCode::Char('/')),
+            None
+        );
+    }
+
+    #[test]
+    fn composer_live_action_errors_become_status_instead_of_fatal() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+
+        let result = handle_composer_live_action_result(
+            &mut state,
+            "voice call",
+            Err(anyhow!("peer is not currently connected")),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            state.app.last_error.as_deref(),
+            Some("peer is not currently connected")
+        );
+        assert_eq!(
+            state.app.status,
+            "voice call failed: peer is not currently connected"
+        );
     }
 
     #[test]
@@ -894,14 +1138,56 @@ mod tests {
         let normal = Theme::rchat();
 
         assert_eq!(app_background_theme(&state), normal);
-        assert_eq!(modal_overlay_theme(), normal);
+        assert_eq!(modal_overlay_theme(&state), normal);
 
         state.app.open_new_person();
         let dimmed = app_background_theme(&state);
 
         assert_ne!(dimmed, normal);
         assert_eq!(dimmed.bg, Color::Rgb(8, 10, 14));
-        assert_eq!(modal_overlay_theme(), normal);
+        assert_eq!(modal_overlay_theme(&state), normal);
+    }
+
+    #[test]
+    fn runtime_theme_changes_app_and_modal_theme_immediately() {
+        let mut state = UiState::new(ProtocolType::Kitty, TuiEventSink::channel(4).0);
+        state.theme = Theme {
+            bg: Color::Rgb(1, 2, 3),
+            surface: Color::Rgb(4, 5, 6),
+            accent: Color::Rgb(7, 8, 9),
+            warning: Color::Rgb(10, 11, 12),
+            text: Color::Rgb(13, 14, 15),
+            muted: Color::Rgb(16, 17, 18),
+            error: Color::Rgb(19, 20, 21),
+        };
+
+        assert_eq!(app_background_theme(&state), state.theme);
+        assert_eq!(modal_overlay_theme(&state), state.theme);
+    }
+
+    #[test]
+    fn core_theme_config_maps_to_tui_theme_colors() {
+        let mut config = storage::theme::ThemeConfig::default();
+        config.base.c950 = "#010203".to_string();
+        config.base.c900 = "#040506".to_string();
+        config.primary.c500 = "#070809".to_string();
+        config.warning.c400 = "#0a0b0c".to_string();
+        config.base.c100 = "#0d0e0f".to_string();
+        config.base.c400 = "#101112".to_string();
+        config.error.c400 = "#131415".to_string();
+
+        assert_eq!(
+            Theme::from_config(&config),
+            Theme {
+                bg: Color::Rgb(1, 2, 3),
+                surface: Color::Rgb(4, 5, 6),
+                accent: Color::Rgb(7, 8, 9),
+                warning: Color::Rgb(10, 11, 12),
+                text: Color::Rgb(13, 14, 15),
+                muted: Color::Rgb(16, 17, 18),
+                error: Color::Rgb(19, 20, 21),
+            }
+        );
     }
 
     #[test]
@@ -925,6 +1211,7 @@ mod tests {
             id: "group:550e8400-e29b-41d4-a716-446655440000".to_string(),
             name: "Design Crew".to_string(),
             is_group: true,
+            image_hash: None,
         };
         let latest_times = std::collections::HashMap::from([(item.id.clone(), 123)]);
         let unread_counts = std::collections::HashMap::from([(item.id.clone(), 2)]);
@@ -1261,6 +1548,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_group_management_palette_commands() {
+        assert_eq!(
+            parse_palette_command("group policy group:one on").unwrap(),
+            PaletteCommand::GroupPolicy {
+                group_id: "group:one".to_string(),
+                members_can_invite: true
+            }
+        );
+        assert_eq!(
+            parse_palette_command("group leave group:one confirm").unwrap(),
+            PaletteCommand::GroupLeave {
+                group_id: "group:one".to_string()
+            }
+        );
+        assert_eq!(
+            parse_palette_command("group admin group:one peer-2 confirm").unwrap(),
+            PaletteCommand::GroupAdminTransfer {
+                group_id: "group:one".to_string(),
+                peer_id: "peer-2".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_palette_command("archive tempdm:one").unwrap(),
+            PaletteCommand::ArchiveTemporary {
+                chat_id: "tempdm:one".to_string(),
+            }
+        );
+        assert!(parse_palette_command("group admin group:one peer-2").is_err());
+        assert_eq!(
+            parse_palette_command("group leave group:one").unwrap(),
+            PaletteCommand::GroupLeavePreview {
+                group_id: "group:one".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn incoming_group_invite_status_is_gui_first() {
         let event = rchat_core::events::GroupInviteReceivedEvent {
             invite_id: "invite-1".to_string(),
@@ -1297,6 +1621,27 @@ mod tests {
             screen_share_status_label(&state),
             Some("sharing screen with peer-1 | e end".to_string())
         );
+    }
+
+    #[test]
+    fn screen_share_panel_is_visible_only_for_active_receiver() {
+        let mut state = UiState::new(ProtocolType::Halfblocks, TuiEventSink::channel(1).0);
+        state.broadcast_state = BroadcastState {
+            phase: BroadcastPhase::Active,
+            session_id: Some("session-1".to_string()),
+            peer_id: Some("peer-1".to_string()),
+            started_at: Some(1_700_000_000),
+            ring_expires_at: None,
+            is_host: false,
+            reason: None,
+        };
+        assert!(should_render_screen_share_panel(&state));
+
+        state.broadcast_state.is_host = true;
+        assert!(!should_render_screen_share_panel(&state));
+        state.broadcast_state.phase = BroadcastPhase::Ending;
+        state.broadcast_state.is_host = false;
+        assert!(!should_render_screen_share_panel(&state));
     }
 
     #[test]
@@ -1623,10 +1968,13 @@ async fn run_interactive() -> Result<()> {
         return Ok(());
     }
 
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    let detection = detect_media_backends();
+    let ratty_bitmap_available = detection.ratty_bitmap;
+    let kitty_detection_forced = detection.kitty_forced;
+    let picker = detection.picker;
     let protocol_type = picker.protocol_type();
-    let kitty_available = protocol_type == ProtocolType::Kitty;
+    let kitty_available = kitty_media_enabled(protocol_type);
+    terminal.set_ratty_bitmap_active(ratty_bitmap_available);
     let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
     let inline_loader = kitty_available.then(|| InlineMediaLoader::spawn(app_state.clone()));
     let _output_redirect = OutputRedirect::redirect(&tui_log_path)?;
@@ -1636,13 +1984,17 @@ async fn run_interactive() -> Result<()> {
         .context("failed to start rchat-core network")?;
 
     let mut state = UiState::new(protocol_type, event_sink);
+    state.ratty_hosted = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
+    state.ratty_bitmap_available = ratty_bitmap_available;
+    state.kitty_detection_forced = kitty_detection_forced;
     state.app.session_phase = AppSessionPhase::Unlocked;
     state.app.app_ready = true;
     state.app.status = "network running".to_string();
     state.status = "logs redirected to tui.log".to_string();
+    refresh_runtime_theme(&app_state, &mut state).await?;
     refresh_direct_chats(&app_state, &network_state, &mut state).await?;
     if let Some(chat_id) = state.app.selected_chat_id().map(ToOwned::to_owned) {
-        open_direct_chat(&app_state, &network_state, &mut state, &chat_id).await?;
+        open_chat_list_item(&app_state, &network_state, &mut state, &chat_id).await?;
     }
     let mut pending_frames = LatestFrameSlot::<BroadcastFrameEvent>::default();
     let mut pending_remote_video_frames =
@@ -1650,8 +2002,13 @@ async fn run_interactive() -> Result<()> {
     let mut decoder = ScreenFrameDecoder::default();
     let mut remote_video_decoder = RemoteVideoFrameDecoder::default();
     let mut last_graphics_clear_generation = graphics_clear_generation(&state);
+    let mut ratty_bitmaps = RattyBitmapManager::default();
+    let mut pending_ratty_screen_frame = None;
+    let mut pending_ratty_remote_video_frame = None;
+    let mut last_ratty_viewer_destination = None;
 
     loop {
+        let mut bitmap_commands = Vec::new();
         let mut refresh_requested = false;
         let mut mark_read_chat_ids = Vec::new();
         drain_core_events(
@@ -1669,7 +2026,7 @@ async fn run_interactive() -> Result<()> {
             let active_chat_id = state.app.active_chat_id.clone();
             refresh_direct_chats(&app_state, &network_state, &mut state).await?;
             if let Some(chat_id) = active_chat_id {
-                let _ = open_direct_chat(&app_state, &network_state, &mut state, &chat_id).await;
+                let _ = open_chat_list_item(&app_state, &network_state, &mut state, &chat_id).await;
             }
         }
         for chat_id in mark_read_chat_ids {
@@ -1683,13 +2040,18 @@ async fn run_interactive() -> Result<()> {
         state.remote_video_decoder_errors = remote_video_decoder.decode_errors();
         state.remote_video_delta_drops = remote_video_decoder.dropped_delta_before_keyframe();
 
-        if let Some(worker) = protocol_worker.as_ref() {
+        if ratty_bitmap_available || protocol_worker.is_some() {
             if let Some(event) = pending_frames.take() {
                 if let Some(frame) = decoder.decode_event(&event) {
                     state.decoded_frames = state.decoded_frames.saturating_add(1);
-                    match ProtocolRequest::screen(frame, state.media_size) {
-                        Ok(request) => worker.request(request),
-                        Err(error) => state.media_error = Some(error.to_string()),
+                    if ratty_bitmap_available {
+                        state.last_protocol_seq = Some(frame.seq);
+                        pending_ratty_screen_frame = Some(frame);
+                    } else if let Some(worker) = protocol_worker.as_ref() {
+                        match ProtocolRequest::screen(frame, state.media_size) {
+                            Ok(request) => worker.request(request),
+                            Err(error) => state.media_error = Some(error.to_string()),
+                        }
                     }
                 }
             }
@@ -1697,9 +2059,13 @@ async fn run_interactive() -> Result<()> {
                 if let Some(frame) = remote_video_decoder.decode_event(&event) {
                     state.remote_video_decoded_frames =
                         state.remote_video_decoded_frames.saturating_add(1);
-                    match ProtocolRequest::remote_video(frame, state.remote_video_size) {
-                        Ok(request) => worker.request(request),
-                        Err(error) => state.remote_video_error = Some(error.to_string()),
+                    if ratty_bitmap_available {
+                        pending_ratty_remote_video_frame = Some(frame);
+                    } else if let Some(worker) = protocol_worker.as_ref() {
+                        match ProtocolRequest::remote_video(frame, state.remote_video_size) {
+                            Ok(request) => worker.request(request),
+                            Err(error) => state.remote_video_error = Some(error.to_string()),
+                        }
                     }
                 }
             }
@@ -1780,10 +2146,28 @@ async fn run_interactive() -> Result<()> {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    let viewer_key_started = std::time::Instant::now();
+                    let previous_view = ratty_viewer_snapshot(&state);
                     if handle_interactive_key(&app_state, &network_state, &mut state, key.code)
                         .await?
                     {
                         return Ok(());
+                    }
+                    let next_view = ratty_viewer_snapshot(&state);
+                    if ratty_bitmap_available && previous_view != next_view {
+                        let mut viewer_commands = Vec::new();
+                        reconcile_ratty_viewer(
+                            &mut state,
+                            &mut ratty_bitmaps,
+                            last_ratty_viewer_destination,
+                            &mut viewer_commands,
+                        );
+                        terminal.write_bitmap_commands(&viewer_commands)?;
+                        trace_ratty_viewer_latency(
+                            "immediate_flush",
+                            viewer_key_started,
+                            viewer_commands.len(),
+                        );
                     }
                 }
                 CrosstermEvent::Mouse(mouse) => {
@@ -1791,6 +2175,33 @@ async fn run_interactive() -> Result<()> {
                     handle_mouse_event(&app_state, &network_state, &mut state, mouse, size).await?;
                 }
                 _ => {}
+            }
+        }
+
+        if std::mem::take(&mut state.local_screen_test_requested) {
+            let result = run_local_screen_preview(
+                &mut terminal,
+                &mut ratty_bitmaps,
+                ScreenCaptureProfile::P720F15,
+                LocalScreenPath::Vp8,
+                None,
+                LocalScreenPreviewRuntime {
+                    protocol_type: state.protocol_type,
+                    ratty_hosted: state.ratty_hosted,
+                    ratty_bitmap_available,
+                    kitty_detection_forced,
+                    kitty_available,
+                    protocol_worker: protocol_worker.as_ref(),
+                },
+            )
+            .await;
+            pending_ratty_screen_frame = None;
+            match result {
+                Ok(()) => set_settings_status(&mut state, "local screen-share test stopped"),
+                Err(error) => set_settings_error(
+                    &mut state,
+                    format!("local screen-share test failed: {error}"),
+                ),
             }
         }
 
@@ -1813,6 +2224,7 @@ async fn run_interactive() -> Result<()> {
             last_graphics_clear_generation = graphics_clear_generation;
         }
 
+        let mut next_ratty_targets = RattyRenderTargets::default();
         terminal.draw(|frame| {
             render_app_shell(
                 frame,
@@ -1820,8 +2232,60 @@ async fn run_interactive() -> Result<()> {
                 inline_loader.as_ref(),
                 protocol_worker.as_ref(),
                 kitty_available,
+                ratty_bitmap_available,
+                &mut next_ratty_targets,
             )
         })?;
+        if ratty_bitmap_available {
+            if should_render_screen_share_panel(&state) {
+                match ratty_bitmaps.reconcile_pending_live_frame(
+                    LiveSurface::Screen,
+                    &mut pending_ratty_screen_frame,
+                    next_ratty_targets.screen,
+                ) {
+                    Ok(commands) => {
+                        bitmap_commands.extend(commands);
+                        state.media_error = None;
+                    }
+                    Err(error) => state.media_error = Some(error.to_string()),
+                }
+                bitmap_commands.extend(
+                    ratty_bitmaps
+                        .reconcile_live_placement(LiveSurface::Screen, next_ratty_targets.screen)?,
+                );
+            } else {
+                pending_ratty_screen_frame = None;
+                bitmap_commands.extend(ratty_bitmaps.clear_live(LiveSurface::Screen));
+            }
+            if should_render_remote_video_panel(&state) {
+                match ratty_bitmaps.reconcile_pending_live_frame(
+                    LiveSurface::RemoteVideo,
+                    &mut pending_ratty_remote_video_frame,
+                    next_ratty_targets.remote_video,
+                ) {
+                    Ok(commands) => {
+                        bitmap_commands.extend(commands);
+                        state.remote_video_error = None;
+                    }
+                    Err(error) => state.remote_video_error = Some(error.to_string()),
+                }
+                bitmap_commands.extend(ratty_bitmaps.reconcile_live_placement(
+                    LiveSurface::RemoteVideo,
+                    next_ratty_targets.remote_video,
+                )?);
+            } else {
+                pending_ratty_remote_video_frame = None;
+                bitmap_commands.extend(ratty_bitmaps.clear_live(LiveSurface::RemoteVideo));
+            }
+            reconcile_ratty_viewer(
+                &mut state,
+                &mut ratty_bitmaps,
+                next_ratty_targets.viewer,
+                &mut bitmap_commands,
+            );
+            terminal.write_bitmap_commands(&bitmap_commands)?;
+            last_ratty_viewer_destination = next_ratty_targets.viewer;
+        }
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 }
@@ -1832,38 +2296,53 @@ async fn run_media_smoke(fps: u32, seconds: u64) -> Result<()> {
     }
 
     let mut terminal = TerminalSession::enter()?;
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    let detection = detect_media_backends();
+    let ratty_bitmap_available = detection.ratty_bitmap;
+    let kitty_detection_forced = detection.kitty_forced;
+    let picker = detection.picker;
     let protocol_type = picker.protocol_type();
-    let kitty_available = protocol_type == ProtocolType::Kitty;
+    let kitty_available = kitty_media_enabled(protocol_type);
+    terminal.set_ratty_bitmap_active(ratty_bitmap_available);
     let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
     let mut state = UiState::new(protocol_type, TuiEventSink::channel(1).0);
+    state.ratty_hosted = std::env::var("RATTY_SESSION").ok().as_deref() == Some("1");
+    state.ratty_bitmap_available = ratty_bitmap_available;
+    state.kitty_detection_forced = kitty_detection_forced;
     state.status = "media smoke".to_string();
 
     let mut generator = SmokeFrameGenerator::new(SMOKE_WIDTH, SMOKE_HEIGHT);
     let frame_interval = Duration::from_millis(1_000 / u64::from(fps));
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut next_frame_at = std::time::Instant::now();
+    let mut ratty_bitmaps = RattyBitmapManager::default();
+    let mut pending_ratty_screen_frame = None;
 
     while std::time::Instant::now() < deadline {
-        if let Some(worker) = protocol_worker.as_ref() {
-            if std::time::Instant::now() >= next_frame_at {
-                worker.request(ProtocolRequest::screen(
-                    generator.next_frame(),
-                    state.media_size,
-                )?);
-                next_frame_at += frame_interval;
+        let mut bitmap_commands = Vec::new();
+        if std::time::Instant::now() >= next_frame_at {
+            let frame = generator.next_frame();
+            if ratty_bitmap_available {
+                state.decoded_frames = state.decoded_frames.saturating_add(1);
+                state.last_protocol_seq = Some(frame.seq);
+                pending_ratty_screen_frame = Some(frame);
+            } else if let Some(worker) = protocol_worker.as_ref() {
+                worker.request(ProtocolRequest::screen(frame, state.media_size)?);
             }
+            next_frame_at += frame_interval;
+        }
 
-            if let Some(response) = worker.try_recv_latest() {
-                match response {
-                    Ok(protocol) => {
-                        state.decoded_frames = state.decoded_frames.saturating_add(1);
-                        state.last_protocol_seq = screen_protocol_seq(&protocol);
-                        state.protocol = Some(protocol);
-                        state.media_error = None;
+        if let Some(worker) = protocol_worker.as_ref() {
+            if !ratty_bitmap_available {
+                if let Some(response) = worker.try_recv_latest() {
+                    match response {
+                        Ok(protocol) => {
+                            state.decoded_frames = state.decoded_frames.saturating_add(1);
+                            state.last_protocol_seq = screen_protocol_seq(&protocol);
+                            state.protocol = Some(protocol);
+                            state.media_error = None;
+                        }
+                        Err(error) => state.media_error = Some(error.message),
                     }
-                    Err(error) => state.media_error = Some(error.message),
                 }
             }
         }
@@ -1877,7 +2356,28 @@ async fn run_media_smoke(fps: u32, seconds: u64) -> Result<()> {
             }
         }
 
-        terminal.draw(|frame| render_media_shell(frame, &mut state, kitty_available))?;
+        let mut next_ratty_targets = RattyRenderTargets::default();
+        terminal.draw(|frame| {
+            render_media_shell(
+                frame,
+                &mut state,
+                kitty_available,
+                ratty_bitmap_available,
+                &mut next_ratty_targets,
+            )
+        })?;
+        if ratty_bitmap_available {
+            bitmap_commands.extend(ratty_bitmaps.reconcile_pending_live_frame(
+                LiveSurface::Screen,
+                &mut pending_ratty_screen_frame,
+                next_ratty_targets.screen,
+            )?);
+            bitmap_commands.extend(
+                ratty_bitmaps
+                    .reconcile_live_placement(LiveSurface::Screen, next_ratty_targets.screen)?,
+            );
+            terminal.write_bitmap_commands(&bitmap_commands)?;
+        }
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
@@ -1889,19 +2389,62 @@ async fn run_local_screen_smoke(
     path: LocalScreenPath,
     seconds: u64,
 ) -> Result<()> {
+    let mut terminal = TerminalSession::enter()?;
+    let detection = detect_media_backends();
+    let ratty_bitmap_available = detection.ratty_bitmap;
+    let kitty_detection_forced = detection.kitty_forced;
+    let picker = detection.picker;
+    let protocol_type = picker.protocol_type();
+    let kitty_available = kitty_media_enabled(protocol_type);
+    terminal.set_ratty_bitmap_active(ratty_bitmap_available);
+    let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
+    let mut ratty_bitmaps = RattyBitmapManager::default();
+
+    run_local_screen_preview(
+        &mut terminal,
+        &mut ratty_bitmaps,
+        profile,
+        path,
+        Some(Duration::from_secs(seconds)),
+        LocalScreenPreviewRuntime {
+            protocol_type,
+            ratty_hosted: std::env::var("RATTY_SESSION").ok().as_deref() == Some("1"),
+            ratty_bitmap_available,
+            kitty_detection_forced,
+            kitty_available,
+            protocol_worker: protocol_worker.as_ref(),
+        },
+    )
+    .await
+}
+
+struct LocalScreenPreviewRuntime<'a> {
+    protocol_type: ProtocolType,
+    ratty_hosted: bool,
+    ratty_bitmap_available: bool,
+    kitty_detection_forced: bool,
+    kitty_available: bool,
+    protocol_worker: Option<&'a ProtocolWorker>,
+}
+
+async fn run_local_screen_preview(
+    terminal: &mut TerminalSession,
+    ratty_bitmaps: &mut RattyBitmapManager,
+    profile: ScreenCaptureProfile,
+    path: LocalScreenPath,
+    duration: Option<Duration>,
+    runtime: LocalScreenPreviewRuntime<'_>,
+) -> Result<()> {
     let config = ScreenCaptureConfig::primary_display_for_profile(profile);
     let mut capture_session = ScreenCaptureSession::start(config)
         .await
         .context("failed to start local screen capture")?;
     let capture_info = capture_session.info().clone();
 
-    let mut terminal = TerminalSession::enter()?;
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
-    let protocol_type = picker.protocol_type();
-    let kitty_available = protocol_type == ProtocolType::Kitty;
-    let protocol_worker = kitty_available.then(|| ProtocolWorker::spawn(picker));
-    let mut state = UiState::new(protocol_type, TuiEventSink::channel(1).0);
+    let mut state = UiState::new(runtime.protocol_type, TuiEventSink::channel(1).0);
+    state.ratty_hosted = runtime.ratty_hosted;
+    state.ratty_bitmap_available = runtime.ratty_bitmap_available;
+    state.kitty_detection_forced = runtime.kitty_detection_forced;
     state.status = format!("local screen smoke {} {}", profile.label(), path.label());
     state.active_session_id = Some(format!(
         "{} {}x{}@{}",
@@ -1927,12 +2470,17 @@ async fn run_local_screen_smoke(
         .transpose()
         .map_err(|error| anyhow!("failed to start local VP8 decoder: {error}"))?;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    let deadline = duration.map(|duration| std::time::Instant::now() + duration);
     let mut next_seq = 0_u32;
     let mut encoded_frames = 0_u64;
+    let mut pending_ratty_screen_frame = None;
 
-    while std::time::Instant::now() < deadline {
-        if let Some(worker) = protocol_worker.as_ref() {
+    while deadline
+        .map(|deadline| std::time::Instant::now() < deadline)
+        .unwrap_or(true)
+    {
+        let mut bitmap_commands = Vec::new();
+        if runtime.ratty_bitmap_available || runtime.protocol_worker.is_some() {
             if let Some(frame) = capture_session.try_recv_latest_i420() {
                 state.received_frames = state.received_frames.saturating_add(1);
                 match local_screen_frame_to_rgba(
@@ -1946,7 +2494,12 @@ async fn run_local_screen_smoke(
                     Ok(Some((frame, encoded_count))) => {
                         encoded_frames = encoded_frames.saturating_add(encoded_count);
                         state.decoded_frames = state.decoded_frames.saturating_add(1);
-                        worker.request(ProtocolRequest::screen(frame, state.media_size)?);
+                        if runtime.ratty_bitmap_available {
+                            state.last_protocol_seq = Some(frame.seq);
+                            pending_ratty_screen_frame = Some(frame);
+                        } else if let Some(worker) = runtime.protocol_worker {
+                            worker.request(ProtocolRequest::screen(frame, state.media_size)?);
+                        }
                         next_seq = next_seq.wrapping_add(1);
                     }
                     Ok(None) => {}
@@ -1957,14 +2510,18 @@ async fn run_local_screen_smoke(
                 }
             }
 
-            if let Some(response) = worker.try_recv_latest() {
-                match response {
-                    Ok(protocol) => {
-                        state.last_protocol_seq = screen_protocol_seq(&protocol);
-                        state.protocol = Some(protocol);
-                        state.media_error = None;
+            if !runtime.ratty_bitmap_available {
+                if let Some(worker) = runtime.protocol_worker {
+                    if let Some(response) = worker.try_recv_latest() {
+                        match response {
+                            Ok(protocol) => {
+                                state.last_protocol_seq = screen_protocol_seq(&protocol);
+                                state.protocol = Some(protocol);
+                                state.media_error = None;
+                            }
+                            Err(error) => state.media_error = Some(error.message),
+                        }
                     }
-                    Err(error) => state.media_error = Some(error.message),
                 }
             }
         }
@@ -1976,15 +2533,44 @@ async fn run_local_screen_smoke(
             let CrosstermEvent::Key(key) = event::read()? else {
                 continue;
             };
-            if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+            if key.kind == KeyEventKind::Press
+                && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            {
+                let cleanup = ratty_bitmaps.clear_live(LiveSurface::Screen);
+                terminal.write_bitmap_commands(&cleanup)?;
+                terminal.clear()?;
                 return Ok(());
             }
         }
 
-        terminal.draw(|frame| render_media_shell(frame, &mut state, kitty_available))?;
+        let mut next_ratty_targets = RattyRenderTargets::default();
+        terminal.draw(|frame| {
+            render_media_shell(
+                frame,
+                &mut state,
+                runtime.kitty_available,
+                runtime.ratty_bitmap_available,
+                &mut next_ratty_targets,
+            )
+        })?;
+        if runtime.ratty_bitmap_available {
+            bitmap_commands.extend(ratty_bitmaps.reconcile_pending_live_frame(
+                LiveSurface::Screen,
+                &mut pending_ratty_screen_frame,
+                next_ratty_targets.screen,
+            )?);
+            bitmap_commands.extend(
+                ratty_bitmaps
+                    .reconcile_live_placement(LiveSurface::Screen, next_ratty_targets.screen)?,
+            );
+            terminal.write_bitmap_commands(&bitmap_commands)?;
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
+    let cleanup = ratty_bitmaps.clear_live(LiveSurface::Screen);
+    terminal.write_bitmap_commands(&cleanup)?;
+    terminal.clear()?;
     Ok(())
 }
 
@@ -2336,16 +2922,36 @@ async fn open_chat_list_item(
     if chat_kind::is_temp_group_chat_id(chat_id) {
         return open_direct_chat(app_state, network_state, state, chat_id).await;
     }
-    if is_group_chat_list_item(chat_id) {
-        state.app.active_chat_id = Some(chat_id.to_string());
-        state.app.messages.clear();
-        state.app.history_scroll_offset = 0;
-        state.app.status = "durable group chat history is not implemented in rchat-tui yet"
-            .to_string();
-        return Ok(());
+    if chat_uses_group_transport(chat_id) {
+        return open_group_chat(app_state, network_state, state, chat_id).await;
     }
 
     open_direct_chat(app_state, network_state, state, chat_id).await
+}
+
+async fn open_group_chat(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    chat_id: &str,
+) -> Result<()> {
+    let history = {
+        let conn = app_state
+            .db_conn
+            .lock()
+            .map_err(|error| anyhow!("database lock failed: {error}"))?;
+        storage::db::get_messages(&conn, chat_id)?
+    };
+    state.app.select_chat_with_history(chat_id, history);
+    let marked = {
+        let conn = app_state
+            .db_conn
+            .lock()
+            .map_err(|error| anyhow!("database lock failed: {error}"))?;
+        storage::db::mark_group_messages_read(&conn, chat_id)?
+    };
+    group::mark_read(app_state, network_state, chat_id.to_string(), marked).await?;
+    Ok(())
 }
 
 async fn open_chat_details(
@@ -2355,6 +2961,61 @@ async fn open_chat_details(
     chat_id: &str,
 ) -> Result<()> {
     let chat_id = db_chat_id(chat_id);
+    if chat_uses_group_transport(&chat_id) {
+        let policy = group::get_group_policy(app_state, &chat_id)?;
+        let is_admin = group::is_local_group_admin(app_state, &chat_id).await?;
+        let roster = group::get_group_roster(app_state, &chat_id)?
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "{}  {} ({})",
+                    row.display_name, row.role, row.membership_state
+                )
+            })
+            .collect::<Vec<_>>();
+        let message_id = state.app.selected_message_id.as_deref().unwrap_or_default();
+        let receipts = if message_id.is_empty() {
+            Vec::new()
+        } else {
+            group::get_group_message_receipts(app_state, &chat_id, message_id)?
+                .into_iter()
+                .map(|row| format!("{}: {}", row.display_name, row.status))
+                .collect()
+        };
+        let pending = group::get_group_pending_record_summary(app_state, &chat_id)?;
+        let image_hash = group::get_group_image_hash(app_state, &chat_id)?;
+        let name = state
+            .app
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.name.clone())
+            .unwrap_or_else(|| chat_id.clone());
+        state.app.chat_details = Some(TuiChatDetails {
+            chat_id: chat_id.clone(),
+            peer_id: policy.admin_peer_id.clone(),
+            peer_name: name,
+            peer_alias: None,
+            avatar_url: None,
+            connected: true,
+            remote_addr: None,
+            reconnect_count: 0,
+            sent_total: 0,
+            received_total: 0,
+            recent_files: Vec::new(),
+            group: Some(TuiGroupDetails {
+                image_hash,
+                is_admin,
+                members_can_invite: policy.settings.members_can_invite,
+                roster,
+                receipts,
+                pending_count: pending.count,
+                sync_status: state.app.group_sync_status.get(&chat_id).cloned(),
+            }),
+        });
+        state.app.status = "group details".to_string();
+        return Ok(());
+    }
     let overview = details::overview(app_state, network_state, &chat_id).await?;
     let stats = details::stats(app_state, &chat_id)?;
     let recent_files = details::files(app_state, &chat_id, Some("all"), Some(8), Some(0))?
@@ -2374,6 +3035,7 @@ async fn open_chat_details(
         sent_total: stats.sent_total,
         received_total: stats.received_total,
         recent_files,
+        group: None,
     });
     state.app.status = "chat details".to_string();
     Ok(())
@@ -2393,6 +3055,19 @@ async fn send_composer(
             network_state,
             &draft.chat_id,
             &draft.text,
+        )
+        .await
+    } else if chat_uses_group_transport(&draft.chat_id) {
+        let alias = {
+            let manager = app_state.config_manager.lock().await;
+            manager.load().await?.user.profile.alias
+        };
+        group::send_group_text(
+            app_state,
+            network_state,
+            draft.chat_id.clone(),
+            draft.text.clone(),
+            alias,
         )
         .await
     } else {
@@ -2437,7 +3112,7 @@ async fn send_attachment_from_path(
     let result =
         chat_media::send_file_from_path(app_state, network_state, &chat_id, kind, path).await?;
     refresh_direct_chats(app_state, network_state, state).await?;
-    open_direct_chat(app_state, network_state, state, &chat_id).await?;
+    open_chat_list_item(app_state, network_state, state, &chat_id).await?;
     state.app.selected_attachment_message_id = Some(result.msg_id);
     state.app.status = format!("sent {}", attachment_kind_label(kind));
     Ok(())
@@ -2456,7 +3131,7 @@ async fn send_sticker_hash(
     let chat_id = active_chat_id(state)?;
     let result = chat_media::send_sticker(app_state, network_state, &chat_id, file_hash).await?;
     refresh_direct_chats(app_state, network_state, state).await?;
-    open_direct_chat(app_state, network_state, state, &chat_id).await?;
+    open_chat_list_item(app_state, network_state, state, &chat_id).await?;
     state.app.selected_attachment_message_id = Some(result.msg_id);
     state.app.status = "sticker sent".to_string();
     Ok(())
@@ -2783,6 +3458,30 @@ async fn handle_new_person_key(
     Ok(())
 }
 
+async fn publish_new_person_invite_once(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let Some((invitee, password, published)) = state.app.new_person.as_ref().map(|modal| {
+        (
+            modal.invitee_username.trim().to_string(),
+            modal.create_invite_password.clone(),
+            modal.create_invite_published,
+        )
+    }) else {
+        return Ok(());
+    };
+    if published {
+        return Ok(());
+    }
+    direct::create_github_invite(app_state, network_state, &invitee, &password).await?;
+    if let Some(modal) = state.app.new_person.as_mut() {
+        modal.create_invite_published = true;
+    }
+    Ok(())
+}
+
 async fn activate_new_person_focus(
     app_state: &AppState,
     network_state: &NetworkState,
@@ -2844,22 +3543,66 @@ async fn activate_new_person_focus(
             }
             if let Some(modal) = state.app.new_person.as_mut() {
                 modal.create_invite_password = direct::generate_invite_password();
+                modal.create_invite_published = false;
                 modal.qr_payload = Some(modal.create_invite_password.clone());
             }
             set_new_person_step(network_state, state, NewPersonStep::CreateInviteCode).await?;
         }
         NewPersonField::CreateInviteConfirm => {
-            let Some((invitee, password)) = state.app.new_person.as_ref().map(|modal| {
-                (
-                    modal.invitee_username.trim().to_string(),
-                    modal.create_invite_password.clone(),
-                )
-            }) else {
-                return Ok(());
-            };
-            direct::create_github_invite(app_state, network_state, &invitee, &password).await?;
+            let invitee = state
+                .app
+                .new_person
+                .as_ref()
+                .map(|modal| modal.invitee_username.trim().to_string())
+                .unwrap_or_default();
+            publish_new_person_invite_once(app_state, network_state, state).await?;
             state.app.status = format!("invite published for {invitee}");
             close_new_person_modal(network_state, state).await?;
+        }
+        NewPersonField::EmailInvite => {
+            if let Err(error) =
+                publish_new_person_invite_once(app_state, network_state, state).await
+            {
+                set_new_person_error(state, format!("failed to publish invitation: {error}"));
+                return Ok(());
+            }
+            let (invitee, password) = state
+                .app
+                .new_person
+                .as_ref()
+                .map(|modal| {
+                    (
+                        modal.invitee_username.trim().to_string(),
+                        modal.create_invite_password.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            let inviter_result: Result<String> = async {
+                let manager = app_state.config_manager.lock().await;
+                manager
+                    .load()
+                    .await?
+                    .system
+                    .github_username
+                    .ok_or_else(|| anyhow!("GitHub username not set"))
+            }
+            .await;
+            let inviter = match inviter_result {
+                Ok(inviter) => inviter,
+                Err(error) => {
+                    set_new_person_error(
+                        state,
+                        format!("invitation published, but the email draft could not be built: {error}. Copy the password instead."),
+                    );
+                    return Ok(());
+                }
+            };
+            let draft = direct::build_invite_email_draft(&inviter, &invitee, &password);
+            if let Err(error) = open::that(&draft.mailto_uri) {
+                set_new_person_error(state, format!("invitation published, but the email application could not be opened: {error}. Copy the password instead."));
+                return Ok(());
+            }
+            state.app.status = "invitation published; email draft opened".to_string();
         }
         NewPersonField::AcceptInviteNext => {
             let inviter = state
@@ -3110,7 +3853,9 @@ fn pick_attachment_file(kind: MediaKind) -> Option<PathBuf> {
         MediaKind::Audio => dialog.add_filter("Audio", &["mp3", "wav", "ogg", "flac", "m4a"]),
         MediaKind::Document => dialog.add_filter(
             "Documents",
-            &["pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx"],
+            &[
+                "pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+            ],
         ),
     };
     dialog.pick_file()
@@ -3128,7 +3873,10 @@ fn refresh_attachment_picker_entries(modal: &mut crate::state::AttachmentModalSt
     modal.set_picker_entries(entries);
 }
 
-fn list_attachment_picker_entries(root: &Path, kind: MediaKind) -> Result<Vec<AttachmentFileEntry>> {
+fn list_attachment_picker_entries(
+    root: &Path,
+    kind: MediaKind,
+) -> Result<Vec<AttachmentFileEntry>> {
     let mut entries = Vec::new();
     if let Some(parent) = root.parent() {
         entries.push(AttachmentFileEntry {
@@ -3310,7 +4058,7 @@ async fn handle_context_menu_key(
         .app
         .context_menu
         .as_ref()
-        .map(context_menu_actions)
+        .map(|menu| context_menu_actions(menu, state))
         .map(|actions| actions.len())
         .unwrap_or_default();
     match code {
@@ -3346,14 +4094,21 @@ fn open_context_menu_for_focus(state: &mut UiState) {
     }
 }
 
-fn context_menu_actions(menu: &ContextMenuState) -> Vec<ContextMenuAction> {
+fn context_menu_actions(menu: &ContextMenuState, state: &UiState) -> Vec<ContextMenuAction> {
     match &menu.target {
-        ContextMenuTarget::Chat(_) => vec![
-            ContextMenuAction::Open,
-            ContextMenuAction::Details,
-            ContextMenuAction::MoveToRoot,
-            ContextMenuAction::Close,
-        ],
+        ContextMenuTarget::Chat(index) => {
+            let mut actions = vec![ContextMenuAction::Open, ContextMenuAction::Details];
+            if state
+                .app
+                .chats
+                .get(*index)
+                .is_some_and(|chat| chat_kind::is_temporary_chat_id(&chat.id))
+            {
+                actions.push(ContextMenuAction::Archive);
+            }
+            actions.extend([ContextMenuAction::MoveToRoot, ContextMenuAction::Close]);
+            actions
+        }
         ContextMenuTarget::Envelope(_) => {
             vec![ContextMenuAction::DeleteEnvelope, ContextMenuAction::Close]
         }
@@ -3368,6 +4123,7 @@ fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
     match action {
         ContextMenuAction::Open => "Open",
         ContextMenuAction::Details => "Details",
+        ContextMenuAction::Archive => "Save to archive",
         ContextMenuAction::MoveToRoot => "Remove from envelope",
         ContextMenuAction::DeleteEnvelope => "Delete envelope",
         ContextMenuAction::AttachmentActions => "Message actions",
@@ -3383,7 +4139,7 @@ async fn activate_context_menu_action(
     let Some(menu) = state.app.context_menu.clone() else {
         return Ok(());
     };
-    let actions = context_menu_actions(&menu);
+    let actions = context_menu_actions(&menu, state);
     let action = actions
         .get(menu.selected_index)
         .copied()
@@ -3399,6 +4155,19 @@ async fn activate_context_menu_action(
         (ContextMenuTarget::Chat(index), ContextMenuAction::Details) => {
             if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
                 open_chat_details(app_state, network_state, state, &chat_id).await?;
+            }
+        }
+        (ContextMenuTarget::Chat(index), ContextMenuAction::Archive) => {
+            if let Some(chat_id) = state.app.chats.get(index).map(|chat| chat.id.clone()) {
+                let archived = rchat_core::chat::temporary::archive_temporary_chat(
+                    app_state,
+                    network_state,
+                    &chat_id,
+                )
+                .await?;
+                refresh_direct_chats(app_state, network_state, state).await?;
+                open_direct_chat(app_state, network_state, state, &archived.chat_id).await?;
+                state.app.status = format!("archived {}", archived.name);
             }
         }
         (ContextMenuTarget::Chat(index), ContextMenuAction::MoveToRoot) => {
@@ -3628,7 +4397,8 @@ async fn activate_attachment_action(
             state.app.attachment_actions = None;
         }
         AttachmentActionField::SaveSticker => {
-            let result = settings_stickers::save_sticker_from_message(app_state, &snapshot.file_hash)?;
+            let result =
+                settings_stickers::save_sticker_from_message(app_state, &snapshot.file_hash)?;
             if let Some(modal) = state.app.attachment_actions.as_mut() {
                 modal.sticker_saved = true;
                 modal.status = Some(if result.already_exists {
@@ -3660,12 +4430,10 @@ fn open_attachment_actions_for_selected(app_state: &AppState, state: &mut UiStat
     } else {
         false
     };
-    let Some(modal) =
-        crate::state::AttachmentActionModalState::from_message_with_sticker_saved(
-            &message,
-            sticker_saved,
-        )
-    else {
+    let Some(modal) = crate::state::AttachmentActionModalState::from_message_with_sticker_saved(
+        &message,
+        sticker_saved,
+    ) else {
         state.app.last_error = Some("selected message has no attachment".to_string());
         return Ok(());
     };
@@ -3736,7 +4504,14 @@ fn open_attachment_modal(state: &mut UiState) {
     state.app.status = "attachment picker".to_string();
 }
 
+async fn refresh_runtime_theme(app_state: &AppState, state: &mut UiState) -> Result<()> {
+    let theme = settings_theme::get_theme(app_state).await?;
+    state.theme = Theme::from_config(&theme);
+    Ok(())
+}
+
 async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Result<()> {
+    refresh_runtime_theme(app_state, state).await?;
     let profile = settings_profile::get_user_profile(app_state).await?;
     let trusted_peers = settings_peers::get_trusted_peers(app_state)?;
     let friends = settings_peers::get_friends(app_state)
@@ -3928,12 +4703,21 @@ async fn activate_settings_focus(
             set_settings_status(state, "connectivity saved");
         }
         SettingsField::ThemePreset(index) => {
+            let Some((key, name)) = state.app.settings.as_ref().and_then(|modal| {
+                modal
+                    .theme_presets
+                    .get(index)
+                    .map(|preset| (preset.key.clone(), preset.name.clone()))
+            }) else {
+                return Ok(());
+            };
+            let theme = settings_theme::apply_preset(app_state, &key).await?;
+            state.theme = Theme::from_config(&theme);
+            refresh_settings_modal(app_state, state).await?;
             if let Some(modal) = state.app.settings.as_mut() {
-                if let Some(preset) = modal.theme_presets.get(index) {
-                    modal.selected_preset = Some(preset.key.clone());
-                    modal.status = Some(format!("selected {}", preset.name));
-                    modal.error = None;
-                }
+                modal.selected_preset = Some(key);
+                modal.status = Some(format!("theme applied: {name}"));
+                modal.error = None;
             }
         }
         SettingsField::ThemeApply => {
@@ -3943,7 +4727,8 @@ async fn activate_settings_focus(
                 .as_ref()
                 .and_then(|modal| modal.focused_theme_preset_key().map(ToOwned::to_owned))
                 .ok_or_else(|| anyhow!("no theme preset selected"))?;
-            settings_theme::apply_preset(app_state, &key).await?;
+            let theme = settings_theme::apply_preset(app_state, &key).await?;
+            state.theme = Theme::from_config(&theme);
             refresh_settings_modal(app_state, state).await?;
             set_settings_status(state, "theme applied");
         }
@@ -3963,7 +4748,8 @@ async fn activate_settings_focus(
                 return Ok(());
             }
             let theme = settings_theme::generate_simple_theme(&primary, &secondary, &text)?;
-            settings_theme::create_custom_theme(app_state, name, None, theme).await?;
+            settings_theme::create_custom_theme(app_state, name, None, theme.clone()).await?;
+            state.theme = Theme::from_config(&theme);
             refresh_settings_modal(app_state, state).await?;
             set_settings_status(state, "custom theme created");
         }
@@ -4067,6 +4853,10 @@ async fn activate_settings_focus(
                 },
             );
         }
+        SettingsField::ScreenShareTest => {
+            state.local_screen_test_requested = true;
+            set_settings_status(state, "starting local VP8 screen-share test");
+        }
         SettingsField::ProfileAlias
         | SettingsField::ProfileAvatar
         | SettingsField::Peer(_)
@@ -4100,6 +4890,176 @@ fn set_settings_error(state: &mut UiState, message: impl Into<String>) {
         modal.error = Some(message.into());
         modal.status = None;
     }
+}
+
+fn handle_new_item_choice_key(state: &mut UiState, code: KeyCode) {
+    match code {
+        KeyCode::Esc => state.app.new_item_choice = None,
+        KeyCode::Up | KeyCode::Down => {
+            if let Some(choice) = state.app.new_item_choice.as_mut() {
+                *choice = match choice {
+                    NewItemChoice::Person => NewItemChoice::Group,
+                    NewItemChoice::Group => NewItemChoice::Person,
+                };
+            }
+        }
+        KeyCode::Enter => match state.app.new_item_choice {
+            Some(NewItemChoice::Person) => state.app.open_new_person(),
+            Some(NewItemChoice::Group) => state.app.open_new_group(),
+            None => {}
+        },
+        _ => {}
+    }
+}
+
+async fn handle_new_group_key(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    code: KeyCode,
+) -> Result<()> {
+    let peer_count = state
+        .app
+        .chats
+        .iter()
+        .filter(|chat| group_wizard_invitable_chat(&chat.id))
+        .count();
+    match code {
+        KeyCode::Esc => {
+            if let Some(modal) = state.app.new_group.as_mut() {
+                if modal.step == NewGroupStep::InvitePeople {
+                    modal.step = NewGroupStep::Settings;
+                    modal.selected_index = 0;
+                } else {
+                    state.app.new_group = None;
+                }
+            }
+        }
+        KeyCode::Up => {
+            if let Some(modal) = state.app.new_group.as_mut() {
+                modal.move_focus(-1, peer_count);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(modal) = state.app.new_group.as_mut() {
+                modal.move_focus(1, peer_count);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(modal) = state.app.new_group.as_mut() {
+                modal.pop_char();
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some(modal) = state.app.new_group.as_mut() {
+                modal.push_char(ch);
+            }
+        }
+        KeyCode::Enter => activate_new_group_focus(app_state, network_state, state).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn activate_new_group_focus(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let Some((step, index)) = state
+        .app
+        .new_group
+        .as_ref()
+        .map(|modal| (modal.step, modal.selected_index))
+    else {
+        return Ok(());
+    };
+    match step {
+        NewGroupStep::Settings => match index {
+            1 => {
+                if let Some(path) = FileDialog::new().pick_file() {
+                    if let Some(modal) = state.app.new_group.as_mut() {
+                        modal.image_path = path.display().to_string();
+                    }
+                }
+            }
+            2 => {
+                if let Some(modal) = state.app.new_group.as_mut() {
+                    modal.members_can_invite = !modal.members_can_invite;
+                }
+            }
+            3 => {
+                let valid = state
+                    .app
+                    .new_group
+                    .as_ref()
+                    .is_some_and(|modal| !modal.name.trim().is_empty());
+                if !valid {
+                    if let Some(modal) = state.app.new_group.as_mut() {
+                        modal.error = Some("Group name is required".to_string());
+                    }
+                } else if let Some(modal) = state.app.new_group.as_mut() {
+                    modal.step = NewGroupStep::InvitePeople;
+                    modal.selected_index = 0;
+                    modal.error = None;
+                }
+            }
+            _ => {}
+        },
+        NewGroupStep::InvitePeople => {
+            let peers = state
+                .app
+                .chats
+                .iter()
+                .filter(|chat| group_wizard_invitable_chat(&chat.id))
+                .map(|chat| chat.id.clone())
+                .collect::<Vec<_>>();
+            if index < peers.len() {
+                if let Some(modal) = state.app.new_group.as_mut() {
+                    if !modal.selected_peer_ids.insert(peers[index].clone()) {
+                        modal.selected_peer_ids.remove(&peers[index]);
+                    }
+                }
+            } else if index == peers.len() {
+                if let Some(modal) = state.app.new_group.as_mut() {
+                    modal.return_from_new_person = true;
+                }
+                state.app.new_person = Some(Default::default());
+            } else {
+                create_new_group(app_state, network_state, state).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn create_new_group(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+) -> Result<()> {
+    let Some(modal) = state.app.new_group.as_ref() else {
+        return Ok(());
+    };
+    let options = group::CreateGroupOptions {
+        name: Some(modal.name.trim().to_string()),
+        image_path: (!modal.image_path.trim().is_empty())
+            .then(|| modal.image_path.trim().to_string()),
+        settings: Some(rchat_core::network::gossip::GroupSettings {
+            members_can_invite: modal.members_can_invite,
+        }),
+        require_name: true,
+    };
+    let invitees = modal.selected_peer_ids.iter().cloned().collect::<Vec<_>>();
+    let created = group::create_group_with_options(app_state, Some(network_state), options).await?;
+    for peer_id in invitees {
+        group::invite_member(app_state, network_state, created.chat_id.clone(), peer_id).await?;
+    }
+    refresh_direct_chats(app_state, network_state, state).await?;
+    state.app.new_group = None;
+    open_group_chat(app_state, network_state, state, &created.chat_id).await?;
+    state.app.status = format!("created group {}", created.name);
+    Ok(())
 }
 
 async fn handle_interactive_key(
@@ -4163,6 +5123,21 @@ async fn handle_interactive_key(
         return Ok(false);
     }
 
+    if state.app.new_item_choice.is_some() {
+        handle_new_item_choice_key(state, code);
+        return Ok(false);
+    }
+
+    if state.app.new_group.is_some() {
+        if let Err(error) = handle_new_group_key(app_state, network_state, state, code).await {
+            if let Some(modal) = state.app.new_group.as_mut() {
+                modal.error = Some(error.to_string());
+            }
+            state.app.status = "group creation failed".to_string();
+        }
+        return Ok(false);
+    }
+
     if state.app.context_menu.is_some() {
         handle_context_menu_key(app_state, network_state, state, code).await?;
         return Ok(false);
@@ -4198,7 +5173,10 @@ async fn handle_interactive_key(
             KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Tab => {}
             _ => {}
         }
-        if !matches!(code, KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Tab) {
+        if !matches!(
+            code,
+            KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Tab
+        ) {
             return Ok(false);
         }
     }
@@ -4223,16 +5201,14 @@ async fn handle_interactive_key(
         }
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Char('n') => {
-            state.app.open_new_person();
+            state.app.open_new_item_choice();
         }
         KeyCode::Char('s') => {
             if let Err(error) = open_settings_modal(app_state, state).await {
                 state.app.last_error = Some(error.to_string());
             }
         }
-        KeyCode::Char('m')
-            if matches!(state.app.focus, FocusPane::Chats | FocusPane::History) =>
-        {
+        KeyCode::Char('m') if matches!(state.app.focus, FocusPane::Chats | FocusPane::History) => {
             open_context_menu_for_focus(state);
         }
         KeyCode::Char('/') if state.app.focus != FocusPane::Composer => {
@@ -4331,9 +5307,18 @@ async fn activate_composer_action(
             open_sticker_picker(app_state, state)?;
             Ok(())
         }
-        ComposerAction::Voice => toggle_voice_call(network_state, state).await,
-        ComposerAction::Video => toggle_video_call(network_state, state).await,
-        ComposerAction::Screen => toggle_screen_share(network_state, state).await,
+        ComposerAction::Voice => {
+            let result = toggle_voice_call(network_state, state).await;
+            handle_composer_live_action_result(state, "voice call", result)
+        }
+        ComposerAction::Video => {
+            let result = toggle_video_call(network_state, state).await;
+            handle_composer_live_action_result(state, "video call", result)
+        }
+        ComposerAction::Screen => {
+            let result = toggle_screen_share(network_state, state).await;
+            handle_composer_live_action_result(state, "screen share", result)
+        }
         ComposerAction::Details => {
             let chat_id = state
                 .app
@@ -4342,6 +5327,22 @@ async fn activate_composer_action(
                 .or_else(|| state.app.selected_chat_id().map(ToOwned::to_owned))
                 .ok_or_else(|| anyhow!("select a chat first"))?;
             open_chat_details(app_state, network_state, state, &chat_id).await
+        }
+    }
+}
+
+fn handle_composer_live_action_result(
+    state: &mut UiState,
+    action_label: &str,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            state.app.last_error = Some(message.clone());
+            state.app.status = format!("{action_label} failed: {message}");
+            Ok(())
         }
     }
 }
@@ -4489,7 +5490,10 @@ async fn handle_mouse_event(
     }
 
     if state.app.context_menu.is_some() {
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left | MouseButton::Right)) {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+        ) {
             state.app.context_menu = None;
         }
         return Ok(());
@@ -4566,8 +5570,9 @@ async fn handle_mouse_event(
             } else if rect_contains(layout.chat_history, mouse.column, mouse.row) {
                 state.app.focus = FocusPane::History;
                 if let Some(message_id) = state.app.selected_message_id.clone() {
-                    state.app.context_menu =
-                        Some(ContextMenuState::new(ContextMenuTarget::Message(message_id)));
+                    state.app.context_menu = Some(ContextMenuState::new(
+                        ContextMenuTarget::Message(message_id),
+                    ));
                 }
             }
         }
@@ -4689,7 +5694,8 @@ fn new_person_click_target(
             _ => None,
         },
         NewPersonStep::CreateInviteCode => match line {
-            8 => Some(NewPersonField::CreateInviteConfirm),
+            8 => Some(NewPersonField::EmailInvite),
+            9 => Some(NewPersonField::CreateInviteConfirm),
             _ => None,
         },
         NewPersonStep::AcceptInviteUser => match line {
@@ -4879,6 +5885,38 @@ enum PaletteCommand {
     GroupInviteReject {
         invite_id: String,
     },
+    GroupRename {
+        group_id: String,
+        name: String,
+    },
+    GroupPolicy {
+        group_id: String,
+        members_can_invite: bool,
+    },
+    GroupMemberInvite {
+        group_id: String,
+        peer_id: String,
+    },
+    GroupMemberRemove {
+        group_id: String,
+        peer_id: String,
+    },
+    GroupAdminTransfer {
+        group_id: String,
+        peer_id: String,
+    },
+    GroupSync {
+        group_id: String,
+    },
+    GroupLeave {
+        group_id: String,
+    },
+    GroupLeavePreview {
+        group_id: String,
+    },
+    ArchiveTemporary {
+        chat_id: String,
+    },
     Help,
 }
 
@@ -5010,6 +6048,12 @@ fn parse_palette_command(input: &str) -> std::result::Result<PaletteCommand, Str
         "video" => parse_video_palette_command(parts.collect()),
         "screen" | "screen-share" | "share" => parse_screen_share_palette_command(parts.collect()),
         "group-invite" | "group-inv" => parse_group_invite_palette_command(parts.collect()),
+        "group" => parse_group_palette_command(parts.collect()),
+        "archive" => {
+            let chat_id = joined_arg(&parts.collect::<Vec<_>>())
+                .ok_or_else(|| "usage: archive <temporary-chat-id>".to_string())?;
+            Ok(PaletteCommand::ArchiveTemporary { chat_id })
+        }
         "help" | "?" => Ok(PaletteCommand::Help),
         other => Err(format!("unknown command: {other}")),
     }
@@ -5027,6 +6071,95 @@ fn parse_group_invite_palette_command(
         "accept" => Ok(PaletteCommand::GroupInviteAccept { invite_id }),
         "reject" => Ok(PaletteCommand::GroupInviteReject { invite_id }),
         _ => Err("usage: group-invite accept|reject <invite-id>".to_string()),
+    }
+}
+
+fn parse_group_palette_command(parts: Vec<&str>) -> std::result::Result<PaletteCommand, String> {
+    let Some(action) = parts.first().copied() else {
+        return Err("usage: group rename|policy|invite|remove|admin|sync|leave ...".to_string());
+    };
+    match action {
+        "rename" => {
+            let group_id = parts
+                .get(1)
+                .ok_or_else(|| "usage: group rename <group-id> <name>".to_string())?;
+            let name = joined_arg(&parts[2..])
+                .ok_or_else(|| "usage: group rename <group-id> <name>".to_string())?;
+            Ok(PaletteCommand::GroupRename {
+                group_id: (*group_id).to_string(),
+                name,
+            })
+        }
+        "policy" => {
+            let group_id = parts
+                .get(1)
+                .ok_or_else(|| "usage: group policy <group-id> on|off".to_string())?;
+            let value = parts
+                .get(2)
+                .ok_or_else(|| "usage: group policy <group-id> on|off".to_string())?;
+            let members_can_invite = match *value {
+                "on" | "true" => true,
+                "off" | "false" => false,
+                _ => return Err("policy must be on or off".to_string()),
+            };
+            Ok(PaletteCommand::GroupPolicy {
+                group_id: (*group_id).to_string(),
+                members_can_invite,
+            })
+        }
+        "invite" => Ok(PaletteCommand::GroupMemberInvite {
+            group_id: parts
+                .get(1)
+                .ok_or_else(|| "usage: group invite <group-id> <peer-id>".to_string())?
+                .to_string(),
+            peer_id: parts
+                .get(2)
+                .ok_or_else(|| "usage: group invite <group-id> <peer-id>".to_string())?
+                .to_string(),
+        }),
+        "remove" => Ok(PaletteCommand::GroupMemberRemove {
+            group_id: parts
+                .get(1)
+                .ok_or_else(|| "usage: group remove <group-id> <peer-id>".to_string())?
+                .to_string(),
+            peer_id: parts
+                .get(2)
+                .ok_or_else(|| "usage: group remove <group-id> <peer-id>".to_string())?
+                .to_string(),
+        }),
+        "admin" => {
+            if parts.get(3) != Some(&"confirm") {
+                return Err("usage: group admin <group-id> <peer-id> confirm".to_string());
+            }
+            Ok(PaletteCommand::GroupAdminTransfer {
+                group_id: parts
+                    .get(1)
+                    .ok_or_else(|| "usage: group admin <group-id> <peer-id> confirm".to_string())?
+                    .to_string(),
+                peer_id: parts
+                    .get(2)
+                    .ok_or_else(|| "usage: group admin <group-id> <peer-id> confirm".to_string())?
+                    .to_string(),
+            })
+        }
+        "sync" => Ok(PaletteCommand::GroupSync {
+            group_id: parts
+                .get(1)
+                .ok_or_else(|| "usage: group sync <group-id>".to_string())?
+                .to_string(),
+        }),
+        "leave" => {
+            let group_id = parts
+                .get(1)
+                .ok_or_else(|| "usage: group leave <group-id> [confirm]".to_string())?
+                .to_string();
+            if parts.get(2) == Some(&"confirm") {
+                Ok(PaletteCommand::GroupLeave { group_id })
+            } else {
+                Ok(PaletteCommand::GroupLeavePreview { group_id })
+            }
+        }
+        _ => Err("usage: group rename|policy|invite|remove|admin|sync|leave ...".to_string()),
     }
 }
 
@@ -5543,6 +6676,95 @@ async fn execute_palette_command(
             state.app.status = format!("rejected group invite {invite_id}");
             Ok(())
         }
+        Ok(PaletteCommand::GroupRename { group_id, name }) => {
+            group::rename_group(app_state, network_state, group_id.clone(), name.clone()).await?;
+            refresh_direct_chats(app_state, network_state, state).await?;
+            state.app.status = format!("renamed group {name}");
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupPolicy {
+            group_id,
+            members_can_invite,
+        }) => {
+            group::update_group_settings(
+                app_state,
+                network_state,
+                group_id,
+                rchat_core::network::gossip::GroupSettings { members_can_invite },
+            )
+            .await?;
+            state.app.status = "updated group invite policy".to_string();
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupMemberInvite { group_id, peer_id }) => {
+            group::invite_member(app_state, network_state, group_id, peer_id.clone()).await?;
+            state.app.status = format!("invited {peer_id}");
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupMemberRemove { group_id, peer_id }) => {
+            group::remove_member(app_state, network_state, group_id, peer_id.clone()).await?;
+            state.app.status = format!("removed {peer_id}");
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupAdminTransfer { group_id, peer_id }) => {
+            group::transfer_group_admin(
+                app_state,
+                network_state,
+                group_id,
+                peer_id.clone(),
+            )
+            .await?;
+            state.app.status = format!("made {peer_id} group administrator");
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupSync { group_id }) => {
+            group::sync_group(network_state, group_id.clone()).await?;
+            state
+                .app
+                .group_sync_status
+                .insert(group_id, "requested".to_string());
+            state.app.status = "group sync requested".to_string();
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupLeave { group_id }) => {
+            let outcome = group::leave_group(app_state, network_state, group_id).await?;
+            refresh_direct_chats(app_state, network_state, state).await?;
+            state.app.status = match outcome {
+                group::GroupLeaveOutcome::Left => "left group".to_string(),
+                group::GroupLeaveOutcome::TransferredThenLeft { successor_peer_id } => {
+                    format!("left group; administration transferred to {successor_peer_id}")
+                }
+                group::GroupLeaveOutcome::Dissolved => "dissolved group".to_string(),
+            };
+            Ok(())
+        }
+        Ok(PaletteCommand::GroupLeavePreview { group_id }) => {
+            let preview = group::preview_leave_group(app_state, &group_id).await?;
+            state.app.status = match preview {
+                group::GroupLeaveOutcome::Left => {
+                    format!("confirm leave: / group leave {group_id} confirm")
+                }
+                group::GroupLeaveOutcome::TransferredThenLeft { successor_peer_id } => format!(
+                    "leaving transfers administration to {successor_peer_id}; confirm: / group leave {group_id} confirm"
+                ),
+                group::GroupLeaveOutcome::Dissolved => format!(
+                    "leaving dissolves this group and revokes invites; confirm: / group leave {group_id} confirm"
+                ),
+            };
+            Ok(())
+        }
+        Ok(PaletteCommand::ArchiveTemporary { chat_id }) => {
+            let archived = rchat_core::chat::temporary::archive_temporary_chat(
+                app_state,
+                network_state,
+                &chat_id,
+            )
+            .await?;
+            refresh_direct_chats(app_state, network_state, state).await?;
+            open_direct_chat(app_state, network_state, state, &archived.chat_id).await?;
+            state.app.status = format!("archived {}", archived.name);
+            Ok(())
+        }
         Ok(PaletteCommand::Help) => {
             state.app.show_help = true;
             Ok(())
@@ -5703,6 +6925,34 @@ fn drain_core_events(
             TuiEvent::Core(CoreEvent::GroupInviteReceived(event)) => {
                 state.app.status = group_invite_received_status(&event);
             }
+            TuiEvent::Core(CoreEvent::GroupRosterUpdated(event)) => {
+                state.app.status = format!(
+                    "group roster updated {}",
+                    short_identifier(&event.group_id, 24)
+                );
+                *refresh_requested = true;
+            }
+            TuiEvent::Core(CoreEvent::GroupRecordApplied(event)) => {
+                state.app.status = format!("group record applied {}", event.record_type);
+                *refresh_requested = true;
+            }
+            TuiEvent::Core(CoreEvent::GroupMessageReceiptUpdated(event)) => {
+                state.app.status = format!(
+                    "group receipt {} {}",
+                    short_identifier(&event.peer_id, 18),
+                    event.status
+                );
+                *refresh_requested = true;
+            }
+            TuiEvent::Core(CoreEvent::GroupSyncStateUpdated(event)) => {
+                let detail = event.detail.unwrap_or_default();
+                let label = format!("{} {}", event.state, detail).trim().to_string();
+                state
+                    .app
+                    .group_sync_status
+                    .insert(event.group_id.clone(), label.clone());
+                state.app.status = format!("group sync {label}");
+            }
             TuiEvent::Core(CoreEvent::ConnectionWaiting(peer_id)) => {
                 state.app.status = format!("connecting to {peer_id}");
             }
@@ -5720,6 +6970,12 @@ fn drain_core_events(
                 {
                     mdns::disable_fast_discovery();
                     state.app.close_new_person();
+                    if let Some(group) = state.app.new_group.as_mut() {
+                        if group.return_from_new_person {
+                            group.selected_peer_ids.insert(peer_id.clone());
+                            group.return_from_new_person = false;
+                        }
+                    }
                 }
                 *refresh_requested = true;
             }
@@ -5863,6 +7119,7 @@ impl Drop for OutputRedirect {
 
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Box<dyn Write>>>,
+    ratty_bitmap_active: bool,
 }
 
 impl TerminalSession {
@@ -5873,7 +7130,10 @@ impl TerminalSession {
             .context("failed to enter alternate screen")?;
         let backend = CrosstermBackend::new(output);
         let terminal = Terminal::new(backend).context("failed to start terminal")?;
-        let mut session = Self { terminal };
+        let mut session = Self {
+            terminal,
+            ratty_bitmap_active: false,
+        };
         session.clear()?;
         Ok(session)
     }
@@ -5909,6 +7169,24 @@ impl TerminalSession {
         std::io::Write::flush(self.terminal.backend_mut())
             .context("failed to flush terminal graphics clear")
     }
+
+    fn write_bitmap_commands(&mut self, commands: &[Vec<u8>]) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        for command in commands {
+            self.terminal
+                .backend_mut()
+                .write_all(command)
+                .context("failed to write Ratty bitmap command")?;
+        }
+        std::io::Write::flush(self.terminal.backend_mut())
+            .context("failed to flush Ratty bitmap commands")
+    }
+
+    fn set_ratty_bitmap_active(&mut self, active: bool) {
+        self.ratty_bitmap_active = active;
+    }
 }
 
 fn force_full_redraw_after_external_clear<B: Backend>(terminal: &mut Terminal<B>) {
@@ -5918,6 +7196,9 @@ fn force_full_redraw_after_external_clear<B: Backend>(terminal: &mut Terminal<B>
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.ratty_bitmap_active {
+            let _ = self.write_bitmap_commands(&ratty_bitmap::cleanup_all_commands());
+        }
         let _ = disable_raw_mode();
         if let Ok(mut output) = terminal_output() {
             let _ = execute!(&mut output, DisableMouseCapture, LeaveAlternateScreen);
@@ -5945,12 +7226,16 @@ struct UiState {
     app: TuiAppState,
     status: String,
     protocol_type: ProtocolType,
+    ratty_hosted: bool,
+    ratty_bitmap_available: bool,
+    kitty_detection_forced: bool,
     event_sink: TuiEventSink,
     voice_call_state: VoiceCallState,
     broadcast_state: BroadcastState,
     incoming_session_id: Option<String>,
     active_session_id: Option<String>,
     connected_chat_ids: Vec<String>,
+    theme: Theme,
     last_peer_event: Option<String>,
     received_frames: u64,
     encoded_frames: u64,
@@ -5975,6 +7260,7 @@ struct UiState {
     viewer_image: Option<ViewerLoadedImage>,
     viewer_protocol: Option<ProtocolResponse>,
     viewer_protocol_key: Option<MediaViewerKey>,
+    local_screen_test_requested: bool,
     sidebar_follow_selection: bool,
     show_help: bool,
 }
@@ -5991,12 +7277,16 @@ impl UiState {
             app: TuiAppState::default(),
             status: "network running".to_string(),
             protocol_type,
+            ratty_hosted: false,
+            ratty_bitmap_available: false,
+            kitty_detection_forced: false,
             event_sink,
             voice_call_state: VoiceCallState::default(),
             broadcast_state: BroadcastState::default(),
             incoming_session_id: None,
             active_session_id: None,
             connected_chat_ids: Vec::new(),
+            theme: Theme::rchat(),
             last_peer_event: None,
             received_frames: 0,
             encoded_frames: 0,
@@ -6021,6 +7311,7 @@ impl UiState {
             viewer_image: None,
             viewer_protocol: None,
             viewer_protocol_key: None,
+            local_screen_test_requested: false,
             sidebar_follow_selection: true,
             show_help: true,
         }
@@ -6557,13 +7848,32 @@ fn mask_secret(value: &str) -> String {
     PASSWORD_MASK_SYMBOL.repeat(value.chars().count())
 }
 
-fn render_media_shell(frame: &mut Frame<'_>, state: &mut UiState, kitty_available: bool) {
+fn render_media_shell(
+    frame: &mut Frame<'_>,
+    state: &mut UiState,
+    kitty_available: bool,
+    ratty_bitmap_available: bool,
+    ratty_targets: &mut RattyRenderTargets,
+) {
     let root = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(34), Constraint::Min(20)])
         .split(frame.area());
-    render_status(frame, root[0], state, kitty_available);
-    render_media(frame, root[1], state, kitty_available);
+    render_status(
+        frame,
+        root[0],
+        state,
+        kitty_available,
+        ratty_bitmap_available,
+    );
+    render_media(
+        frame,
+        root[1],
+        state,
+        kitty_available,
+        ratty_bitmap_available,
+        ratty_targets,
+    );
 }
 
 fn render_app_shell(
@@ -6572,26 +7882,62 @@ fn render_app_shell(
     inline_loader: Option<&InlineMediaLoader>,
     protocol_worker: Option<&ProtocolWorker>,
     kitty_available: bool,
+    ratty_bitmap_available: bool,
+    ratty_targets: &mut RattyRenderTargets,
 ) {
     let theme = app_background_theme(state);
-    let modal_theme = modal_overlay_theme();
+    let modal_theme = modal_overlay_theme(state);
     let background_kitty_available = background_kitty_media_enabled(state, kitty_available);
+    let background_ratty_bitmap_available =
+        ratty_bitmap_available && !graphics_obscuring_overlay_active(state);
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg)),
         frame.area(),
     );
 
     let layout = app_layout(frame.area());
-    let chat_history_area = if should_render_remote_video_panel(state) {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(12), Constraint::Min(4)])
-            .split(layout.chat_history);
-        render_remote_video_panel(frame, split[0], state, background_kitty_available, &theme);
-        split[1]
-    } else {
-        layout.chat_history
+    let show_screen = should_render_screen_share_panel(state);
+    let show_remote_video = should_render_remote_video_panel(state);
+    let panel_count = usize::from(show_screen) + usize::from(show_remote_video);
+    let panel_constraints = match panel_count {
+        0 => vec![Constraint::Min(4)],
+        1 => vec![Constraint::Length(12), Constraint::Min(4)],
+        _ => vec![
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Min(4),
+        ],
     };
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(panel_constraints)
+        .split(layout.chat_history);
+    let mut panel_index = 0;
+    if show_screen {
+        render_screen_share_panel(
+            frame,
+            panels[panel_index],
+            state,
+            background_kitty_available,
+            background_ratty_bitmap_available,
+            ratty_targets,
+            &theme,
+        );
+        panel_index += 1;
+    }
+    if show_remote_video {
+        render_remote_video_panel(
+            frame,
+            panels[panel_index],
+            state,
+            background_kitty_available,
+            background_ratty_bitmap_available,
+            ratty_targets,
+            &theme,
+        );
+        panel_index += 1;
+    }
+    let chat_history_area = panels[panel_index];
 
     render_top_bar(frame, layout.top_bar, state, &theme);
     render_app_sidebar(frame, layout.sidebar, state, &theme);
@@ -6615,6 +7961,12 @@ fn render_app_shell(
     }
     if state.app.new_person.is_some() {
         render_new_person_overlay(frame, frame.area(), state, kitty_available, &modal_theme);
+    }
+    if state.app.new_item_choice.is_some() {
+        render_new_item_choice_overlay(frame, frame.area(), state, &modal_theme);
+    }
+    if state.app.new_group.is_some() && state.app.new_person.is_none() {
+        render_new_group_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.settings.is_some() {
         render_settings_overlay(frame, frame.area(), state, &modal_theme);
@@ -6651,7 +8003,11 @@ fn render_app_shell(
             frame.area(),
             state,
             protocol_worker,
-            kitty_available,
+            MediaCapabilities {
+                kitty: kitty_available,
+                ratty_bitmap: ratty_bitmap_available,
+            },
+            ratty_targets,
             &modal_theme,
         );
     }
@@ -6708,6 +8064,8 @@ fn graphics_obscuring_overlay_active(state: &UiState) -> bool {
     state.app.show_help
         || state.app.chat_details.is_some()
         || state.app.new_person.is_some()
+        || state.app.new_item_choice.is_some()
+        || state.app.new_group.is_some()
         || state.app.settings.is_some()
         || state.app.attachment_modal.is_some()
         || state.app.sticker_picker.is_some()
@@ -6810,11 +8168,66 @@ fn should_render_remote_video_panel(state: &UiState) -> bool {
         && state.voice_call_state.phase == VoiceCallPhase::Active
 }
 
+fn should_render_screen_share_panel(state: &UiState) -> bool {
+    state.broadcast_state.phase == BroadcastPhase::Active && !state.broadcast_state.is_host
+}
+
+fn render_screen_share_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    kitty_available: bool,
+    ratty_bitmap_available: bool,
+    ratty_targets: &mut RattyRenderTargets,
+    theme: &Theme,
+) {
+    let peer = state.broadcast_state.peer_id.as_deref().unwrap_or("peer");
+    let block = themed_block(format!(" Screen share - {peer} "), theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    state.media_size = Size::new(inner.width, inner.height);
+
+    if !ratty_bitmap_available && !kitty_available {
+        let message = Paragraph::new("Screen share requires Ratty bitmap or Kitty image support.")
+            .style(Style::default().bg(theme.bg).fg(theme.muted))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(message, inner);
+        return;
+    }
+    if let Some(error) = state.media_error.as_deref() {
+        let message = Paragraph::new(error)
+            .style(Style::default().bg(theme.bg).fg(theme.error))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(message, inner);
+        return;
+    }
+    if ratty_bitmap_available {
+        ratty_targets.screen = ratty_destination(inner);
+        if state.decoded_frames == 0 {
+            let message = Paragraph::new("Waiting for screen-share frames...")
+                .style(Style::default().bg(theme.bg).fg(theme.muted))
+                .alignment(Alignment::Center);
+            frame.render_widget(message, inner);
+        }
+        return;
+    }
+    if let Some(protocol) = state.protocol.as_ref() {
+        frame.render_widget(Image::new(&protocol.protocol), inner);
+    } else {
+        let message = Paragraph::new("Waiting for screen-share frames...")
+            .style(Style::default().bg(theme.bg).fg(theme.muted))
+            .alignment(Alignment::Center);
+        frame.render_widget(message, inner);
+    }
+}
+
 fn render_remote_video_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &mut UiState,
     kitty_available: bool,
+    ratty_bitmap_available: bool,
+    ratty_targets: &mut RattyRenderTargets,
     theme: &Theme,
 ) {
     let block = themed_block(" Remote video ", theme);
@@ -6822,8 +8235,8 @@ fn render_remote_video_panel(
     frame.render_widget(block, area);
     state.remote_video_size = Size::new(inner.width, inner.height);
 
-    if !kitty_available {
-        let message = Paragraph::new("Remote video requires Kitty image protocol.")
+    if !ratty_bitmap_available && !kitty_available {
+        let message = Paragraph::new("Remote video requires Ratty bitmap or Kitty image support.")
             .style(Style::default().bg(theme.bg).fg(theme.muted))
             .wrap(Wrap { trim: true });
         frame.render_widget(message, inner);
@@ -6843,6 +8256,17 @@ fn render_remote_video_panel(
             .style(Style::default().bg(theme.bg).fg(theme.error))
             .wrap(Wrap { trim: true });
         frame.render_widget(message, inner);
+        return;
+    }
+
+    if ratty_bitmap_available {
+        ratty_targets.remote_video = ratty_destination(inner);
+        if state.remote_video_decoded_frames == 0 {
+            let message = Paragraph::new("Waiting for remote video frames...")
+                .style(Style::default().bg(theme.bg).fg(theme.muted))
+                .alignment(Alignment::Center);
+            frame.render_widget(message, inner);
+        }
         return;
     }
 
@@ -7163,7 +8587,10 @@ fn visible_sidebar_rows(state: &mut UiState, visible_capacity: usize) -> Vec<Sid
     state.sidebar_follow_selection = false;
 
     let start = state.app.sidebar_scroll_offset.min(max_offset);
-    rows.into_iter().skip(start).take(visible_capacity).collect()
+    rows.into_iter()
+        .skip(start)
+        .take(visible_capacity)
+        .collect()
 }
 
 fn scroll_sidebar_rows(state: &mut UiState, delta: isize, visible_capacity: usize) {
@@ -7267,6 +8694,21 @@ fn is_group_chat_list_item(chat_id: &str) -> bool {
         chat_kind::parse_chat_kind(chat_id),
         ChatKind::Group | ChatKind::TemporaryGroup
     )
+}
+
+fn chat_uses_group_transport(chat_id: &str) -> bool {
+    matches!(chat_kind::parse_chat_kind(chat_id), ChatKind::Group)
+}
+
+fn requires_direct_chat_loader(chat_id: &str) -> bool {
+    !matches!(
+        chat_kind::parse_chat_kind(chat_id),
+        ChatKind::Group | ChatKind::TemporaryGroup
+    )
+}
+
+fn group_wizard_invitable_chat(chat_id: &str) -> bool {
+    matches!(chat_kind::parse_chat_kind(chat_id), ChatKind::Direct)
 }
 
 fn render_chat_history(
@@ -7876,6 +9318,15 @@ fn render_help_line(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &
 }
 
 fn help_line_text(state: &UiState, width: usize) -> String {
+    if state.app.new_group.is_some() && state.app.new_person.is_none() {
+        return fit_segments(
+            &["New Group", "Up/Down move", "Enter activate", "Esc back"],
+            width,
+        );
+    }
+    if state.app.new_item_choice.is_some() {
+        return fit_segments(&["New", "Up/Down choose", "Enter open", "Esc close"], width);
+    }
     if state.app.new_person.is_some() {
         return fit_segments(
             &["New Person", "Up/Down move", "Enter activate", "Esc back"],
@@ -7896,7 +9347,13 @@ fn help_line_text(state: &UiState, width: usize) -> String {
     }
     if state.app.media_viewer.is_some() {
         return fit_segments(
-            &["Viewer", "+/- zoom", "arrows move", "Enter action", "Esc close"],
+            &[
+                "Viewer",
+                "+/- zoom",
+                "arrows move",
+                "Enter action",
+                "Esc close",
+            ],
             width,
         );
     }
@@ -7920,7 +9377,13 @@ fn help_line_text(state: &UiState, width: usize) -> String {
     }
     if state.app.sticker_picker.is_some() {
         return fit_segments(
-            &["Stickers", "preview first", "a add", "Enter send", "Esc close"],
+            &[
+                "Stickers",
+                "preview first",
+                "a add",
+                "Enter send",
+                "Esc close",
+            ],
             width,
         );
     }
@@ -8082,6 +9545,80 @@ fn render_chat_details_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
     ];
+
+    if let Some(group) = details.group.as_ref() {
+        lines = vec![
+            Line::from(Span::styled(
+                "Group",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!(
+                "Founder/admin: {}",
+                short_identifier(&details.peer_id, 42)
+            )),
+            Line::from(format!(
+                "Image: {}",
+                group
+                    .image_hash
+                    .as_deref()
+                    .map(short_hash)
+                    .unwrap_or_else(|| "-".to_string())
+            )),
+            Line::from(format!(
+                "Members can invite: {}",
+                if group.members_can_invite {
+                    "yes"
+                } else {
+                    "no"
+                }
+            )),
+            Line::from(format!("Pending records: {}", group.pending_count)),
+            Line::from(format!(
+                "Sync: {}",
+                group.sync_status.as_deref().unwrap_or("idle")
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Roster",
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )),
+        ];
+        if group.roster.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No roster records yet",
+                Style::default().fg(theme.muted),
+            )));
+        }
+        for member in &group.roster {
+            lines.push(Line::from(member.clone()));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Selected message receipts",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )));
+        if group.receipts.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Select an outgoing message to view receipts",
+                Style::default().fg(theme.muted),
+            )));
+        }
+        for receipt in &group.receipts {
+            lines.push(Line::from(receipt.clone()));
+        }
+        if group.is_admin {
+            lines.push(Line::from(Span::styled(
+                "Admin: use / group rename|policy|invite|remove|admin",
+                Style::default().fg(theme.warning),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Repair: / group sync <group-id>; leave: / group leave <group-id> confirm",
+            Style::default().fg(theme.muted),
+        )));
+    }
 
     if details.recent_files.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -8289,12 +9826,7 @@ fn render_sticker_picker_overlay(
         Line::from(""),
     ];
     if picker.mode == StickerPickerMode::AddPath {
-        lines.push(attachment_modal_line(
-            true,
-            "Path",
-            &picker.add_path,
-            theme,
-        ));
+        lines.push(attachment_modal_line(true, "Path", &picker.add_path, theme));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Enter imports, Esc returns to picker",
@@ -8413,7 +9945,14 @@ fn render_attachment_preview_box(
             render_preview_card(frame, inner, theme, "audio", path, Some("opens externally"));
         }
         MediaKind::Document => {
-            render_preview_card(frame, inner, theme, "document", path, Some("opens externally"));
+            render_preview_card(
+                frame,
+                inner,
+                theme,
+                "document",
+                path,
+                Some("opens externally"),
+            );
         }
     }
 }
@@ -8569,7 +10108,10 @@ fn render_preview_card(
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(name.to_string(), Style::default().fg(theme.text))),
+        Line::from(Span::styled(
+            name.to_string(),
+            Style::default().fg(theme.text),
+        )),
     ];
     if let Ok(metadata) = fs::metadata(path) {
         lines.push(Line::from(Span::styled(
@@ -8688,7 +10230,7 @@ fn render_context_menu_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiStat
     let Some(menu) = state.app.context_menu.as_ref() else {
         return;
     };
-    let actions = context_menu_actions(menu);
+    let actions = context_menu_actions(menu, state);
     let height = (actions.len() as u16).saturating_add(3).max(5);
     let popup = centered_rect(38, height, area);
     draw_shadow(frame, popup);
@@ -8725,7 +10267,8 @@ fn render_media_viewer_overlay(
     area: Rect,
     state: &mut UiState,
     protocol_worker: Option<&ProtocolWorker>,
-    kitty_available: bool,
+    capabilities: MediaCapabilities,
+    ratty_targets: &mut RattyRenderTargets,
     theme: &Theme,
 ) {
     let Some(viewer) = state.app.media_viewer.clone() else {
@@ -8751,9 +10294,9 @@ fn render_media_viewer_overlay(
             frame,
             layout[0],
             state,
-            &viewer,
             protocol_worker,
-            kitty_available,
+            capabilities,
+            ratty_targets,
             theme,
         ),
         MediaViewerKind::Video => render_media_viewer_placeholder(
@@ -8779,24 +10322,67 @@ fn render_media_viewer_overlay(
     render_media_viewer_details(frame, layout[1], &viewer, theme);
 }
 
+fn reconcile_ratty_viewer(
+    state: &mut UiState,
+    manager: &mut RattyBitmapManager,
+    destination: Option<RattyDestination>,
+    commands: &mut Vec<Vec<u8>>,
+) {
+    let desired = destination.and_then(|destination| {
+        let viewer = state.app.media_viewer.clone()?;
+        let loaded = state
+            .viewer_image
+            .as_ref()
+            .filter(|loaded| loaded.file_hash == viewer.file_hash)?;
+        Some((viewer, Arc::clone(&loaded.image), destination))
+    });
+
+    let Some((viewer, image, destination)) = desired else {
+        commands.extend(manager.clear_viewer());
+        return;
+    };
+    match manager.update_viewer(
+        &viewer.file_hash,
+        image.as_ref(),
+        ViewerView::new(viewer.zoom_percent, viewer.pan_x, viewer.pan_y),
+        destination,
+    ) {
+        Ok(next) => {
+            commands.extend(next);
+            if let Some(viewer) = state.app.media_viewer.as_mut() {
+                viewer.error = None;
+            }
+        }
+        Err(error) => {
+            commands.extend(manager.clear_viewer());
+            if let Some(viewer) = state.app.media_viewer.as_mut() {
+                viewer.error = Some(error.to_string());
+            }
+        }
+    }
+}
+
 fn render_media_viewer_image(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &mut UiState,
-    viewer: &crate::state::MediaViewerState,
     protocol_worker: Option<&ProtocolWorker>,
-    kitty_available: bool,
+    capabilities: MediaCapabilities,
+    ratty_targets: &mut RattyRenderTargets,
     theme: &Theme,
 ) {
+    let Some(viewer) = state.app.media_viewer.clone() else {
+        return;
+    };
     let block = themed_block(" Image ", theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if !kitty_available {
+    if !capabilities.ratty_bitmap && !capabilities.kitty {
         render_media_viewer_placeholder(
             frame,
             inner,
-            "Kitty image protocol unavailable. Metadata and file actions are still available.",
+            "Ratty bitmap and Kitty image protocols are unavailable. Metadata and file actions are still available.",
             theme,
         );
         return;
@@ -8810,6 +10396,11 @@ fn render_media_viewer_image(
         render_media_viewer_placeholder(frame, inner, "Loading image...", theme);
         return;
     };
+
+    if capabilities.ratty_bitmap {
+        ratty_targets.viewer = ratty_destination(inner);
+        return;
+    }
 
     let size = Size::new(inner.width.max(1), inner.height.max(1));
     let key = MediaViewerKey::new(
@@ -9102,8 +10693,8 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, t
         .iter()
         .enumerate()
         .map(|(index, section)| {
-            let focused = modal.pane == SettingsPane::Menu
-                && modal.focus == SettingsField::Section(index);
+            let focused =
+                modal.pane == SettingsPane::Menu && modal.focus == SettingsField::Section(index);
             let active = modal.section == *section;
             let marker = if active { ">" } else { " " };
             Line::from(Span::styled(
@@ -9424,7 +11015,12 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
             &modal.ratty_path,
             theme,
         ),
-        settings_button_line(modal, SettingsField::RattyPathSave, "Save Ratty path", theme),
+        settings_button_line(
+            modal,
+            SettingsField::RattyPathSave,
+            "Save Ratty path",
+            theme,
+        ),
         settings_button_line(
             modal,
             SettingsField::RattyImportGhostty,
@@ -9438,7 +11034,41 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
             theme,
         ),
         Line::from(""),
+        Line::from("Local screen sharing"),
+        settings_button_line(
+            modal,
+            SettingsField::ScreenShareTest,
+            "Test screen share (VP8)",
+            theme,
+        ),
+        Line::from(Span::styled(
+            "Captures this display locally; Esc or q returns to Settings.",
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(""),
         Line::from("Media diagnostics"),
+        Line::from(format!(
+            "Hosted by Ratty: {}",
+            if state.ratty_hosted { "yes" } else { "no" }
+        )),
+        Line::from(format!(
+            "Ratty bitmap v1: {}",
+            if state.ratty_bitmap_available {
+                "yes"
+            } else {
+                "no"
+            }
+        )),
+        Line::from(format!(
+            "Kitty selection: {}",
+            if state.kitty_detection_forced {
+                "forced"
+            } else if state.protocol_type_is_kitty() {
+                "detected"
+            } else {
+                "unavailable"
+            }
+        )),
         Line::from(format!("Protocol: {:?}", state.protocol_type)),
         Line::from(format!(
             "Kitty media: {}",
@@ -9536,6 +11166,199 @@ fn connectivity_mode_label(mode: ConnectivityMode) -> &'static str {
         ConnectivityMode::Reachable => "Reachable",
         ConnectivityMode::Custom => "Custom",
     }
+}
+
+fn render_new_item_choice_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &UiState,
+    theme: &Theme,
+) {
+    let Some(choice) = state.app.new_item_choice else {
+        return;
+    };
+    let popup = centered_rect(46, 18, area);
+    draw_shadow(frame, popup);
+    frame.render_widget(Clear, popup);
+    let person = choice == NewItemChoice::Person;
+    let lines = vec![
+        Line::from(Span::styled(
+            "Choose what to create",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{} New Person", if person { ">" } else { " " }),
+            if person {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        )),
+        Line::from(Span::styled(
+            format!("{} New Group", if !person { ">" } else { " " }),
+            if !person {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Up/Down choose | Enter open | Esc close",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(themed_block(" New ", theme))
+            .style(Style::default().bg(theme.surface).fg(theme.text)),
+        popup,
+    );
+}
+
+fn render_new_group_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+    let Some(modal) = state.app.new_group.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(78, 34, area);
+    draw_shadow(frame, popup);
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            if modal.step == NewGroupStep::Settings {
+                "1. Group Settings / 2. Invite People"
+            } else {
+                "1. Group Settings / 2. Invite People"
+            },
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    match modal.step {
+        NewGroupStep::Settings => {
+            lines.push(group_wizard_input_line(
+                modal,
+                0,
+                "Group name",
+                &modal.name,
+                theme,
+            ));
+            lines.push(group_wizard_input_line(
+                modal,
+                1,
+                "Image path (optional)",
+                &modal.image_path,
+                theme,
+            ));
+            lines.push(group_wizard_button_line(
+                modal,
+                2,
+                format!(
+                    "{} Members can invite people",
+                    selected_marker(modal.members_can_invite)
+                ),
+                theme,
+            ));
+            lines.push(group_wizard_button_line(modal, 3, "Continue", theme));
+        }
+        NewGroupStep::InvitePeople => {
+            lines.push(Line::from("Select known direct peers to invite:"));
+            for (index, chat) in state
+                .app
+                .chats
+                .iter()
+                .filter(|chat| group_wizard_invitable_chat(&chat.id))
+                .enumerate()
+            {
+                lines.push(group_wizard_button_line(
+                    modal,
+                    index,
+                    format!(
+                        "{} {}",
+                        selected_marker(modal.selected_peer_ids.contains(&chat.id)),
+                        chat.name
+                    ),
+                    theme,
+                ));
+            }
+            let base = state
+                .app
+                .chats
+                .iter()
+                .filter(|chat| group_wizard_invitable_chat(&chat.id))
+                .count();
+            lines.push(group_wizard_button_line(modal, base, "New Person", theme));
+            lines.push(group_wizard_button_line(modal, base + 1, "Create", theme));
+            lines.push(group_wizard_button_line(
+                modal,
+                base + 2,
+                "Skip and create",
+                theme,
+            ));
+        }
+    }
+    if let Some(error) = modal.error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            error.to_string(),
+            Style::default().fg(theme.error),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Up/Down move | Enter activate | Esc back",
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(themed_block(" New Group ", theme))
+            .style(Style::default().bg(theme.surface).fg(theme.text))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn group_wizard_input_line(
+    modal: &crate::state::NewGroupModalState,
+    index: usize,
+    label: &str,
+    value: &str,
+    theme: &Theme,
+) -> Line<'static> {
+    let focused = modal.selected_index == index;
+    Line::from(Span::styled(
+        format!("{} {label}: {value}", if focused { ">" } else { " " }),
+        if focused {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        },
+    ))
+}
+
+fn group_wizard_button_line(
+    modal: &crate::state::NewGroupModalState,
+    index: usize,
+    label: impl Into<String>,
+    theme: &Theme,
+) -> Line<'static> {
+    let focused = modal.selected_index == index;
+    Line::from(Span::styled(
+        format!("{} {}", if focused { ">" } else { " " }, label.into()),
+        if focused {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        },
+    ))
 }
 
 fn render_new_person_overlay(
@@ -9690,6 +11513,17 @@ fn new_person_lines(
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
+            lines.push(new_person_button_line(
+                modal,
+                NewPersonField::EmailInvite,
+                "Email invite",
+                if modal.create_invite_published {
+                    "Open your email application again"
+                } else {
+                    "Publish once and open your email application"
+                },
+                theme,
+            ));
             lines.push(new_person_button_line(
                 modal,
                 NewPersonField::CreateInviteConfirm,
@@ -10079,6 +11913,19 @@ impl Theme {
         }
     }
 
+    fn from_config(config: &storage::theme::ThemeConfig) -> Self {
+        let fallback = Self::rchat();
+        Self {
+            bg: color_from_hex(&config.base.c950).unwrap_or(fallback.bg),
+            surface: color_from_hex(&config.base.c900).unwrap_or(fallback.surface),
+            accent: color_from_hex(&config.primary.c500).unwrap_or(fallback.accent),
+            warning: color_from_hex(&config.warning.c400).unwrap_or(fallback.warning),
+            text: color_from_hex(&config.base.c100).unwrap_or(fallback.text),
+            muted: color_from_hex(&config.base.c400).unwrap_or(fallback.muted),
+            error: color_from_hex(&config.error.c400).unwrap_or(fallback.error),
+        }
+    }
+
     fn dimmed(self) -> Self {
         Self {
             bg: Color::Rgb(8, 10, 14),
@@ -10092,8 +11939,21 @@ impl Theme {
     }
 }
 
+fn color_from_hex(value: &str) -> Option<Color> {
+    let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    Some(Color::Rgb(
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    ))
+}
+
 fn app_background_theme(state: &UiState) -> Theme {
-    let theme = Theme::rchat();
+    let theme = state.theme;
     if graphics_obscuring_overlay_active(state) {
         theme.dimmed()
     } else {
@@ -10101,8 +11961,8 @@ fn app_background_theme(state: &UiState) -> Theme {
     }
 }
 
-fn modal_overlay_theme() -> Theme {
-    Theme::rchat()
+fn modal_overlay_theme(state: &UiState) -> Theme {
+    state.theme
 }
 
 fn themed_block(title: impl Into<Line<'static>>, theme: &Theme) -> Block<'static> {
@@ -10156,7 +12016,13 @@ fn draw_shadow(frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, state: &UiState, kitty_available: bool) {
+fn render_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &UiState,
+    kitty_available: bool,
+    ratty_bitmap_available: bool,
+) {
     let mut lines = vec![
         Line::from(Span::styled(
             "RChat TUI",
@@ -10168,6 +12034,10 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &UiState, kitty_avail
         Line::from(format!(
             "Kitty media: {}",
             if kitty_available { "yes" } else { "no" }
+        )),
+        Line::from(format!(
+            "Ratty bitmap v1: {}",
+            if ratty_bitmap_available { "yes" } else { "no" }
         )),
         Line::from(format!(
             "Connected chats: {}",
@@ -10228,17 +12098,34 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &UiState, kitty_avail
     frame.render_widget(paragraph, area);
 }
 
-fn render_media(frame: &mut Frame<'_>, area: Rect, state: &mut UiState, kitty_available: bool) {
+fn render_media(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    kitty_available: bool,
+    ratty_bitmap_available: bool,
+    ratty_targets: &mut RattyRenderTargets,
+) {
     let block = Block::default().title("Screen").borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     state.media_size = Size::new(inner.width, inner.height);
 
-    if !kitty_available {
-        let message = Paragraph::new("Kitty image protocol unavailable; run inside Ratty.")
+    if !ratty_bitmap_available && !kitty_available {
+        let message = Paragraph::new("Ratty bitmap and Kitty image protocols are unavailable.")
             .style(Style::default().fg(Color::Yellow))
             .wrap(Wrap { trim: true });
         frame.render_widget(message, inner);
+        return;
+    }
+
+    if ratty_bitmap_available {
+        ratty_targets.screen = ratty_destination(inner);
+        if state.decoded_frames == 0 {
+            let message = Paragraph::new("Waiting for screen-share frames...")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(message, inner);
+        }
         return;
     }
 

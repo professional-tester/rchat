@@ -36,13 +36,19 @@ pub struct LoadedAttachment {
     pub bytes: Vec<u8>,
 }
 
-pub async fn send_file_from_path(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFileObject {
+    pub file_hash: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub size_bytes: usize,
+}
+
+pub fn store_file_object_from_path(
     app_state: &AppState,
-    net_state: &NetworkState,
-    chat_id: &str,
     kind: MediaKind,
     file_path: impl AsRef<Path>,
-) -> Result<SentMediaResult> {
+) -> Result<StoredFileObject> {
     let file_path = file_path.as_ref();
     let bytes = fs::read(file_path)
         .with_context(|| format!("Failed to read {}: {}", kind.noun(), file_path.display()))?;
@@ -67,6 +73,24 @@ pub async fn send_file_from_path(
         .with_context(|| format!("Failed to store {}", kind.noun()))?
     };
 
+    Ok(StoredFileObject {
+        file_hash,
+        file_name,
+        mime_type: mime_type.to_string(),
+        size_bytes: bytes.len(),
+    })
+}
+
+pub async fn send_file_from_path(
+    app_state: &AppState,
+    net_state: &NetworkState,
+    chat_id: &str,
+    kind: MediaKind,
+    file_path: impl AsRef<Path>,
+) -> Result<SentMediaResult> {
+    let file_path = file_path.as_ref();
+    let stored = store_file_object_from_path(app_state, kind, file_path)?;
+
     send_stored_media(
         app_state,
         net_state,
@@ -75,9 +99,9 @@ pub async fn send_file_from_path(
             content_type: kind.content_type(),
             group_type: kind.group_type(),
             direct_type: kind.direct_type(),
-            file_hash,
-            file_name: kind.result_file_name(file_name),
-            size_bytes: Some(bytes.len()),
+            file_hash: stored.file_hash,
+            file_name: kind.result_file_name(stored.file_name),
+            size_bytes: Some(stored.size_bytes),
             text_content: kind.text_content_name(file_path),
             direct_file_name: kind.direct_file_name(file_path),
         },
@@ -264,9 +288,45 @@ pub async fn retry_direct_attachment_fetch(
             Ok(())
         }
         ChatKind::SelfChat => Err(anyhow!("self chat attachments are already local")),
-        ChatKind::Group => Err(anyhow!(
-            "durable group attachment retry is not supported in rchat-tui yet"
-        )),
+        ChatKind::Group => {
+            let local_peer_id = net_state.local_peer_id.lock().await.clone().unwrap_or_default();
+            let (sources, fallbacks) = {
+                let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+                let sources = storage::db::get_group_file_sources(
+                    &conn,
+                    &canonical_chat_id,
+                    file_hash,
+                )?
+                .into_iter()
+                .map(|source| source.peer_id)
+                .collect::<Vec<_>>();
+                let fallbacks = crate::chat::group::get_group_policy(
+                    app_state,
+                    &canonical_chat_id,
+                )?
+                .active_members;
+                (sources, fallbacks)
+            };
+            let candidates = group_retry_candidates(
+                sources.first().map(String::as_str),
+                sources.iter().map(String::as_str),
+                fallbacks.iter().map(String::as_str),
+                &local_peer_id,
+            );
+            let preferred_peer_id = candidates.first().cloned();
+            if preferred_peer_id.is_none() {
+                return Err(anyhow!("No remote group member is available for attachment retry"));
+            }
+            let tx = net_state.sender.lock().await;
+            tx.send(NetworkCommand::RequestGroupFileMetadata {
+                group_id: canonical_chat_id,
+                file_hash: file_hash.to_string(),
+                preferred_peer_id,
+            })
+            .await
+            .map_err(|error| anyhow!("network command channel is closed: {error}"))?;
+            Ok(())
+        }
         ChatKind::TemporaryGroup => {
             // Retry against every eligible remote member so any peer that
             // holds the file can answer; the roster dedupes, so each member
@@ -289,6 +349,24 @@ pub async fn retry_direct_attachment_fetch(
         }
         ChatKind::Archived => Err(anyhow!("archived chats are read-only")),
     }
+}
+
+pub(crate) fn group_retry_candidates<'a>(
+    preferred: Option<&'a str>,
+    sources: impl IntoIterator<Item = &'a str>,
+    fallbacks: impl IntoIterator<Item = &'a str>,
+    local_peer_id: &str,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for peer_id in preferred.into_iter().chain(sources).chain(fallbacks) {
+        if !peer_id.is_empty()
+            && peer_id != local_peer_id
+            && !candidates.iter().any(|candidate| candidate == peer_id)
+        {
+            candidates.push(peer_id.to_string());
+        }
+    }
+    candidates
 }
 
 struct StoredMedia {
@@ -709,6 +787,17 @@ mod tests {
     fn audio_mime_rejects_unsupported_extensions() {
         assert_eq!(detect_audio_mime(Path::new("clip.aac")), None);
         assert_eq!(detect_audio_mime(Path::new("clip")), None);
+    }
+
+    #[test]
+    fn group_retry_candidates_prioritize_sources_and_exclude_local_peer() {
+        let candidates = group_retry_candidates(
+            Some("preferred"),
+            ["source", "local", "preferred"],
+            ["fallback", "source"],
+            "local",
+        );
+        assert_eq!(candidates, vec!["preferred", "source", "fallback"]);
     }
 
     #[tokio::test]

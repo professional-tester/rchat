@@ -105,6 +105,10 @@ pub enum NetworkCommand {
         target_peer_id: String,
         invite: GroupInvitePayload,
     },
+    SendGroupDissolution {
+        target_peer_id: String,
+        record: SignedGroupRecord,
+    },
     SyncGroup {
         group_id: String,
     },
@@ -130,6 +134,11 @@ pub enum NetworkCommand {
     RequestDirectFileMetadata {
         target_peer_id: String,
         file_hash: String,
+    },
+    RequestGroupFileMetadata {
+        group_id: String,
+        file_hash: String,
+        preferred_peer_id: Option<String>,
     },
     StartVoiceCall {
         peer_id: String,

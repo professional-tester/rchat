@@ -112,6 +112,24 @@ impl NetworkManager {
                 self.request_direct_file_metadata(target_peer_id, file_hash)
                     .await;
             }
+            NetworkCommand::RequestGroupFileMetadata {
+                group_id,
+                file_hash,
+                preferred_peer_id,
+            } => {
+                self.request_group_file_metadata(
+                    &group_id,
+                    &file_hash,
+                    preferred_peer_id.as_deref(),
+                )
+                .await;
+            }
+            NetworkCommand::SendGroupDissolution {
+                target_peer_id,
+                record,
+            } => {
+                self.send_group_dissolution(target_peer_id, record).await;
+            }
             NetworkCommand::StartVoiceCall { peer_id } => {
                 self.handle_start_voice_call(peer_id).await;
             }

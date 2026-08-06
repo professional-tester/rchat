@@ -63,15 +63,25 @@ impl NetworkManager {
                 true,
             ) {
                 Ok(true) => {
-                    if let crate::network::gossip::GroupRecordBody::Message {
-                        file_hash: Some(file_hash),
-                        ..
-                    } = record.body()
-                    {
+                    let request_file_hash = match record.body() {
+                        crate::network::gossip::GroupRecordBody::Message {
+                            file_hash: Some(file_hash),
+                            ..
+                        }
+                        | crate::network::gossip::GroupRecordBody::GroupCreated {
+                            image_hash: Some(file_hash),
+                            ..
+                        }
+                        | crate::network::gossip::GroupRecordBody::FileAvailability { file_hash } => {
+                            Some(file_hash)
+                        }
+                        _ => None,
+                    };
+                    if let Some(file_hash) = request_file_hash {
                         self.request_group_file_metadata(
                             record.group_id(),
                             file_hash,
-                            record.author_peer_id(),
+                            Some(record.author_peer_id()),
                         )
                         .await;
                     }
@@ -174,7 +184,11 @@ impl NetworkManager {
 
         if envelope.content_type.needs_file_transfer() {
             if let Some(ref file_hash) = envelope.file_hash {
-                self.request_group_file_metadata(&envelope.group_id, file_hash, &envelope.sender_id)
+                self.request_group_file_metadata(
+                    &envelope.group_id,
+                    file_hash,
+                    Some(&envelope.sender_id),
+                )
                     .await;
             }
         }
@@ -182,15 +196,18 @@ impl NetworkManager {
         self.emit(CoreEvent::MessageReceived(db_msg));
     }
 
-    pub(super) async fn request_group_file_metadata(
+    pub(crate) async fn request_group_file_metadata(
         &mut self,
         group_id: &str,
         file_hash: &str,
-        preferred_peer_id: &str,
+        preferred_peer_id: Option<&str>,
     ) {
         // Media routing into a temporary group is only authorized for admitted
         // members of a live (non-archived) session.
         if crate::chat_kind::is_temp_group_chat_id(group_id) {
+            let Some(preferred_peer_id) = preferred_peer_id else {
+                return;
+            };
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
             let Some(session) = temp_state.chats.get(group_id) else {
@@ -203,16 +220,16 @@ impl NetworkManager {
                 return;
             }
         }
-        let mut candidates = vec![preferred_peer_id.to_string()];
+        let mut sources = Vec::new();
+        let mut fallbacks = Vec::new();
         if let Ok(conn) = self.app_state.db_conn.lock() {
-            if let Ok(sources) =
+            if let Ok(rows) =
                 crate::storage::db::get_group_file_sources(&conn, group_id, file_hash)
             {
-                for source in sources {
-                    if !candidates.iter().any(|p| p == &source.peer_id) {
-                        candidates.push(source.peer_id);
-                    }
-                }
+                sources.extend(rows.into_iter().map(|source| source.peer_id));
+            }
+            if let Ok(policy) = crate::chat::group::get_group_policy(&self.app_state, group_id) {
+                fallbacks.extend(policy.active_members);
             }
         }
         // Temporary-group members are all eligible sources; add every remote
@@ -222,13 +239,16 @@ impl NetworkManager {
             let network_state = &self.network_state;
             let temp_state = network_state.temporary_state.lock().await;
             if let Some(session) = temp_state.chats.get(group_id) {
-                for member in session.remote_members(Some(&local)) {
-                    if !candidates.iter().any(|p| p == &member) {
-                        candidates.push(member);
-                    }
-                }
+                fallbacks.extend(session.remote_members(Some(&local)));
             }
         }
+        let local_peer_id = self.swarm.local_peer_id().to_string();
+        let candidates = crate::chat::media::group_retry_candidates(
+            preferred_peer_id,
+            sources.iter().map(String::as_str),
+            fallbacks.iter().map(String::as_str),
+            &local_peer_id,
+        );
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -167,6 +167,35 @@ impl NetworkManager {
         );
     }
 
+    pub(super) async fn send_group_dissolution(
+        &mut self,
+        target_peer_id: String,
+        record: crate::network::gossip::SignedGroupRecord,
+    ) {
+        let Some(peer_id) = self.resolve_peer_id(&target_peer_id, "GROUP_DISSOLUTION").await else {
+            return;
+        };
+        let Ok(payload) = serde_json::to_string(&record) else {
+            return;
+        };
+        let request = crate::network::direct_message::DirectMessageRequest {
+            id: format!("group-dissolution-{}", record.id()),
+            sender_id: self.swarm.local_peer_id().to_string(),
+            msg_type: crate::network::direct_message::DirectMessageKind::GroupDissolution,
+            text_content: Some(payload),
+            file_hash: None,
+            timestamp: record.timestamp(),
+            chunk_hash: None,
+            chunk_data: None,
+            chunk_list: None,
+            sender_alias: None,
+        };
+        self.swarm
+            .behaviour_mut()
+            .direct_message
+            .send_request(&peer_id, request);
+    }
+
     pub(super) async fn request_group_sync(&mut self, group_id: &str) {
         let known_record_ids = {
             let state = &self.app_state;
