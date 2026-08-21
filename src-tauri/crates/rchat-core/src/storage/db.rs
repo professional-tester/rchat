@@ -361,10 +361,40 @@ pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_group_records_group_counter ON group_records(group_id, lamport_counter)",
         [],
     );
-    let _ = conn.execute(
+    // v3 is a hard break: any pre-existing v2 rows have lamport_counter=0
+    // and would violate the new uniqueness invariant (author,counter). Since
+    // there are no deployed users that need to keep v2 history, reset those
+    // rows so the unique index can be created. Propagate any other failure.
+    let v2_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM group_records WHERE lamport_counter = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if v2_rows > 0 {
+        conn.execute("DELETE FROM group_records WHERE lamport_counter = 0", [])?;
+    }
+    conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_group_records_author_counter ON group_records(group_id, author_peer_id, lamport_counter)",
         [],
-    );
+    )?;
+    // Verify the index exists after migration (fail fast if creation was
+    // silently ignored on a populated v2-shaped DB).
+    let index_exists: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_group_records_author_counter'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index_exists.is_none() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(1),
+            Some("unique index idx_group_records_author_counter not created".to_string()),
+        )
+        .into());
+    }
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS group_invites (
@@ -1132,7 +1162,7 @@ pub fn get_group_records_including_pending(
 pub fn get_group_max_lamport_counter(conn: &Connection, group_id: &str) -> anyhow::Result<u64> {
     let max: Option<i64> = conn
         .query_row(
-            "SELECT MAX(lamport_counter) FROM group_records WHERE group_id = ?1",
+            "SELECT MAX(lamport_counter) FROM group_records WHERE group_id = ?1 AND verified = 1",
             [group_id],
             |row| row.get(0),
         )
@@ -1141,22 +1171,37 @@ pub fn get_group_max_lamport_counter(conn: &Connection, group_id: &str) -> anyho
     Ok(max.unwrap_or(0) as u64)
 }
 
-pub fn get_group_head_ids(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<String>> {
-    // Single-head total order: the maximal (counter, author, id) is the head.
-    // Concurrent same-counter records are ordered by author, so one wins
-    // deterministically; a fork that produces two heads at the same position
-    // is rejected by the unique (author,counter) index before it can fork
-    // the DAG. For a true multi-head DAG the caller would need to parent
-    // all heads, but the total order keeps the common case to one parent.
+pub fn get_all_verified_group_records_ordered(
+    conn: &Connection,
+    group_id: &str,
+) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM group_records WHERE group_id = ?1 ORDER BY lamport_counter DESC, author_peer_id DESC, id DESC LIMIT 1",
+        "SELECT payload_json FROM group_records WHERE group_id = ?1 AND verified = 1 ORDER BY lamport_counter ASC, author_peer_id ASC, id ASC",
     )?;
     let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        out.push(serde_json::from_str(&row?)?);
     }
     Ok(out)
+}
+
+pub fn get_group_head_ids(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<String>> {
+    // DAG leaf heads: verified records that are not a parent of any other
+    // verified record in the same group. Pending records are not authoritative
+    // heads (they are unverified network input).
+    let all = get_all_verified_group_records_ordered(conn, group_id)?;
+    let mut parent_set = std::collections::HashSet::new();
+    for rec in &all {
+        for p in &rec.unsigned.parents {
+            parent_set.insert(p.clone());
+        }
+    }
+    Ok(all
+        .iter()
+        .filter(|r| !parent_set.contains(r.id()))
+        .map(|r| r.id().to_string())
+        .collect())
 }
 
 pub fn has_author_counter(

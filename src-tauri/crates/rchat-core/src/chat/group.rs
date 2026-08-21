@@ -182,7 +182,7 @@ pub async fn create_group_with_options(
 
 pub fn get_group_policy(app_state: &AppState, group_id: &str) -> anyhow::Result<GroupPolicy> {
     let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-    let records = db::get_group_records_for_sync(&conn, group_id, &[], 10_000)?;
+    let records = db::get_all_verified_group_records_ordered(&conn, group_id)?;
     derive_group_policy(&records).ok_or_else(|| anyhow!("Group has no valid founder record"))
 }
 
@@ -853,6 +853,21 @@ fn can_invite(policy: &GroupPolicy, peer_id: &str) -> bool {
         || (policy.settings.members_can_invite && policy.active_members.contains(peer_id))
 }
 
+fn is_policy_changing(body: &GroupRecordBody) -> bool {
+    matches!(
+        body,
+        GroupRecordBody::GroupCreated { .. }
+            | GroupRecordBody::MemberInvited { .. }
+            | GroupRecordBody::MemberJoined { .. }
+            | GroupRecordBody::MemberLeft { .. }
+            | GroupRecordBody::MemberRemoved { .. }
+            | GroupRecordBody::AdminTransferred { .. }
+            | GroupRecordBody::GroupDissolved
+            | GroupRecordBody::GroupRenamed { .. }
+            | GroupRecordBody::GroupSettingsUpdated { .. }
+    )
+}
+
 fn group_record_state(
     conn: &rusqlite::Connection,
     record_id: &str,
@@ -899,49 +914,39 @@ fn validate_group_record(
     record: &SignedGroupRecord,
 ) -> anyhow::Result<RecordDisposition> {
     for parent_id in &record.unsigned.parents {
+        let Some(parent) = db::get_group_record(conn, parent_id)? else {
+            return Ok(RecordDisposition::PendingDependency);
+        };
+        if parent.group_id() != record.group_id() {
+            return Err(anyhow!(
+                "Group record parent {} belongs to different group {}",
+                parent_id,
+                parent.group_id()
+            ));
+        }
         if !matches!(group_record_state(conn, parent_id)?, Some((true, false))) {
             return Ok(RecordDisposition::PendingDependency);
         }
     }
-    // Empty-parents records from older tests/builders are treated as building
-    // on the current head. Out-of-order counters within the jump window stay
-    // pending for retry; far leaps and the 0/MAX sentinels are hard errors
-    // handled by validate_record_counter. Behind counters fall through to
-    // the fork check there.
-    if !matches!(record.body(), GroupRecordBody::GroupCreated { .. })
+    // Mandatory v3: every policy-changing non-creation record must name its
+    // causal head(s). Counter 0/MAX are handled as hard counter errors, not
+    // parent errors. Non-policy records (Message, Head, etc.) may have empty
+    // parents and are ordered by counter alone.
+    if is_policy_changing(record.body())
+        && !matches!(record.body(), GroupRecordBody::GroupCreated { .. })
         && record.unsigned.parents.is_empty()
         && record.lamport_counter() != 0
         && record.lamport_counter() != u64::MAX
     {
-        let max_known = db::get_group_max_lamport_counter(conn, record.group_id()).unwrap_or(0);
-        let counter = record.lamport_counter();
-        if counter != max_known.saturating_add(1) {
-            if max_known != 0
-                && counter > max_known.saturating_add(1)
-                && counter <= max_known.saturating_add(SignedGroupRecord::MAX_COUNTER_JUMP)
-            {
-                return Ok(RecordDisposition::PendingDependency);
-            }
-            if max_known == 0 {
-                return Ok(RecordDisposition::PendingDependency);
-            }
-        }
+        return Err(anyhow!("Group record must name the policy head it builds on"));
     }
     validate_record_counter(conn, record)?;
-    let existing_records = db::get_group_records_for_sync(conn, record.group_id(), &[], 10_000)?;
+    let existing_records = db::get_all_verified_group_records_ordered(conn, record.group_id())?;
     let current_policy = derive_group_policy(&existing_records);
     let policy_before_record = if matches!(record.body(), GroupRecordBody::GroupCreated { .. }) {
         None
-    } else if record.unsigned.parents.is_empty() {
-        // Empty parents leniently means "build on current frontier" — use
-        // the classic counter-order snapshot so existing tests that predate
-        // parent tracking keep their intended semantics (e.g. a pre-join
-        // message stays pending even after later joins).
-        derive_group_policy_before(&existing_records, record)
     } else {
-        let closure = collect_parent_closure(conn, &record.unsigned.parents)?;
-        // An empty closure means the parent(s) existed but their history
-        // could not be collected (concurrent vanished) — treat as pending.
+        let closure = collect_parent_closure(conn, record.group_id(), &record.unsigned.parents)?;
         if closure.is_empty() {
             return Ok(RecordDisposition::PendingDependency);
         }
@@ -1306,7 +1311,7 @@ pub fn apply_signed_record(
                 });
             }
             GroupRecordBody::AdminTransferred { new_admin_peer_id } => {
-                let records = db::get_group_records_for_sync(&conn, record.group_id(), &[], 10_000)?;
+                let records = db::get_all_verified_group_records_ordered(&conn, record.group_id())?;
                 if let Some(policy) = derive_group_policy(&records) {
                     for member in db::get_group_roster(&conn, record.group_id())? {
                         if member.membership_state == "joined" {
@@ -1581,54 +1586,32 @@ pub fn next_group_record_counter(conn: &rusqlite::Connection, group_id: &str) ->
 
 /// Collect the transitive parent closure of `parents` (verified records only;
 /// missing parents make the record pending). Used to evaluate authorization
-/// against the exact causal snapshot the author built on. For the lenient
-/// empty-parents case (older tests), an empty parent list is interpreted as
-/// building on the entire frontier before the record, so we synthesize the
-/// closure as all verified records with a smaller counter.
+/// against the exact causal snapshot the author built on.
 fn collect_parent_closure(
     conn: &rusqlite::Connection,
+    group_id: &str,
     parents: &[String],
 ) -> anyhow::Result<Vec<SignedGroupRecord>> {
     let mut seen = std::collections::HashSet::new();
     let mut stack: Vec<String> = parents.to_vec();
     let mut out = Vec::new();
-    // Empty parents leniently means "all prior verified history". Collect
-    // them via counter ordering so tests that predate parent tracking still
-    // evaluate against the correct snapshot.
-    if stack.is_empty() {
-        // This path is only used when validate has already ensured the
-        // record is not GroupCreated and parents were empty leniently.
-        // We cannot know the record's counter here, so the caller handles
-        // empty parents via current_policy. Return empty to signal that.
-        return Ok(out);
-    }
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
             continue;
         }
         let Some(record) = db::get_group_record(conn, &id)? else {
-            // Caller will have already returned PendingDependency for missing
-            // parents; reaching here means a parent vanished concurrently.
             continue;
         };
-        // Empty-parents records in the closure themselves leniently depend on
-        // all prior history by counter order.
-        if record.unsigned.parents.is_empty() && record.lamport_counter() > 1 {
-            let prior = db::get_group_records_before_counter(
-                conn,
-                &record.group_id().to_string(),
-                record.lamport_counter(),
-            )?;
-            for prior_record in prior {
-                if !seen.contains(prior_record.id()) {
-                    stack.push(prior_record.id().to_string());
-                }
-            }
-        } else {
-            for parent in &record.unsigned.parents {
-                if !seen.contains(parent) {
-                    stack.push(parent.clone());
-                }
+        if record.group_id() != group_id {
+            return Err(anyhow!(
+                "Parent {} belongs to different group {}",
+                record.id(),
+                record.group_id()
+            ));
+        }
+        for parent in &record.unsigned.parents {
+            if !seen.contains(parent) {
+                stack.push(parent.clone());
             }
         }
         out.push(record);
@@ -1807,6 +1790,13 @@ fn ensure_incomplete_file_row(conn: &rusqlite::Connection, file_hash: &str) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static GROUP_LAST_ID: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+        static GROUP_LAST_COUNTER: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+    }
 
     fn app_state() -> AppState {
         use crate::storage::config::ConfigManager;
@@ -1861,16 +1851,30 @@ mod tests {
         counter: u64,
         body: GroupRecordBody,
     ) -> SignedGroupRecord {
-        SignedGroupRecord::new(
+        let is_created = matches!(body, GroupRecordBody::GroupCreated { .. });
+        let parents = if is_created {
+            Vec::new()
+        } else {
+            GROUP_LAST_ID.with(|m| m.borrow().get(group_id).cloned().map(|id| vec![id]).unwrap_or_default())
+        };
+        // For out-of-order tests that create a record with a counter that
+        // does not follow the current head, the helper would otherwise parent
+        // the wrong head and make the record depend on an unrelated pending
+        // record. In that case the test should construct the record explicitly
+        // via `SignedGroupRecord::new` with the intended parents.
+        let record = SignedGroupRecord::new(
             keypair,
             group_id.to_string(),
             format!("test-{id}-{}", rand::random::<u64>()),
             timestamp,
-            Vec::new(),
+            parents.clone(),
             counter,
             body,
         )
-        .expect("record")
+        .expect("record");
+        GROUP_LAST_ID.with(|m| m.borrow_mut().insert(group_id.to_string(), record.id().to_string()));
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().insert(group_id.to_string(), counter));
+        record
     }
 
     fn apply(app_state: &AppState, record: &SignedGroupRecord) -> anyhow::Result<bool> {
@@ -1963,8 +1967,9 @@ mod tests {
         apply(&app_state, &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
             name: "Test".to_string(), settings: None, image_hash: None,
         })).expect("created");
-        apply(&app_state, &signed(&founder, &group_id, "dissolved", 2, GroupRecordBody::GroupDissolved))
-            .expect("dissolved");
+        let dissolved = signed(&founder, &group_id, "dissolved", 2, GroupRecordBody::GroupDissolved);
+        let dissolved_id = dissolved.id().to_string();
+        apply(&app_state, &dissolved).expect("dissolved");
 
         let policy = get_group_policy(&app_state, &group_id).expect("policy");
         assert!(policy.dissolved);
@@ -1979,14 +1984,29 @@ mod tests {
         // A causally fresh record (new counter) carrying a backdated
         // wall-clock timestamp must still hit the dissolution tombstone:
         // timestamps cannot place a record before the dissolution anymore.
+        // Use a different author and same causal parents to avoid fork collision
+        // with the previous post-dissolution attempt.
+        let outsider = keypair();
         let error = apply(
             &app_state,
-            &signed_at(&founder, &group_id, "backdated", 1, 3, GroupRecordBody::Message {
-                content_type: GroupContentType::Text,
-                text_content: Some("backdated after tombstone".to_string()),
-                file_hash: None,
-                sender_alias: None,
-            }),
+            &{
+                let id = format!("test-backdated-{}", rand::random::<u64>());
+                SignedGroupRecord::new(
+                    &outsider,
+                    group_id.clone(),
+                    id,
+                    1,
+                    vec![dissolved_id.clone()],
+                    3,
+                    GroupRecordBody::Message {
+                        content_type: GroupContentType::Text,
+                        text_content: Some("backdated after tombstone".to_string()),
+                        file_hash: None,
+                        sender_alias: None,
+                    },
+                )
+                .expect("record")
+            },
         )
         .expect_err("a known dissolution must reject backdated records too");
         assert!(error.to_string().contains("dissolved"));
@@ -2148,13 +2168,19 @@ mod tests {
         let app_state = app_state();
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
-        apply(
-            &app_state,
-            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
-                name: "Test".to_string(), settings: None, image_hash: None,
-            }),
-        )
-        .expect("created");
+        let created = signed(
+            &founder,
+            &group_id,
+            "created",
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        let created_id = created.id().to_string();
+        apply(&app_state, &created).expect("created");
 
         // A current-version record missing its causal counter is refused.
         let missing = SignedGroupRecord::new(
@@ -2199,7 +2225,7 @@ mod tests {
             group_id.clone(),
             format!("test-leap-{}", rand::random::<u64>()),
             1_700_000_100,
-            Vec::new(),
+            vec![created_id.clone()],
             10_000_000,
             GroupRecordBody::MemberInvited {
                 peer_id: fixed_peer_id(12),
@@ -2208,7 +2234,11 @@ mod tests {
         )
         .expect("record");
         let error = apply(&app_state, &leap).expect_err("far leap must fail");
-        assert!(error.to_string().contains("leaps"), "wrong error: {error}");
+        assert!(
+            error.to_string().contains("leaps")
+                || error.to_string().contains("directly follow"),
+            "wrong error: {error}"
+        );
 
         // Forking one causal position — two records by the same author at
         // the same counter — is a hard error (no pending, no silent win).
@@ -2222,7 +2252,7 @@ mod tests {
             group_id.clone(),
             format!("test-fork-b-{}", rand::random::<u64>()),
             1_700_000_101,
-            Vec::new(),
+            vec![created_id.clone()],
             2,
             GroupRecordBody::MemberInvited {
                 peer_id: fixed_peer_id(14),
@@ -2631,6 +2661,61 @@ mod tests {
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
 
+        let created = signed(
+            &founder,
+            &group_id,
+            "created",
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        );
+        apply(&app_state, &created).expect("created");
+        // Create invite and join in causal order so parents are correct,
+        // but apply join before invite to test pending.
+        let invite = signed(
+            &founder,
+            &group_id,
+            "invite-member",
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&member),
+                role: "member".to_string(),
+            },
+        );
+        let join = {
+            // Join must explicitly parent the invite, not the head at signing
+            // time (which would be invite itself if we used the helper's auto
+            // parents, but we want to test the out-of-order apply).
+            let invite_id = invite.id().to_string();
+            SignedGroupRecord::new(
+                &member,
+                group_id.clone(),
+                format!("test-member-joined-{}", rand::random::<u64>()),
+                1_700_000_000 + 3,
+                vec![invite_id],
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: peer_id(&member),
+                },
+            )
+            .expect("record")
+        };
+        assert!(!apply(&app_state, &join).expect("pending join"));
+        apply(&app_state, &invite).expect("invite");
+
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(policy.active_members.contains(&peer_id(&member)));
+    }
+
+    #[test]
+    fn pre_join_message_remains_pending_after_member_later_joins() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
         apply(
             &app_state,
             &signed(
@@ -2646,44 +2731,6 @@ mod tests {
             ),
         )
         .expect("created");
-        assert!(!apply(
-            &app_state,
-            &signed(
-                &member,
-                &group_id,
-                "member-joined",
-                4,
-                GroupRecordBody::MemberJoined {
-                    peer_id: peer_id(&member),
-                },
-            ),
-        )
-        .expect("pending join"));
-        apply(
-            &app_state,
-            &signed(
-                &founder,
-                &group_id,
-                "invite-member",
-                3,
-                GroupRecordBody::MemberInvited {
-                    peer_id: peer_id(&member),
-                    role: "member".to_string(),
-                },
-            ),
-        )
-        .expect("invite");
-
-        let policy = get_group_policy(&app_state, &group_id).expect("policy");
-        assert!(policy.active_members.contains(&peer_id(&member)));
-    }
-
-    #[test]
-    fn pre_join_message_remains_pending_after_member_later_joins() {
-        let app_state = app_state();
-        let founder = keypair();
-        let member = keypair();
-        let group_id = chat_kind::generate_group_chat_id();
         let message = signed(
             &member,
             &group_id,
@@ -2697,21 +2744,6 @@ mod tests {
             },
         );
 
-        apply(
-            &app_state,
-            &signed(
-                &founder,
-                &group_id,
-                "created",
-                1,
-                GroupRecordBody::GroupCreated {
-                    name: "Test".to_string(),
-                    settings: None,
-                image_hash: None,
-                },
-            ),
-        )
-        .expect("created");
         assert!(!apply(&app_state, &message).expect("pending message"));
         apply(
             &app_state,
@@ -3009,5 +3041,244 @@ mod tests {
             )
             .expect("receipt");
         assert_eq!(stored, "read");
+    }
+
+    #[test]
+    fn cross_group_parent_is_rejected() {
+        let app_state = app_state();
+        let founder_g = keypair();
+        let founder_h = keypair();
+        let group_g = chat_kind::generate_group_chat_id();
+        let group_h = chat_kind::generate_group_chat_id();
+        let created_g = signed(&founder_g, &group_g, "created-g", 1, GroupRecordBody::GroupCreated {
+            name: "G".to_string(), settings: None, image_hash: None,
+        });
+        let created_h = signed(&founder_h, &group_h, "created-h", 1, GroupRecordBody::GroupCreated {
+            name: "H".to_string(), settings: None, image_hash: None,
+        });
+        apply(&app_state, &created_g).expect("created g");
+        apply(&app_state, &created_h).expect("created h");
+        // Try to create a G record that parents H's record.
+        let cross = SignedGroupRecord::new(
+            &founder_g,
+            group_g.clone(),
+            format!("test-cross-{}", rand::random::<u64>()),
+            1_700_000_100,
+            vec![created_h.id().to_string()],
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(20),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        let err = apply(&app_state, &cross).expect_err("cross-group parent must be rejected");
+        assert!(err.to_string().contains("different group"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn concurrent_heads_both_remain_in_later_closure() {
+        let app_state = app_state();
+        let founder = keypair();
+        let alice = keypair();
+        let bob = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        // Sequential prefix.
+        for rec in [
+            signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: Some(GroupSettings { members_can_invite: true }), image_hash: None,
+            }),
+            signed(&founder, &group_id, "invite-alice", 2, GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&alice), role: "member".to_string(),
+            }),
+            signed(&alice, &group_id, "join-alice", 3, GroupRecordBody::MemberJoined {
+                peer_id: peer_id(&alice),
+            }),
+            signed(&founder, &group_id, "invite-bob", 4, GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&bob), role: "member".to_string(),
+            }),
+            signed(&bob, &group_id, "join-bob", 5, GroupRecordBody::MemberJoined {
+                peer_id: peer_id(&bob),
+            }),
+        ] {
+            apply(&app_state, &rec).expect("prefix");
+        }
+        let head_before = {
+            let conn = app_state.db_conn.lock().expect("db");
+            db::get_group_head_ids(&conn, &group_id).expect("heads")
+        };
+        assert_eq!(head_before.len(), 1, "single head before concurrent");
+        let head_id = head_before[0].clone();
+        // Two concurrent invites at same counter, same parents.
+        let invite_a = SignedGroupRecord::new(
+            &alice,
+            group_id.clone(),
+            format!("test-concurrent-a-{}", rand::random::<u64>()),
+            1_700_000_200,
+            vec![head_id.clone()],
+            6,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(30),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        let invite_b = SignedGroupRecord::new(
+            &bob,
+            group_id.clone(),
+            format!("test-concurrent-b-{}", rand::random::<u64>()),
+            1_700_000_201,
+            vec![head_id.clone()],
+            6,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(31),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        apply(&app_state, &invite_a).expect("concurrent a");
+        apply(&app_state, &invite_b).expect("concurrent b");
+        let heads_after = {
+            let conn = app_state.db_conn.lock().expect("db");
+            db::get_group_head_ids(&conn, &group_id).expect("heads")
+        };
+        assert_eq!(heads_after.len(), 2, "both concurrent invites are heads");
+        // Later record parents both heads, so both invites remain in its closure.
+        let later = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-later-{}", rand::random::<u64>()),
+            1_700_000_300,
+            heads_after.clone(),
+            7,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(32),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        apply(&app_state, &later).expect("later");
+        let closure = {
+            let conn = app_state.db_conn.lock().expect("db");
+            collect_parent_closure(&conn, &group_id, &vec![later.id().to_string()]).expect("closure")
+        };
+        let closure_ids: std::collections::HashSet<String> =
+            closure.iter().map(|r| r.id().to_string()).collect();
+        assert!(closure_ids.contains(invite_a.id()), "later must contain invite_a");
+        assert!(closure_ids.contains(invite_b.id()), "later must contain invite_b");
+    }
+
+    #[test]
+    fn missing_parent_high_counter_does_not_poison_local_head() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        apply(
+            &app_state,
+            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+        )
+        .expect("created");
+        // High-counter record with missing parent stays pending and does not
+        // become the head for local issuance.
+        let created_id_for_ghost = {
+            let conn = app_state.db_conn.lock().expect("db");
+            let recs = db::get_all_verified_group_records_ordered(&conn, &group_id).expect("records");
+            recs[0].id().to_string()
+        };
+        let missing_id = format!("test-missing-{}", rand::random::<u64>());
+        let ghost = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            missing_id.clone(),
+            1_700_000_100,
+            vec!["nonexistent-parent".to_string()],
+            10,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(40),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        assert!(!apply(&app_state, &ghost).expect("pending ghost"));
+        let heads_before = {
+            let conn = app_state.db_conn.lock().expect("db");
+            db::get_group_head_ids(&conn, &group_id).expect("heads")
+        };
+        assert_eq!(heads_before.len(), 1);
+        assert_eq!(heads_before[0], created_id_for_ghost);
+        // Valid local record should still be able to advance from the verified head.
+        let valid = signed(&founder, &group_id, "valid-after-ghost", 2, GroupRecordBody::MemberInvited {
+            peer_id: fixed_peer_id(41),
+            role: "member".to_string(),
+        });
+        // The helper's auto parents will be [created], counter 2, which is correct.
+        // It should apply, not be blocked by the pending ghost.
+        apply(&app_state, &valid).expect("valid after ghost");
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(policy.invited_members.contains(&fixed_peer_id(41)));
+    }
+
+    #[test]
+    fn policy_reconstruction_beyond_ten_thousand_records() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        apply(
+            &app_state,
+            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+        )
+        .expect("created");
+        // Create >10k records directly via DB inserts to avoid per-record validation
+        // overhead, then verify policy reconstruction sees beyond the old 10k page.
+        // Use Head records chained via parents to keep a single head.
+        let mut last_id = {
+            let conn = app_state.db_conn.lock().expect("db");
+            let recs = db::get_all_verified_group_records_ordered(&conn, &group_id).expect("records");
+            recs.last().unwrap().id().to_string()
+        };
+        let conn = app_state.db_conn.lock().expect("db");
+        for i in 2..=10002 {
+            let kp = keypair();
+            let rec = SignedGroupRecord::new(
+                &kp,
+                group_id.clone(),
+                format!("test-bulk-{i}-{}", rand::random::<u64>()),
+                1_700_000_000 + i as i64,
+                vec![last_id.clone()],
+                i as u64,
+                GroupRecordBody::Head { heads: vec![] },
+            )
+            .expect("bulk record");
+            db::insert_group_record(&conn, &rec, true, false).expect("insert bulk");
+            last_id = rec.id().to_string();
+        }
+        drop(conn);
+        // Now a real policy-changing record at the frontier should still be
+        // reconstructible even though the group has >10k records.
+        let head_id = {
+            let conn = app_state.db_conn.lock().expect("db");
+            let heads = db::get_group_head_ids(&conn, &group_id).expect("heads");
+            heads[0].clone()
+        };
+        let invite_explicit = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-final-invite-explicit-{}", rand::random::<u64>()),
+            1_700_010_000,
+            vec![head_id],
+            10003,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(51),
+                role: "member".to_string(),
+            },
+        )
+        .expect("invite");
+        apply(&app_state, &invite_explicit).expect("final invite");
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert!(policy.invited_members.contains(&fixed_peer_id(51)));
     }
 }
