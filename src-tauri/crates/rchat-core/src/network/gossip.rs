@@ -211,7 +211,6 @@ pub struct UnsignedGroupRecord {
     /// non-monotonic for their author or leap more than
     /// [`MAX_GROUP_RECORD_COUNTER_JUMP`] past everything known, so a record
     /// cannot authorize itself by claiming an arbitrary position.
-    #[serde(default)]
     pub lamport_counter: u64,
     pub body: GroupRecordBody,
 }
@@ -296,7 +295,7 @@ impl SignedGroupRecord {
     }
 
     pub fn verify(&self) -> bool {
-        if !(1..=Self::VERSION).contains(&self.unsigned.version) {
+        if self.unsigned.version != Self::VERSION {
             return false;
         }
         let Ok(public_key_bytes) = BASE64.decode(&self.public_key_b64) else {
@@ -418,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_group_records_remain_verifiable() {
+    fn version_one_group_records_are_rejected_mandatory_upgrade() {
         let key = identity::Keypair::generate_ed25519();
         let unsigned = UnsignedGroupRecord {
             version: 1,
@@ -443,7 +442,7 @@ mod tests {
             signature_b64: BASE64.encode(signature),
         };
 
-        assert!(record.verify());
+        assert!(!record.verify(), "v1 records must be rejected: upgrade required");
     }
 
     #[test]

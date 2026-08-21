@@ -560,8 +560,19 @@ impl NetworkManager {
             let Ok(conn) = self.app_state.db_conn.lock() else {
                 continue;
             };
-            let lamport_counter =
-                crate::chat::group::next_group_record_counter(&conn, &group_id);
+            let parents =
+                crate::storage::db::get_group_head_ids(&conn, &group_id).unwrap_or_default();
+            let lamport_counter = if parents.is_empty() {
+                1
+            } else {
+                let mut max_parent = 0u64;
+                for pid in &parents {
+                    if let Ok(Some(rec)) = crate::storage::db::get_group_record(&conn, pid) {
+                        max_parent = max_parent.max(rec.lamport_counter());
+                    }
+                }
+                max_parent.saturating_add(1)
+            };
             let record = match crate::network::gossip::SignedGroupRecord::new(
                 &keypair,
                 group_id.clone(),
@@ -577,7 +588,7 @@ impl NetworkManager {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
-                Vec::new(),
+                parents,
                 lamport_counter,
                 crate::network::gossip::GroupRecordBody::FileAvailability {
                     file_hash: file_hash.to_string(),

@@ -338,6 +338,7 @@ pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
              record_type TEXT NOT NULL,
              author_peer_id TEXT NOT NULL,
              timestamp INTEGER NOT NULL,
+             lamport_counter INTEGER NOT NULL DEFAULT 0,
              payload_json TEXT NOT NULL,
              public_key_b64 TEXT NOT NULL,
              signature_b64 TEXT NOT NULL,
@@ -347,6 +348,23 @@ pub(crate) fn create_tables(conn: &Connection) -> anyhow::Result<()> {
          )",
         [],
     )?;
+    // Causal ordering must not be truncated or ordered by untrusted
+    // timestamps. The counter column is queryable and indexed so the
+    // frontier can be obtained without a 10k page, and the
+    // (author,counter) fork is detectable via an indexed lookup over the
+    // complete set.
+    let _ = conn.execute(
+        "ALTER TABLE group_records ADD COLUMN lamport_counter INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_records_group_counter ON group_records(group_id, lamport_counter)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_group_records_author_counter ON group_records(group_id, author_peer_id, lamport_counter)",
+        [],
+    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS group_invites (
@@ -994,7 +1012,7 @@ pub fn delete_group_chat(conn: &Connection, chat_id: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1010,14 +1028,15 @@ pub fn insert_group_record(
     let payload_json = serde_json::to_string(record)?;
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO group_records
-         (id, group_id, record_type, author_peer_id, timestamp, payload_json, public_key_b64, signature_b64, verified, pending, received_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         (id, group_id, record_type, author_peer_id, timestamp, lamport_counter, payload_json, public_key_b64, signature_b64, verified, pending, received_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         (
             record.id(),
             record.group_id(),
             record.body().kind(),
             record.author_peer_id(),
             record.timestamp(),
+            record.lamport_counter() as i64,
             payload_json,
             &record.public_key_b64,
             &record.signature_b64,
@@ -1106,6 +1125,74 @@ pub fn get_group_records_including_pending(
         if out.len() >= limit {
             break;
         }
+    }
+    Ok(out)
+}
+
+pub fn get_group_max_lamport_counter(conn: &Connection, group_id: &str) -> anyhow::Result<u64> {
+    let max: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(lamport_counter) FROM group_records WHERE group_id = ?1",
+            [group_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(max.unwrap_or(0) as u64)
+}
+
+pub fn get_group_head_ids(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<String>> {
+    // Single-head total order: the maximal (counter, author, id) is the head.
+    // Concurrent same-counter records are ordered by author, so one wins
+    // deterministically; a fork that produces two heads at the same position
+    // is rejected by the unique (author,counter) index before it can fork
+    // the DAG. For a true multi-head DAG the caller would need to parent
+    // all heads, but the total order keeps the common case to one parent.
+    let mut stmt = conn.prepare(
+        "SELECT id FROM group_records WHERE group_id = ?1 ORDER BY lamport_counter DESC, author_peer_id DESC, id DESC LIMIT 1",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn has_author_counter(
+    conn: &Connection,
+    group_id: &str,
+    author_peer_id: &str,
+    lamport_counter: u64,
+    exclude_id: &str,
+) -> anyhow::Result<bool> {
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT id FROM group_records WHERE group_id = ?1 AND author_peer_id = ?2 AND lamport_counter = ?3 AND id != ?4 LIMIT 1",
+            (
+                group_id,
+                author_peer_id,
+                lamport_counter as i64,
+                exclude_id,
+            ),
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+pub fn get_group_records_before_counter(
+    conn: &Connection,
+    group_id: &str,
+    counter: u64,
+) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT payload_json FROM group_records WHERE group_id = ?1 AND lamport_counter < ?2 AND verified = 1 ORDER BY lamport_counter ASC",
+    )?;
+    let rows = stmt.query_map((group_id, counter as i64), |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
     }
     Ok(out)
 }
@@ -2012,6 +2099,9 @@ mod tests {
     use super::*;
     use crate::network::gossip::{GroupRecordBody, SignedGroupRecord};
     use libp2p::identity;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1000);
 
     fn signed_group_record(
         keypair: &identity::Keypair,
@@ -2019,13 +2109,17 @@ mod tests {
         id: &str,
         timestamp: i64,
     ) -> SignedGroupRecord {
+        // Use a distinct counter per call so the unique (author,counter)
+        // index does not collide when the same helper is used for multiple
+        // records in one test.
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         SignedGroupRecord::new(
             keypair,
             group_id.to_string(),
             id.to_string(),
             timestamp,
             Vec::new(),
-            1,
+            counter,
             GroupRecordBody::Head {
                 heads: vec![id.to_string()],
             },
@@ -2189,9 +2283,9 @@ mod tests {
         .expect("admin receipt");
         conn.execute(
             "INSERT INTO group_records
-             (id, group_id, record_type, author_peer_id, timestamp, payload_json, public_key_b64, signature_b64, verified, pending, received_at)
-             VALUES ('pending-message', ?1, 'message', 'peer-member', 1, '{}', '', '', 0, 1, 40),
-                    ('pending-receipt', ?1, 'receipt', 'peer-member', 2, '{}', '', '', 0, 1, 30)",
+             (id, group_id, record_type, author_peer_id, timestamp, lamport_counter, payload_json, public_key_b64, signature_b64, verified, pending, received_at)
+             VALUES ('pending-message', ?1, 'message', 'peer-member', 1, 9001, '{}', '', '', 0, 1, 40),
+                    ('pending-receipt', ?1, 'receipt', 'peer-member', 2, 9002, '{}', '', '', 0, 1, 30)",
             [group_id],
         )
         .expect("pending records");
