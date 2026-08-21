@@ -3,7 +3,7 @@ use tauri::State;
 use crate::chat_identity;
 use crate::chat_kind::{self, ChatKind};
 use crate::network::command::NetworkCommand;
-use crate::NetworkState;
+use crate::{settings, AppState, NetworkState};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -302,7 +302,7 @@ pub async fn report_video_call_render_stats(
 
 #[tauri::command]
 pub async fn get_video_capture_support() -> Result<VideoCaptureSupport, String> {
-    match rchat_video_capture::list_devices() {
+    match settings::camera::list_camera_devices() {
         Ok(devices) => {
             let devices = devices.into_iter().map(video_capture_device_info).collect();
             Ok(VideoCaptureSupport {
@@ -331,9 +331,30 @@ pub async fn get_screen_capture_support() -> Result<ScreenCaptureSupport, String
 
 #[tauri::command]
 pub async fn get_video_capture_devices() -> Result<Vec<VideoCaptureDeviceInfo>, String> {
-    rchat_video_capture::list_devices()
+    settings::camera::list_camera_devices()
         .map(|devices| devices.into_iter().map(video_capture_device_info).collect())
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_selected_camera_device_id(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    settings::camera::get_selected_camera_device_id(&state)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_selected_camera_device_id(
+    device_id: Option<String>,
+    state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    let sender = state.sender.lock().await;
+    sender
+        .send(NetworkCommand::SetVideoCallCameraDevice { device_id })
+        .await
+        .map_err(|e| format!("Failed to update camera device: {}", e))
 }
 
 fn video_capture_device_info(

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { api } from "$lib/tauri/api";
+  import { api, type VideoCaptureDeviceInfo, type VideoCaptureSupport } from "$lib/tauri/api";
   import {
     currentMediaSupport,
     describeMediaError,
@@ -23,6 +23,13 @@
   let activeAudioTrack = $state("");
   let activeVideoTrack = $state("");
   let secureContext = $state(false);
+  let nativeCameraDevices = $state<VideoCaptureDeviceInfo[]>([]);
+  let nativeCameraSupport = $state<VideoCaptureSupport | null>(null);
+  let selectedNativeCameraId = $state<string | null>(null);
+  let nativeCameraLoading = $state(false);
+  let nativeCameraSaving = $state(false);
+  let nativeCameraError = $state("");
+  let nativeCameraLoaded = $state(false);
 
   let audioContext: AudioContext | null = null;
   let analyser: AnalyserNode | null = null;
@@ -32,10 +39,15 @@
 
   let hasAudioTrack = $derived(!!stream?.getAudioTracks().length);
   let hasVideoTrack = $derived(!!stream?.getVideoTracks().length);
+  let nativeCameraUnavailable = $derived(
+    nativeCameraLoaded &&
+      selectedNativeCameraId !== null &&
+      !nativeCameraDevices.some((device) => device.id === selectedNativeCameraId),
+  );
 
   onMount(async () => {
     refreshSupport();
-    await refreshDevices();
+    await Promise.all([refreshDevices(), refreshNativeCamera()]);
   });
 
   onDestroy(() => {
@@ -65,6 +77,51 @@
     } catch (e) {
       logMediaTest("enumerate devices failed", { error: describeMediaError(e) });
     }
+  }
+
+  async function refreshNativeCamera() {
+    nativeCameraLoading = true;
+    nativeCameraError = "";
+
+    try {
+      const [selectedDeviceId, support] = await Promise.all([
+        api.getSelectedCameraDeviceId(),
+        api.getVideoCaptureSupport(),
+      ]);
+      selectedNativeCameraId = selectedDeviceId;
+      nativeCameraSupport = support;
+      nativeCameraDevices = support.devices;
+    } catch (e) {
+      nativeCameraError = describeMediaError(e);
+    } finally {
+      nativeCameraLoaded = true;
+      nativeCameraLoading = false;
+    }
+  }
+
+  async function saveNativeCameraSelection(event: Event) {
+    const select = event.currentTarget as HTMLSelectElement;
+    const nextDeviceId = select.value || null;
+    const previousDeviceId = selectedNativeCameraId;
+    selectedNativeCameraId = nextDeviceId;
+    nativeCameraSaving = true;
+    nativeCameraError = "";
+
+    try {
+      await api.setSelectedCameraDeviceId(nextDeviceId);
+    } catch (e) {
+      selectedNativeCameraId = previousDeviceId;
+      nativeCameraError = `Could not save native camera selection: ${describeMediaError(e)}`;
+    } finally {
+      nativeCameraSaving = false;
+    }
+  }
+
+  function nativeCameraOptionLabel(device: VideoCaptureDeviceInfo): string {
+    const name = device.name.trim() || `Camera ${device.index + 1}`;
+    const description = device.description.trim();
+    const details = [device.backend.trim(), description && description !== name ? description : ""];
+    return [name, ...details].filter(Boolean).join(" · ");
   }
 
   function constraintsFor(mode: TestMode): MediaStreamConstraints {
@@ -306,10 +363,82 @@
     {/if}
   </div>
 
+  <div class="rounded-xl border border-theme-base-800 bg-theme-base-900 p-4">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h3 class="text-sm font-semibold text-theme-base-200">Native call camera</h3>
+        <p class="mt-1 max-w-2xl text-xs leading-relaxed text-theme-base-500">
+          This setting controls the native camera used by RChat video calls. The browser preview below is
+          WebView diagnostics and does not test this selected native camera.
+        </p>
+      </div>
+      <button
+        type="button"
+        onclick={refreshNativeCamera}
+        disabled={nativeCameraLoading || nativeCameraSaving}
+        class="rounded-lg border border-theme-base-700 bg-theme-base-800 px-3 py-2 text-xs font-semibold text-theme-base-200 hover:bg-theme-base-700 disabled:opacity-50"
+      >
+        {nativeCameraLoading ? "Refreshing…" : "Refresh"}
+      </button>
+    </div>
+
+    <div class="mt-4 max-w-2xl">
+      <label for="native-call-camera" class="block text-xs font-medium text-theme-base-300">
+        Camera device
+      </label>
+      <select
+        id="native-call-camera"
+        value={selectedNativeCameraId ?? ""}
+        onchange={saveNativeCameraSelection}
+        disabled={nativeCameraLoading || nativeCameraSaving || nativeCameraSupport?.supported === false}
+        aria-describedby="native-call-camera-status"
+        class="mt-2 w-full rounded-lg border border-theme-base-700 bg-theme-base-950 px-3 py-2 text-sm text-theme-base-100 outline-none transition focus:border-theme-primary-500 focus:ring-2 focus:ring-theme-primary-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        <option value="">Automatic</option>
+        {#if nativeCameraUnavailable && selectedNativeCameraId}
+          <option value={selectedNativeCameraId}>{selectedNativeCameraId} · unavailable</option>
+        {/if}
+        {#each nativeCameraDevices as device}
+          <option value={device.id}>{nativeCameraOptionLabel(device)}</option>
+        {/each}
+      </select>
+
+      <div id="native-call-camera-status" class="mt-2 text-xs" aria-live="polite" role="status">
+        {#if nativeCameraLoading}
+          <span class="text-theme-base-500">Loading native camera devices…</span>
+        {:else if nativeCameraSaving}
+          <span class="text-theme-base-400">Saving selection…</span>
+        {:else if nativeCameraSupport?.supported === false}
+          <span class="text-theme-error-300">
+            Native camera capture is unavailable{nativeCameraSupport.reason ? `: ${nativeCameraSupport.reason}` : "."}
+            Calls use Automatic.
+          </span>
+        {:else if nativeCameraUnavailable}
+          <span class="text-theme-warning-300">
+            Saved camera is unavailable; calls use Automatic while unavailable. The saved choice is retried the next time capture starts.
+          </span>
+        {:else if nativeCameraSupport?.devices.length === 0}
+          <span class="text-theme-base-500">No native camera devices reported. Calls use Automatic.</span>
+        {:else}
+          <span class="text-theme-base-500">Changes apply immediately to native calls.</span>
+        {/if}
+      </div>
+
+      {#if nativeCameraError}
+        <div class="mt-3 rounded-lg border border-theme-error-500/40 bg-theme-error-500/10 px-3 py-2 text-sm text-theme-error-300">
+          {nativeCameraError}
+        </div>
+      {/if}
+    </div>
+  </div>
+
   <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.8fr)] gap-5">
     <div class="rounded-xl border border-theme-base-800 bg-theme-base-900 p-4">
       <div class="mb-3 flex items-center justify-between">
-        <h3 class="text-sm font-semibold text-theme-base-200">Camera</h3>
+        <div>
+          <h3 class="text-sm font-semibold text-theme-base-200">WebView camera preview</h3>
+          <p class="mt-1 text-xs text-theme-base-500">Diagnostic only; this does not test the native call camera.</p>
+        </div>
         <span class={`text-xs ${hasVideoTrack ? "text-theme-success-400" : "text-theme-base-500"}`}>
           {hasVideoTrack ? "Active" : "Inactive"}
         </span>
@@ -378,11 +507,14 @@
   </div>
 
   <div class="rounded-xl border border-theme-base-800 bg-theme-base-900 p-4">
-    <h3 class="mb-3 text-sm font-semibold text-theme-base-200">Detected Devices</h3>
+    <h3 class="text-sm font-semibold text-theme-base-200">WebView-detected devices</h3>
+    <p class="mt-1 text-xs text-theme-base-500">
+      Browser diagnostics only; use Native call camera above for the devices used by RChat calls.
+    </p>
     {#if devices.length === 0}
-      <div class="text-sm text-theme-base-500">No devices reported.</div>
+      <div class="mt-3 text-sm text-theme-base-500">No devices reported.</div>
     {:else}
-      <div class="space-y-2">
+      <div class="mt-3 space-y-2">
         {#each devices as device}
           <div class="flex items-center justify-between gap-3 rounded-lg bg-theme-base-950 px-3 py-2 text-xs">
             <span class="text-theme-base-300">{deviceLabel(device)}</span>

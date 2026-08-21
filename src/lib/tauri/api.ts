@@ -107,6 +107,8 @@ export const COMMANDS = {
   reportVideoCallRenderStats: "report_video_call_render_stats",
   getVideoCaptureSupport: "get_video_capture_support",
   getVideoCaptureDevices: "get_video_capture_devices",
+  getSelectedCameraDeviceId: "get_selected_camera_device_id",
+  setSelectedCameraDeviceId: "set_selected_camera_device_id",
   getScreenCaptureSupport: "get_screen_capture_support",
   getVoiceCallState: "get_voice_call_state",
   startScreenBroadcast: "start_screen_broadcast",
@@ -755,6 +757,14 @@ type CommandSpec = {
     args?: undefined;
     result: VideoCaptureDeviceInfo[];
   };
+  [COMMANDS.getSelectedCameraDeviceId]: {
+    args?: undefined;
+    result: string | null;
+  };
+  [COMMANDS.setSelectedCameraDeviceId]: {
+    args: { device_id: string | null };
+    result: void;
+  };
   [COMMANDS.getScreenCaptureSupport]: {
     args?: undefined;
     result: ScreenCaptureSupport;
@@ -1140,6 +1150,10 @@ export const api = {
     }),
   getVideoCaptureSupport: () => invokeCommand(COMMANDS.getVideoCaptureSupport),
   getVideoCaptureDevices: () => invokeCommand(COMMANDS.getVideoCaptureDevices),
+  getSelectedCameraDeviceId: () =>
+    invokeCommand(COMMANDS.getSelectedCameraDeviceId),
+  setSelectedCameraDeviceId: (deviceId: string | null) =>
+    invokeCommand(COMMANDS.setSelectedCameraDeviceId, { device_id: deviceId }),
   getScreenCaptureSupport: () => invokeCommand(COMMANDS.getScreenCaptureSupport),
   getVoiceCallState: () => invokeCommand(COMMANDS.getVoiceCallState),
   startScreenBroadcast: (peerId: string, profile: ScreenBroadcastProfile) =>
