@@ -176,23 +176,6 @@ pub enum NetworkCommand {
         call_id: String,
         enabled: bool,
     },
-    SendVideoCallChunk {
-        call_id: String,
-        seq: u32,
-        timestamp: i64,
-        mime: String,
-        codec: String,
-        chunk_type: String,
-        payload: Vec<u8>,
-    },
-    SubmitVideoCallI420Frame {
-        call_id: String,
-        timestamp_us: i64,
-        width: u32,
-        height: u32,
-        profile: String,
-        data: Vec<u8>,
-    },
     SetVideoCallCameraDevice {
         device_id: Option<String>,
     },

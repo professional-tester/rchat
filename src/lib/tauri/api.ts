@@ -101,8 +101,6 @@ export const COMMANDS = {
   endVideoCall: "end_video_call",
   setVideoCallMuted: "set_video_call_muted",
   setVideoCallCameraEnabled: "set_video_call_camera_enabled",
-  sendVideoCallChunk: "send_video_call_chunk",
-  submitVideoCallI420Frame: "submit_video_call_i420_frame",
   setVideoCallQuality: "set_video_call_quality",
   reportVideoCallRenderStats: "report_video_call_render_stats",
   getVideoCaptureSupport: "get_video_capture_support",
@@ -718,29 +716,6 @@ type CommandSpec = {
     args: { call_id: string; enabled: boolean };
     result: void;
   };
-  [COMMANDS.sendVideoCallChunk]: {
-    args: {
-      call_id: string;
-      seq: number;
-      timestamp: number;
-      mime: string;
-      codec: string;
-      chunk_type: VideoChunkType;
-      payload: Uint8Array;
-    };
-    result: void;
-  };
-  [COMMANDS.submitVideoCallI420Frame]: {
-    args: {
-      call_id: string;
-      timestamp_us: number;
-      width: number;
-      height: number;
-      profile: VideoProfile;
-      data: Uint8Array;
-    };
-    result: void;
-  };
   [COMMANDS.setVideoCallQuality]: {
     args: { call_id: string; mode: VideoQualityMode };
     result: void;
@@ -1106,40 +1081,6 @@ export const api = {
     invokeCommand(COMMANDS.setVideoCallCameraEnabled, {
       call_id: callId,
       enabled,
-    }),
-  sendVideoCallChunk: (
-    callId: string,
-    seq: number,
-    timestamp: number,
-    mime: string,
-    codec: string,
-    chunkType: VideoChunkType,
-    payload: Uint8Array,
-  ) =>
-    invokeCommand(COMMANDS.sendVideoCallChunk, {
-      call_id: callId,
-      seq,
-      timestamp,
-      mime,
-      codec,
-      chunk_type: chunkType,
-      payload,
-    }),
-  submitVideoCallI420Frame: (
-    callId: string,
-    timestampUs: number,
-    width: number,
-    height: number,
-    profile: VideoProfile,
-    data: Uint8Array,
-  ) =>
-    invokeCommand(COMMANDS.submitVideoCallI420Frame, {
-      call_id: callId,
-      timestamp_us: timestampUs,
-      width,
-      height,
-      profile,
-      data,
     }),
   setVideoCallQuality: (callId: string, mode: VideoQualityMode) =>
     invokeCommand(COMMANDS.setVideoCallQuality, { call_id: callId, mode }),

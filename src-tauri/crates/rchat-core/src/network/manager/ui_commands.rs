@@ -164,38 +164,6 @@ impl NetworkManager {
                 self.handle_set_video_call_camera_enabled(call_id, enabled)
                     .await;
             }
-            NetworkCommand::SendVideoCallChunk {
-                call_id,
-                seq,
-                timestamp,
-                mime,
-                codec,
-                chunk_type,
-                payload,
-            } => {
-                self.handle_send_video_call_chunk(
-                    call_id, seq, timestamp, mime, codec, chunk_type, payload,
-                )
-                .await;
-            }
-            NetworkCommand::SubmitVideoCallI420Frame {
-                call_id,
-                timestamp_us,
-                width,
-                height,
-                profile,
-                data,
-            } => {
-                self.handle_submit_video_call_i420_frame(
-                    call_id,
-                    timestamp_us,
-                    width,
-                    height,
-                    profile,
-                    data,
-                )
-                .await;
-            }
             NetworkCommand::SetVideoCallCameraDevice { device_id } => {
                 self.handle_set_video_call_camera_device(device_id).await;
             }

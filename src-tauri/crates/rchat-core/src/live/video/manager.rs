@@ -1115,50 +1115,6 @@ impl NetworkManager {
         }
     }
 
-    pub(super) async fn handle_send_video_call_chunk(
-        &mut self,
-        _call_id: String,
-        _seq: u32,
-        _timestamp: i64,
-        _mime: String,
-        _codec: String,
-        _chunk_type: String,
-        _payload: Vec<u8>,
-    ) {
-        self.video_network_stats.raw_frames_dropped += 1;
-    }
-
-    pub(super) async fn handle_submit_video_call_i420_frame(
-        &mut self,
-        call_id: String,
-        timestamp_us: i64,
-        width: u32,
-        height: u32,
-        _profile: String,
-        data: Vec<u8>,
-    ) {
-        let Some(call_snapshot) = self.active_call.as_ref().cloned() else {
-            return;
-        };
-        if call_snapshot.call_id != call_id
-            || call_snapshot.phase != ActiveCallPhase::Active
-            || call_snapshot.kind != CallKind::Video
-            || !call_snapshot.camera_enabled
-        {
-            return;
-        }
-        if !self.peer_has_quic_path(&call_snapshot.remote_peer_id) {
-            self.transition_to_idle(Some("quic_path_lost".to_string()))
-                .await;
-            return;
-        }
-        if self.video_stream_tx.is_none() {
-            let _ = self.start_video_stream_writer(call_snapshot.remote_peer_id, call_id.clone());
-        }
-
-        self.queue_outbound_video_encode_frame(&call_id, timestamp_us, width, height, data);
-    }
-
     fn queue_outbound_video_encode_frame(
         &mut self,
         call_id: &str,

@@ -16,10 +16,9 @@ use crate::commands::call::{
     end_video_call, end_voice_call, get_broadcast_state, get_connected_chat_ids,
     get_screen_capture_support, get_selected_camera_device_id, get_video_capture_devices,
     get_video_capture_support, get_voice_call_state, reject_screen_broadcast, reject_video_call,
-    reject_voice_call, report_video_call_render_stats, send_video_call_chunk,
-    set_selected_camera_device_id, set_video_call_camera_enabled, set_video_call_muted,
-    set_video_call_quality, set_voice_call_muted, start_screen_broadcast, start_video_call,
-    start_voice_call, submit_video_call_i420_frame,
+    reject_voice_call, report_video_call_render_stats, set_selected_camera_device_id,
+    set_video_call_camera_enabled, set_video_call_muted, set_video_call_quality,
+    set_voice_call_muted, start_screen_broadcast, start_video_call, start_voice_call,
 };
 use crate::commands::chat::{
     accept_group_invite, create_group_chat, get_chat_history, get_chat_latest_times, get_chat_list,
@@ -262,8 +261,6 @@ pub fn run() {
             end_video_call,
             set_video_call_muted,
             set_video_call_camera_enabled,
-            send_video_call_chunk,
-            submit_video_call_i420_frame,
             set_video_call_quality,
             report_video_call_render_stats,
             get_video_capture_support,

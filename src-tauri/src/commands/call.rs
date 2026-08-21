@@ -217,57 +217,6 @@ pub async fn set_video_call_camera_enabled(
 }
 
 #[tauri::command]
-pub async fn send_video_call_chunk(
-    call_id: String,
-    seq: u32,
-    timestamp: i64,
-    mime: String,
-    codec: String,
-    chunk_type: String,
-    payload: Vec<u8>,
-    state: State<'_, NetworkState>,
-) -> Result<(), String> {
-    let sender = state.sender.lock().await;
-    sender
-        .send(NetworkCommand::SendVideoCallChunk {
-            call_id,
-            seq,
-            timestamp,
-            mime,
-            codec,
-            chunk_type,
-            payload,
-        })
-        .await
-        .map_err(|e| format!("Failed to send video chunk: {}", e))
-}
-
-#[tauri::command]
-pub async fn submit_video_call_i420_frame(
-    call_id: String,
-    timestamp_us: i64,
-    width: u32,
-    height: u32,
-    profile: String,
-    data: Vec<u8>,
-    state: State<'_, NetworkState>,
-) -> Result<(), String> {
-    let sender = state.sender.lock().await;
-    match sender.try_send(NetworkCommand::SubmitVideoCallI420Frame {
-        call_id,
-        timestamp_us,
-        width,
-        height,
-        profile,
-        data,
-    }) {
-        Ok(()) => Ok(()),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
-        Err(e) => Err(format!("Failed to submit video frame: {}", e)),
-    }
-}
-
-#[tauri::command]
 pub async fn set_video_call_quality(
     call_id: String,
     mode: String,
