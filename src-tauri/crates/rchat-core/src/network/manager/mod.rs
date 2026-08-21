@@ -653,6 +653,13 @@ pub struct NetworkManager {
     video_encode_worker_handle: tokio::task::JoinHandle<()>,
     // Pending native camera startup task; polled from the video tick without blocking the network loop.
     video_capture_start_task: Option<video_call::VideoCaptureStartTask>,
+    // Requested camera device id used by the current/pending native capture.
+    video_capture_device_id: Option<String>,
+    // Monotonic generation used to reject stale camera startup tasks after a selection change.
+    video_capture_device_generation: u64,
+    // Persisted camera preference, loaded once on first capture use.
+    video_selected_device_id: Option<String>,
+    video_selected_device_id_loaded: bool,
     // Native local camera capture for active video calls.
     video_capture_session: Option<rchat_video_capture::VideoCaptureSession>,
     // Capture session metadata for diagnostics.
@@ -944,6 +951,10 @@ impl NetworkManager {
             video_encode_event_rx,
             video_encode_worker_handle,
             video_capture_start_task: None,
+            video_capture_device_id: None,
+            video_capture_device_generation: 0,
+            video_selected_device_id: None,
+            video_selected_device_id_loaded: false,
             video_capture_session: None,
             video_capture_info: None,
             video_capture_last_stats: rchat_video_capture::CaptureSessionStats::default(),

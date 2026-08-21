@@ -166,6 +166,8 @@ pub struct UserConfig {
     pub custom_themes: Vec<CustomThemeEntry>,
     #[serde(default)]
     pub github_peer_mapping: std::collections::HashMap<String, String>, // GitHub username → libp2p PeerId
+    #[serde(default)]
+    pub selected_camera_device_id: Option<String>, // Native camera device id; None selects automatically
 }
 
 impl Default for UserConfig {
@@ -188,6 +190,7 @@ impl Default for UserConfig {
             selected_preset: None,
             custom_themes: vec![],
             github_peer_mapping: std::collections::HashMap::new(),
+            selected_camera_device_id: None,
         }
     }
 }
@@ -508,6 +511,47 @@ mod tests {
 
         let parsed: UserConfig = serde_json::from_str(legacy).expect("legacy user config parses");
         assert_eq!(parsed.connectivity, ConnectivitySettings::reachable());
+    }
+
+    #[test]
+    fn legacy_user_config_defaults_selected_camera_device_to_automatic() {
+        let legacy = r##"{
+          "dark_mode": true,
+          "timeout": 0,
+          "identity_private_key": null,
+          "identity_public_key": null,
+          "encryption_private_key": null,
+          "friends": [],
+          "hks_nodes": [],
+          "profile": { "alias": null, "avatar_path": null },
+          "pinned_peers": [],
+          "is_online": false,
+          "connectivity": {
+            "mode": "reachable",
+            "mdns_enabled": true,
+            "github_sync_enabled": true,
+            "nat_keepalive_enabled": true,
+            "punch_assist_enabled": true
+          },
+          "libp2p_keypair": null,
+          "pending_invitations": null,
+          "theme": {
+            "base": {"950":"#0b0f14","900":"#111827","800":"#1f2937","700":"#374151","600":"#4b5563","500":"#6b7280","400":"#9ca3af","300":"#d1d5db","200":"#e5e7eb","100":"#f3f4f6"},
+            "primary": {"600":"#0d9488","500":"#14b8a6","400":"#2dd4bf","300":"#5eead4"},
+            "secondary": {"600":"#7c3aed","500":"#8b5cf6","400":"#a78bfa","300":"#c4b5fd"},
+            "error": {"600":"#dc2626","500":"#ef4444","400":"#f87171","300":"#fca5a5"},
+            "success": {"600":"#16a34a","500":"#22c55e","400":"#4ade80","300":"#86efac"},
+            "info": {"600":"#2563eb","500":"#3b82f6","400":"#60a5fa","300":"#93c5fd"},
+            "warning": {"600":"#d97706","500":"#f59e0b","400":"#fbbf24","300":"#fcd34d"}
+          },
+          "selected_preset": null,
+          "custom_themes": [],
+          "github_peer_mapping": {}
+        }"##;
+
+        let parsed: UserConfig = serde_json::from_str(legacy).expect("legacy user config parses");
+
+        assert!(parsed.selected_camera_device_id.is_none());
     }
 
     #[test]

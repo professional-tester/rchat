@@ -5,6 +5,7 @@ use super::{
     VoiceStreamEvent,
 };
 use crate::app_state::CallKind;
+use crate::network::command::NetworkCommand;
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use crate::network::gossip::{GroupContentType, GroupMessageEnvelope};
 use libp2p::{Multiaddr, PeerId};
@@ -55,6 +56,20 @@ fn incoming_call_reject_accepts_stale_requested_id_for_current_incoming_voice_ca
 
     assert_eq!(decision.call.call_id, "call-current");
     assert!(!decision.requested_call_id_matched);
+}
+
+#[test]
+fn network_command_carries_optional_camera_device_selection() {
+    let command = NetworkCommand::SetVideoCallCameraDevice {
+        device_id: Some("camera-b".to_string()),
+    };
+
+    assert!(matches!(
+        command,
+        NetworkCommand::SetVideoCallCameraDevice {
+            device_id: Some(device_id)
+        } if device_id == "camera-b"
+    ));
 }
 
 #[test]

@@ -193,6 +193,9 @@ pub enum NetworkCommand {
         profile: String,
         data: Vec<u8>,
     },
+    SetVideoCallCameraDevice {
+        device_id: Option<String>,
+    },
     SetVideoCallQuality {
         call_id: String,
         mode: String,

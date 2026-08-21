@@ -16,7 +16,9 @@ use crate::live::video::protocol::{
 };
 use crate::network::direct_message::{DirectMessageKind, DirectMessageRequest};
 use futures::AsyncWriteExt as _;
-use rchat_video_capture::{CaptureConfig, CaptureProfile, VideoCaptureError, VideoCaptureSession};
+use rchat_video_capture::{
+    CaptureConfig, CaptureProfile, VideoCaptureError, VideoCaptureSession, VideoCaptureStartResult,
+};
 
 const CALL_RING_TIMEOUT_SECS: u64 = 30;
 const VIDEO_STREAM_QUEUE_CAPACITY: usize = 8;
@@ -28,7 +30,9 @@ const VIDEO_RECEIVER_REQUEST_REASON: &str = "receiver_request";
 pub(super) struct VideoCaptureStartTask {
     call_id: String,
     profile_label: String,
-    handle: tokio::task::JoinHandle<Result<VideoCaptureSession, VideoCaptureError>>,
+    device_id: Option<String>,
+    device_generation: u64,
+    handle: tokio::task::JoinHandle<Result<VideoCaptureStartResult, VideoCaptureError>>,
 }
 
 pub(super) struct OutboundVideoEncodeFrame {
@@ -213,6 +217,19 @@ fn take_finished_video_capture_start(
     }
 }
 
+fn video_capture_start_matches_selection(
+    task_device_id: Option<&str>,
+    task_generation: u64,
+    current_device_id: Option<&str>,
+    current_generation: u64,
+) -> bool {
+    task_generation == current_generation && task_device_id == current_device_id
+}
+
+fn camera_selection_changed(current: Option<&str>, requested: Option<&str>) -> bool {
+    current != requested
+}
+
 fn effective_video_profile(
     local_profile: VideoProfile,
     remote_requested_profile: VideoProfile,
@@ -287,6 +304,25 @@ impl NetworkManager {
             .try_send(OutboundVideoEncodeTask::Reset);
     }
 
+    async fn ensure_selected_camera_device_id_loaded(&mut self) {
+        if self.video_selected_device_id_loaded {
+            return;
+        }
+
+        let manager = self.app_state.config_manager.lock().await;
+        self.video_selected_device_id = match manager.load().await {
+            Ok(config) => config.user.selected_camera_device_id,
+            Err(error) => {
+                eprintln!(
+                    "[Video][Capture] failed to load persisted camera device selection: {}",
+                    error
+                );
+                None
+            }
+        };
+        self.video_selected_device_id_loaded = true;
+    }
+
     pub(super) fn stop_video_media(&mut self) {
         if let Some(call) = self.active_call.as_ref() {
             if call.kind == CallKind::Video {
@@ -347,6 +383,7 @@ impl NetworkManager {
             self.video_capture_last_stats = session.stats();
         }
         self.video_capture_info = None;
+        self.video_capture_device_id = None;
         self.video_capture_started_at = None;
     }
 
@@ -362,6 +399,7 @@ impl NetworkManager {
             return;
         }
 
+        self.ensure_selected_camera_device_id_loaded().await;
         self.complete_video_capture_start_if_ready(call_snapshot)
             .await;
         if self
@@ -377,6 +415,7 @@ impl NetworkManager {
         }
 
         let current_profile = self.video_quality_controller.current_profile();
+        let selected_device_id = self.video_selected_device_id.clone();
         let needs_restart = self
             .video_capture_info
             .as_ref()
@@ -387,7 +426,13 @@ impl NetworkManager {
                 )
             })
             .unwrap_or(true);
-        if self.video_capture_session.is_some() && !needs_restart {
+        if self.video_capture_session.is_some()
+            && !needs_restart
+            && !camera_selection_changed(
+                self.video_capture_device_id.as_deref(),
+                selected_device_id.as_deref(),
+            )
+        {
             return;
         }
         if self
@@ -396,6 +441,8 @@ impl NetworkManager {
             .map(|task| {
                 task.call_id == call_snapshot.call_id
                     && task.profile_label == current_profile.label()
+                    && task.device_id == selected_device_id
+                    && task.device_generation == self.video_capture_device_generation
             })
             .unwrap_or(false)
         {
@@ -405,15 +452,22 @@ impl NetworkManager {
 
         let config =
             CaptureConfig::default_for_profile(capture_profile_from_video_profile(current_profile));
+        let device_generation = self.video_capture_device_generation;
+        let task_device_id = selected_device_id.clone();
         eprintln!(
-            "[Video][Capture] start queued call_id={} requested_profile={}",
+            "[Video][Capture] start queued call_id={} requested_profile={} selected_device_id={:?}",
             call_snapshot.call_id,
             current_profile.label(),
+            selected_device_id,
         );
-        let handle = tokio::task::spawn_blocking(move || VideoCaptureSession::start(config));
+        let handle = tokio::task::spawn_blocking(move || {
+            VideoCaptureSession::start_with_device_id(config, selected_device_id)
+        });
         self.video_capture_start_task = Some(VideoCaptureStartTask {
             call_id: call_snapshot.call_id.clone(),
             profile_label: current_profile.label().to_string(),
+            device_id: task_device_id,
+            device_generation,
             handle,
         });
     }
@@ -425,22 +479,32 @@ impl NetworkManager {
         };
         let task_call_id = task.call_id.clone();
         let task_profile_label = task.profile_label.clone();
+        let task_device_id = task.device_id.clone();
+        let task_device_generation = task.device_generation;
         let result = match task.handle.await {
             Ok(result) => result,
             Err(error) => Err(VideoCaptureError::Backend(error.to_string())),
         };
         let current_profile = self.video_quality_controller.current_profile();
+        let current_device_id = self.video_selected_device_id.as_deref();
         if task_call_id != call_snapshot.call_id
             || call_snapshot.phase != ActiveCallPhase::Active
             || call_snapshot.kind != CallKind::Video
             || !call_snapshot.camera_enabled
             || task_profile_label != current_profile.label()
+            || !video_capture_start_matches_selection(
+                task_device_id.as_deref(),
+                task_device_generation,
+                current_device_id,
+                self.video_capture_device_generation,
+            )
         {
             return;
         }
 
         match result {
-            Ok(session) => {
+            Ok(start_result) => {
+                let VideoCaptureStartResult { session, selection } = start_result;
                 let info = session.info().clone();
                 eprintln!(
                     "[Video][Capture] started backend={} device='{}' requested_profile={} actual={}x{}@{} format={}",
@@ -453,9 +517,13 @@ impl NetworkManager {
                     info.format.format,
                 );
                 self.video_capture_info = Some(info);
+                self.video_capture_device_id = task_device_id;
                 self.video_capture_started_at = Some(std::time::Instant::now());
                 self.video_capture_last_stats = rchat_video_capture::CaptureSessionStats::default();
                 self.video_capture_session = Some(session);
+                if let Some(warning) = selection.warning {
+                    self.emit_video_camera_error(&call_snapshot.call_id, &warning);
+                }
             }
             Err(error) => {
                 self.handle_video_capture_start_failure(call_snapshot, error)
@@ -992,6 +1060,43 @@ impl NetworkManager {
         if let Some(current) = self.active_call.as_ref().cloned() {
             self.push_active_call_state(&current, VoiceCallPhase::Active, None)
                 .await;
+        }
+    }
+
+    pub(super) async fn handle_set_video_call_camera_device(&mut self, device_id: Option<String>) {
+        let active_call = self.active_call.as_ref().cloned();
+        let device_id = device_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        if let Err(error) = crate::settings::camera::set_selected_camera_device_id(
+            &self.app_state,
+            device_id.clone(),
+        )
+        .await
+        {
+            eprintln!("[Video][Capture] failed to save camera device selection: {error}");
+            if let Some(call) = active_call.as_ref().filter(|call| {
+                call.phase == ActiveCallPhase::Active
+                    && call.kind == CallKind::Video
+                    && call.camera_enabled
+            }) {
+                self.emit_video_camera_error(&call.call_id, &error.to_string());
+            }
+            return;
+        }
+
+        self.video_selected_device_id = device_id;
+        self.video_selected_device_id_loaded = true;
+        self.video_capture_device_generation = self.video_capture_device_generation.wrapping_add(1);
+
+        if let Some(call) = active_call.filter(|call| {
+            call.phase == ActiveCallPhase::Active
+                && call.kind == CallKind::Video
+                && call.camera_enabled
+        }) {
+            self.stop_video_capture();
+            self.reset_outbound_video_encoder();
+            self.ensure_video_capture_running(&call).await;
         }
     }
 
@@ -1673,16 +1778,51 @@ mod tests {
     async fn pending_video_capture_start_is_not_awaited() {
         let handle = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Err::<VideoCaptureSession, VideoCaptureError>(VideoCaptureError::NoDevice)
+            Err::<VideoCaptureStartResult, VideoCaptureError>(VideoCaptureError::NoDevice)
         });
         let mut task = Some(VideoCaptureStartTask {
             call_id: "call-1".to_string(),
             profile_label: "720p30".to_string(),
+            device_id: None,
+            device_generation: 0,
             handle,
         });
 
         assert!(take_finished_video_capture_start(&mut task).is_none());
         assert!(task.is_some());
+    }
+
+    #[test]
+    fn stale_camera_start_is_rejected_after_camera_switch() {
+        assert!(video_capture_start_matches_selection(
+            Some("camera-a"),
+            3,
+            Some("camera-a"),
+            3,
+        ));
+        assert!(!video_capture_start_matches_selection(
+            Some("camera-a"),
+            3,
+            Some("camera-b"),
+            4,
+        ));
+        assert!(!video_capture_start_matches_selection(
+            Some("camera-a"),
+            3,
+            Some("camera-a"),
+            4,
+        ));
+    }
+
+    #[test]
+    fn cached_camera_selection_identity_is_stable() {
+        assert!(!camera_selection_changed(None, None));
+        assert!(camera_selection_changed(None, Some("camera-a")));
+        assert!(camera_selection_changed(Some("camera-a"), None));
+        assert!(!camera_selection_changed(
+            Some("camera-a"),
+            Some("camera-a")
+        ));
     }
 
     #[test]

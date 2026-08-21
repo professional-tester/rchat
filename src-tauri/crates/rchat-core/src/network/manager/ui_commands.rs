@@ -196,6 +196,9 @@ impl NetworkManager {
                 )
                 .await;
             }
+            NetworkCommand::SetVideoCallCameraDevice { device_id } => {
+                self.handle_set_video_call_camera_device(device_id).await;
+            }
             NetworkCommand::SetVideoCallQuality { call_id, mode } => {
                 self.handle_set_video_call_quality(call_id, mode).await;
             }

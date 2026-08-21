@@ -72,6 +72,52 @@ pub struct CaptureDeviceInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureDeviceSelection {
+    pub requested_id: Option<String>,
+    pub resolved_id: Option<String>,
+    pub device_index: Option<u32>,
+    pub warning: Option<String>,
+}
+
+pub fn resolve_device_selection(
+    selected_device_id: Option<&str>,
+    devices: &[CaptureDeviceInfo],
+) -> CaptureDeviceSelection {
+    let requested_id = selected_device_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string);
+
+    let Some(requested_id_ref) = requested_id.as_deref() else {
+        return CaptureDeviceSelection {
+            requested_id: None,
+            resolved_id: None,
+            device_index: None,
+            warning: None,
+        };
+    };
+
+    if let Some(device) = devices.iter().find(|device| device.id == requested_id_ref) {
+        return CaptureDeviceSelection {
+            requested_id,
+            resolved_id: Some(device.id.clone()),
+            device_index: Some(device.index),
+            warning: None,
+        };
+    }
+
+    CaptureDeviceSelection {
+        warning: Some(format!(
+            "selected camera device '{}' was not found; using automatic camera",
+            requested_id_ref
+        )),
+        requested_id,
+        resolved_id: None,
+        device_index: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureFormatInfo {
     pub width: u32,
     pub height: u32,
@@ -110,6 +156,11 @@ pub struct CaptureSessionInfo {
     pub device_name: String,
     pub requested_profile: String,
     pub format: CaptureFormatInfo,
+}
+
+pub struct VideoCaptureStartResult {
+    pub session: VideoCaptureSession,
+    pub selection: CaptureDeviceSelection,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,6 +294,36 @@ impl VideoCaptureSession {
             stats,
             handle: Some(handle),
         })
+    }
+
+    pub fn start_with_device_id(
+        mut config: CaptureConfig,
+        selected_device_id: Option<String>,
+    ) -> Result<VideoCaptureStartResult, VideoCaptureError> {
+        let selection = if selected_device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .is_some()
+        {
+            match list_devices() {
+                Ok(devices) => resolve_device_selection(selected_device_id.as_deref(), &devices),
+                Err(error) => CaptureDeviceSelection {
+                    requested_id: selected_device_id,
+                    resolved_id: None,
+                    device_index: None,
+                    warning: Some(format!(
+                        "unable to resolve selected camera device; using automatic camera: {}",
+                        error
+                    )),
+                },
+            }
+        } else {
+            resolve_device_selection(None, &[])
+        };
+        config.device_index = selection.device_index;
+        let session = Self::start(config)?;
+        Ok(VideoCaptureStartResult { session, selection })
     }
 
     pub fn info(&self) -> &CaptureSessionInfo {
@@ -842,6 +923,54 @@ mod tests {
             .expect("initial request accepts available supported format");
 
         assert_eq!(selected.format(), FrameFormat::MJPEG);
+    }
+
+    #[test]
+    fn selected_camera_id_resolves_to_current_index() {
+        let devices = vec![
+            CaptureDeviceInfo {
+                id: "camera-a".to_string(),
+                index: 2,
+                name: "Camera A".to_string(),
+                description: "A".to_string(),
+                backend: "test".to_string(),
+            },
+            CaptureDeviceInfo {
+                id: "camera-b".to_string(),
+                index: 7,
+                name: "Camera B".to_string(),
+                description: "B".to_string(),
+                backend: "test".to_string(),
+            },
+        ];
+
+        let selection = resolve_device_selection(Some("camera-b"), &devices);
+
+        assert_eq!(selection.requested_id.as_deref(), Some("camera-b"));
+        assert_eq!(selection.resolved_id.as_deref(), Some("camera-b"));
+        assert_eq!(selection.device_index, Some(7));
+        assert!(selection.warning.is_none());
+    }
+
+    #[test]
+    fn missing_selected_camera_falls_back_to_automatic_without_clearing_preference() {
+        let devices = vec![CaptureDeviceInfo {
+            id: "camera-a".to_string(),
+            index: 2,
+            name: "Camera A".to_string(),
+            description: "A".to_string(),
+            backend: "test".to_string(),
+        }];
+
+        let selection = resolve_device_selection(Some("camera-missing"), &devices);
+
+        assert_eq!(selection.requested_id.as_deref(), Some("camera-missing"));
+        assert!(selection.resolved_id.is_none());
+        assert_eq!(selection.device_index, None);
+        assert_eq!(
+            selection.warning.as_deref(),
+            Some("selected camera device 'camera-missing' was not found; using automatic camera")
+        );
     }
 
     #[test]
