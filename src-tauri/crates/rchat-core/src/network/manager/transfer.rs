@@ -554,6 +554,14 @@ impl NetworkManager {
             }
         };
         for group_id in group_ids {
+            // The causal counter must come from the stored history so remote
+            // validators accept the record: compute it under the db lock
+            // before signing, then reuse the lock for the local insert.
+            let Ok(conn) = self.app_state.db_conn.lock() else {
+                continue;
+            };
+            let lamport_counter =
+                crate::chat::group::next_group_record_counter(&conn, &group_id);
             let record = match crate::network::gossip::SignedGroupRecord::new(
                 &keypair,
                 group_id.clone(),
@@ -570,6 +578,7 @@ impl NetworkManager {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
                 Vec::new(),
+                lamport_counter,
                 crate::network::gossip::GroupRecordBody::FileAvailability {
                     file_hash: file_hash.to_string(),
                 },
@@ -580,15 +589,14 @@ impl NetworkManager {
                     continue;
                 }
             };
-            if let Ok(conn) = self.app_state.db_conn.lock() {
-                let _ = crate::storage::db::insert_group_record(&conn, &record, true, false);
-                let _ = crate::storage::db::upsert_group_file_source(
-                    &conn,
-                    &group_id,
-                    file_hash,
-                    "Me",
-                );
-            }
+            let _ = crate::storage::db::insert_group_record(&conn, &record, true, false);
+            let _ = crate::storage::db::upsert_group_file_source(
+                &conn,
+                &group_id,
+                file_hash,
+                "Me",
+            );
+            drop(conn);
             self.publish_group_record(&record);
         }
     }

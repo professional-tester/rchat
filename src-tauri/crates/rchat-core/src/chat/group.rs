@@ -108,6 +108,7 @@ pub async fn create_group_with_options(
         None
     };
     let record = sign_record(
+        app_state,
         &keypair,
         group_id.clone(),
         GroupRecordBody::GroupCreated {
@@ -119,9 +120,21 @@ pub async fn create_group_with_options(
     let file_availability_record = image_hash
         .as_ref()
         .map(|file_hash| {
-            sign_record(
+            // Continuation of the same causal chain: the image availability
+            // is announced immediately after creation, so it must occupy the
+            // next Lamport position rather than recomputing from the still-
+            // empty DB (both records are signed before either is persisted).
+            SignedGroupRecord::new(
                 &keypair,
                 group_id.clone(),
+                format!(
+                    "group-rec-{}-{}",
+                    timestamp_now(),
+                    rand::random::<u32>()
+                ),
+                timestamp_now(),
+                Vec::new(),
+                record.lamport_counter().saturating_add(1),
                 GroupRecordBody::FileAvailability {
                     file_hash: file_hash.clone(),
                 },
@@ -232,6 +245,7 @@ pub async fn update_group_settings(
     }
 
     let record = sign_record(
+        app_state,
         &keypair,
         group_id,
         GroupRecordBody::GroupSettingsUpdated { settings },
@@ -259,6 +273,7 @@ pub async fn remove_member(
     }
 
     let record = sign_record(
+        app_state,
         &keypair,
         group_id,
         GroupRecordBody::MemberRemoved { peer_id },
@@ -286,6 +301,7 @@ pub async fn transfer_group_admin(
         return Err(anyhow!("The new administrator must be an active member"));
     }
     let record = sign_record(
+        app_state,
         &keypair,
         group_id,
         GroupRecordBody::AdminTransferred { new_admin_peer_id },
@@ -338,6 +354,7 @@ pub async fn invite_member(
     };
 
     let invite_record = sign_record(
+        app_state,
         &keypair,
         group_id.clone(),
         GroupRecordBody::MemberInvited {
@@ -417,6 +434,7 @@ pub async fn accept_invite(
     }
 
     let joined_record = sign_record(
+        app_state,
         &keypair,
         invite.group_id.clone(),
         GroupRecordBody::MemberJoined {
@@ -474,6 +492,7 @@ pub async fn leave_group(
         if let Some(successor_peer_id) = policy.automatic_successor_peer_id {
             let transfer_timestamp = timestamp_now();
             let transfer = sign_record_at(
+                app_state,
                 &keypair,
                 group_id.clone(),
                 transfer_timestamp,
@@ -491,6 +510,7 @@ pub async fn leave_group(
             )
             .await?;
             let leave = sign_record_at(
+                app_state,
                 &keypair,
                 group_id.clone(),
                 transfer_timestamp.saturating_add(1),
@@ -508,7 +528,7 @@ pub async fn leave_group(
                 let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
                 db::get_open_group_invitee_peer_ids(&conn, &group_id)?
             };
-            let dissolution = sign_record(&keypair, group_id.clone(), GroupRecordBody::GroupDissolved)?;
+            let dissolution = sign_record(app_state, &keypair, group_id.clone(), GroupRecordBody::GroupDissolved)?;
             apply_signed_record(app_state, None, &dissolution, true)?;
             send_network_command(
                 network_state,
@@ -531,6 +551,7 @@ pub async fn leave_group(
         }
     } else {
         let leave = sign_record(
+            app_state,
             &keypair,
             group_id.clone(),
             GroupRecordBody::MemberLeft {
@@ -573,6 +594,7 @@ pub async fn rename_group(
         return Err(anyhow!("Only the group admin can rename the group"));
     }
     let record = sign_record(
+        app_state,
         &keypair,
         group_id.clone(),
         GroupRecordBody::GroupRenamed { name: name.clone() },
@@ -664,6 +686,7 @@ pub async fn create_receipt_record(
     }
     let keypair = load_or_create_local_keypair(app_state).await?;
     sign_record(
+        app_state,
         &keypair,
         group_id,
         GroupRecordBody::Receipt {
@@ -673,19 +696,28 @@ pub async fn create_receipt_record(
     )
 }
 
+/// The causal total order over a group's records. The signed Lamport counter
+/// dominates; `(author_peer_id, id)` only break ties between records that are
+/// genuinely concurrent (same counter from different authors) and between
+/// pre-counter legacy records. Wall-clock timestamps are never part of the
+/// order, so clock skew or a forged clock cannot decide authorization.
+fn record_order_key(record: &SignedGroupRecord) -> (u64, &str, &str) {
+    (
+        record.lamport_counter(),
+        record.author_peer_id(),
+        record.id(),
+    )
+}
+
 fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
     let mut ordered = records.to_vec();
-    ordered.sort_by(|a, b| {
-        a.timestamp()
-            .cmp(&b.timestamp())
-            .then_with(|| a.id().cmp(b.id()))
-    });
+    ordered.sort_by(|a, b| record_order_key(a).cmp(&record_order_key(b)));
 
     let mut admin_peer_id = None;
     let mut settings = GroupSettings::default();
     let mut active_members = HashSet::new();
     let mut invited_members = HashSet::new();
-    let mut membership_order: HashMap<String, (i64, String)> = HashMap::new();
+    let mut membership_order: HashMap<String, (u64, String)> = HashMap::new();
     let mut dissolved = false;
 
     for record in ordered {
@@ -701,7 +733,10 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                     let author = record.author_peer_id().to_string();
                     admin_peer_id = Some(author.clone());
                     active_members.insert(author.clone());
-                    membership_order.insert(author, (record.timestamp(), record.id().to_string()));
+                    membership_order.insert(
+                        author,
+                        (record.lamport_counter(), record.id().to_string()),
+                    );
                     settings = group_settings.clone().unwrap_or_default();
                 }
             }
@@ -721,7 +756,7 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                     invited_members.remove(peer_id);
                     membership_order.insert(
                         peer_id.clone(),
-                        (record.timestamp(), record.id().to_string()),
+                        (record.lamport_counter(), record.id().to_string()),
                     );
                 }
             }
@@ -783,7 +818,7 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
                 membership_order
                     .get(*peer_id)
                     .cloned()
-                    .unwrap_or((i64::MAX, (*peer_id).clone()))
+                    .unwrap_or((u64::MAX, (*peer_id).clone()))
             })
             .cloned();
         GroupPolicy {
@@ -798,8 +833,7 @@ fn derive_group_policy(records: &[SignedGroupRecord]) -> Option<GroupPolicy> {
 }
 
 fn record_precedes(candidate: &SignedGroupRecord, existing: &SignedGroupRecord) -> bool {
-    existing.timestamp() < candidate.timestamp()
-        || (existing.timestamp() == candidate.timestamp() && existing.id() < candidate.id())
+    record_order_key(existing) < record_order_key(candidate)
 }
 
 fn derive_group_policy_before(
@@ -869,6 +903,7 @@ fn validate_group_record(
             return Ok(RecordDisposition::PendingDependency);
         }
     }
+    validate_record_counter(conn, record)?;
     let existing_records = db::get_group_records_for_sync(conn, record.group_id(), &[], 10_000)?;
     let current_policy = derive_group_policy(&existing_records);
     let policy_before_record = derive_group_policy_before(&existing_records, record);
@@ -950,6 +985,9 @@ fn validate_group_record(
                 return Ok(RecordDisposition::PendingDependency);
             };
             if policy.admin_peer_id != record.author_peer_id() {
+                if policy.active_members.contains(record.author_peer_id()) {
+                    return Ok(RecordDisposition::PendingDependency);
+                }
                 return Err(anyhow!("Only the group admin can transfer administration"));
             }
             if new_admin_peer_id == record.author_peer_id() {
@@ -965,6 +1003,9 @@ fn validate_group_record(
                 return Ok(RecordDisposition::PendingDependency);
             };
             if policy.admin_peer_id != record.author_peer_id() {
+                if policy.active_members.contains(record.author_peer_id()) {
+                    return Ok(RecordDisposition::PendingDependency);
+                }
                 return Err(anyhow!("Only the group admin can dissolve the group"));
             }
             if policy.active_members.len() != 1 {
@@ -986,6 +1027,59 @@ fn validate_group_record(
             }
         }
     }
+}
+
+/// Enforce the causal counter discipline for current-version records:
+/// a nonzero position within the jump cap, and strict monotonicity per
+/// author. These checks run before any policy evaluation, so a record can
+/// never legitimize itself through an arbitrary or reused causal position.
+/// Pre-counter legacy records (versions 1-2, counter defaulted to 0) are
+/// exempt and keep their historical `(timestamp, id)` tie-break order among
+/// themselves.
+fn validate_record_counter(
+    conn: &rusqlite::Connection,
+    record: &SignedGroupRecord,
+) -> anyhow::Result<()> {
+    let counter = record.lamport_counter();
+    if record.unsigned.version >= SignedGroupRecord::VERSION {
+        if counter == 0 {
+            return Err(anyhow!(
+                "Group record is missing its causal counter (got version {})",
+                record.unsigned.version
+            ));
+        }
+        if counter == u64::MAX {
+            return Err(anyhow!("Group record counter exhausted"));
+        }
+    }
+    if counter == 0 {
+        return Ok(());
+    }
+
+    // Pending records occupy their causal position too: a record waiting for
+    // dependencies must still block a second record claiming the same spot.
+    // Arrival order does not matter — a lower counter from the same author
+    // may legitimately arrive after a higher one — so only an exact
+    // (author, counter) collision, i.e. a forked position, is rejected.
+    let known = db::get_group_records_including_pending(conn, record.group_id(), 10_000)?;
+    let max_known = known.iter().map(|r| r.lamport_counter()).max().unwrap_or(0);
+    if counter > max_known.saturating_add(SignedGroupRecord::MAX_COUNTER_JUMP) {
+        return Err(anyhow!(
+            "Group record counter {counter} leaps more than {} past the known frontier {max_known}",
+            SignedGroupRecord::MAX_COUNTER_JUMP
+        ));
+    }
+    if known.iter().any(|other| {
+        other.author_peer_id() == record.author_peer_id()
+            && other.id() != record.id()
+            && other.lamport_counter() == counter
+    }) {
+        return Err(anyhow!(
+            "Group record forks author {}'s causal position {counter}",
+            record.author_peer_id()
+        ));
+    }
+    Ok(())
 }
 
 fn retry_pending_group_records(
@@ -1324,6 +1418,7 @@ async fn send_group_message_record(
         }
     }
     let record = sign_record(
+        app_state,
         &keypair,
         group_id.clone(),
         GroupRecordBody::Message {
@@ -1399,27 +1494,60 @@ fn group_record_to_db_message(
     }
 }
 
+/// The next causal position for a record in `group_id`: one past every
+/// counter observed so far — verified *and* pending records alike (the
+/// Lamport receive rule). Pending records count because they already occupy
+/// a causal position from their author's perspective; ignoring them could
+/// reissue the same position and fork the order.
+pub fn next_group_record_counter(conn: &rusqlite::Connection, group_id: &str) -> u64 {
+    let known = db::get_group_records_including_pending(conn, group_id, 10_000)
+        .unwrap_or_default();
+    known
+        .iter()
+        .map(|record| record.lamport_counter())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
 fn sign_record(
+    app_state: &AppState,
     keypair: &identity::Keypair,
     group_id: String,
     body: GroupRecordBody,
 ) -> anyhow::Result<SignedGroupRecord> {
-    sign_record_at(keypair, group_id, timestamp_now(), Vec::new(), body)
+    sign_record_at(
+        app_state,
+        keypair,
+        group_id,
+        timestamp_now(),
+        Vec::new(),
+        body,
+    )
 }
 
 fn sign_record_at(
+    app_state: &AppState,
     keypair: &identity::Keypair,
     group_id: String,
     timestamp: i64,
     parents: Vec<String>,
     body: GroupRecordBody,
 ) -> anyhow::Result<SignedGroupRecord> {
+    // Each issued record advances past every counter observed so far, so
+    // back-to-back issuances (e.g. transfer then leave) occupy strictly
+    // increasing causal positions.
+    let lamport_counter = {
+        let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
+        next_group_record_counter(&conn, &group_id)
+    };
     SignedGroupRecord::new(
         keypair,
         group_id,
         format!("group-rec-{}-{}", timestamp, rand::random::<u32>()),
         timestamp,
         parents,
+        lamport_counter,
         body,
     )
 }
@@ -1515,11 +1643,34 @@ mod tests {
         PeerId::from_public_key(&keypair.public()).to_string()
     }
 
+    /// A signed v3 record whose causal position is `counter`. The timestamp
+    /// is deliberately derived from the counter so tests that pass skewed or
+    /// tied timestamps explicitly use [`signed_at`] instead.
     fn signed(
         keypair: &identity::Keypair,
         group_id: &str,
         id: &str,
+        counter: u64,
+        body: GroupRecordBody,
+    ) -> SignedGroupRecord {
+        signed_at(
+            keypair,
+            group_id,
+            id,
+            1_700_000_000 + counter as i64,
+            counter,
+            body,
+        )
+    }
+
+    /// Like [`signed`], but with an explicit wall-clock timestamp — used to
+    /// prove that skew, ties, and backdating cannot influence authorization.
+    fn signed_at(
+        keypair: &identity::Keypair,
+        group_id: &str,
+        id: &str,
         timestamp: i64,
+        counter: u64,
         body: GroupRecordBody,
     ) -> SignedGroupRecord {
         SignedGroupRecord::new(
@@ -1528,6 +1679,7 @@ mod tests {
             format!("test-{id}-{}", rand::random::<u64>()),
             timestamp,
             Vec::new(),
+            counter,
             body,
         )
         .expect("record")
@@ -1636,13 +1788,316 @@ mod tests {
         })).expect_err("records after dissolution must fail");
         assert!(error.to_string().contains("dissolved"));
 
-        let error = apply(&app_state, &signed(&founder, &group_id, "backdated", 1, GroupRecordBody::Message {
-            content_type: GroupContentType::Text,
-            text_content: Some("backdated after tombstone".to_string()),
-            file_hash: None,
-            sender_alias: None,
-        })).expect_err("a known dissolution must reject backdated records too");
+        // A causally fresh record (new counter) carrying a backdated
+        // wall-clock timestamp must still hit the dissolution tombstone:
+        // timestamps cannot place a record before the dissolution anymore.
+        let error = apply(
+            &app_state,
+            &signed_at(&founder, &group_id, "backdated", 1, 4, GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("backdated after tombstone".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            }),
+        )
+        .expect_err("a known dissolution must reject backdated records too");
         assert!(error.to_string().contains("dissolved"));
+    }
+
+    #[test]
+    fn authorization_order_follows_counters_not_timestamps() {
+        // Wall-clock timestamps are display metadata: even with perverse,
+        // tied, and descending clocks the causal counters decide who is
+        // admin and who joins first, so skewed peers converge identically.
+        let app_state = app_state();
+        let founder = keypair();
+        let older = keypair();
+        let newer = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let older_id = peer_id(&older);
+        let newer_id = peer_id(&newer);
+
+        // Counters ascend causally while timestamps descend and tie.
+        let records = [
+            signed_at(&founder, &group_id, "created", 900, 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+            signed_at(&founder, &group_id, "invite-older", 800, 2, GroupRecordBody::MemberInvited {
+                peer_id: older_id.clone(), role: "member".to_string(),
+            }),
+            signed_at(&older, &group_id, "join-older", 700, 3, GroupRecordBody::MemberJoined {
+                peer_id: older_id.clone(),
+            }),
+            signed_at(&founder, &group_id, "invite-newer", 700, 4, GroupRecordBody::MemberInvited {
+                peer_id: newer_id.clone(), role: "member".to_string(),
+            }),
+            signed_at(&newer, &group_id, "join-newer", 100, 5, GroupRecordBody::MemberJoined {
+                peer_id: newer_id.clone(),
+            }),
+        ];
+        for record in &records {
+            apply(&app_state, record).expect("membership record");
+        }
+
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert_eq!(policy.admin_peer_id, peer_id(&founder));
+        // The successor is the earliest *causal* join (counter 3), not the
+        // one with the smallest timestamp.
+        assert_eq!(
+            policy.automatic_successor_peer_id.as_deref(),
+            Some(older_id.as_str())
+        );
+    }
+
+    #[test]
+    fn concurrent_records_converge_identically_from_any_arrival_order() {
+        // Genuinely concurrent records: two members invite at the same
+        // causal position without having seen each other's record yet. The
+        // (counter, author) order resolves them identically on every peer,
+        // no matter the delivery order or clock readings.
+        // Same identities and group on both peers — only arrival order differs.
+        let founder = keypair();
+        let alice = keypair();
+        let bob = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let founder_id = peer_id(&founder);
+        let records = [
+            signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(),
+                settings: Some(GroupSettings { members_can_invite: true }),
+                image_hash: None,
+            }),
+            signed(&founder, &group_id, "invite-alice", 2, GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&alice), role: "member".to_string(),
+            }),
+            signed(&alice, &group_id, "join-alice", 3, GroupRecordBody::MemberJoined {
+                peer_id: peer_id(&alice),
+            }),
+            signed(&founder, &group_id, "invite-bob", 4, GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&bob), role: "member".to_string(),
+            }),
+            signed(&bob, &group_id, "join-bob", 5, GroupRecordBody::MemberJoined {
+                peer_id: peer_id(&bob),
+            }),
+            // Deterministic invitee ids so both orders invite exactly the same peers.
+            signed_at(&alice, &group_id, "concurrent-a", 555, 6, GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(1), role: "member".to_string(),
+            }),
+            signed_at(&bob, &group_id, "concurrent-b", 999, 6, GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(2), role: "member".to_string(),
+            }),
+        ];
+
+        let app_a = app_state();
+        for record in &records {
+            apply(&app_a, record).expect("in-order apply");
+        }
+        let policy_in_order = get_group_policy(&app_a, &group_id).expect("policy");
+
+        // Reverse arrival order on an independent peer — same records, same group.
+        let mut reversed = records.clone();
+        reversed.reverse();
+        let app_b = app_state();
+        for record in &reversed {
+            apply(&app_b, record).expect("reversed apply");
+        }
+        let policy_reversed = get_group_policy(&app_b, &group_id).expect("policy");
+        // Founder is the same on both peers.
+        assert_eq!(founder_id, policy_in_order.admin_peer_id);
+        assert_eq!(founder_id, policy_reversed.admin_peer_id);
+
+        assert_eq!(
+            policy_in_order.admin_peer_id, policy_reversed.admin_peer_id,
+            "concurrent invites must converge to one admin"
+        );
+        let mut invited_a: Vec<String> =
+            policy_in_order.invited_members.iter().cloned().collect();
+        let mut invited_b: Vec<String> =
+            policy_reversed.invited_members.iter().cloned().collect();
+        invited_a.sort();
+        invited_b.sort();
+        assert_eq!(invited_a.len(), 2, "both concurrent invites survive");
+        assert_eq!(invited_a, invited_b, "identical invited set from both orders");
+        assert_eq!(policy_in_order.active_members.len(), 3);
+        assert_eq!(policy_reversed.active_members.len(), 3);
+    }
+
+    /// A syntactically valid, deterministic peer id for concurrent-invite
+    /// tests (both simulated peers must name the same invitees).
+    fn fixed_peer_id(seed: u8) -> String {
+        let keypair =
+            identity::Keypair::ed25519_from_bytes([seed; 32]).expect("deterministic keypair");
+        PeerId::from_public_key(&keypair.public()).to_string()
+    }
+
+    #[test]
+    fn causal_counter_abuse_is_rejected() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        apply(
+            &app_state,
+            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+        )
+        .expect("created");
+
+        // A current-version record missing its causal counter is refused.
+        let missing = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-missing-{}", rand::random::<u64>()),
+            1_700_000_100,
+            Vec::new(),
+            0,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(10),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        let error = apply(&app_state, &missing).expect_err("zero counter must fail");
+        assert!(
+            error.to_string().contains("causal counter"),
+            "wrong error: {error}"
+        );
+
+        // The reserved sentinel is refused.
+        let exhausted = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-max-{}", rand::random::<u64>()),
+            1_700_000_100,
+            Vec::new(),
+            u64::MAX,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(11),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        let error = apply(&app_state, &exhausted).expect_err("MAX sentinel must fail");
+        assert!(error.to_string().contains("exhausted"), "wrong error: {error}");
+
+        // A counter that leaps beyond the known frontier is refused.
+        let leap = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-leap-{}", rand::random::<u64>()),
+            1_700_000_100,
+            Vec::new(),
+            10_000_000,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(12),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        let error = apply(&app_state, &leap).expect_err("far leap must fail");
+        assert!(error.to_string().contains("leaps"), "wrong error: {error}");
+
+        // Forking one causal position — two records by the same author at
+        // the same counter — is a hard error (no pending, no silent win).
+        let fork_a = signed(&founder, &group_id, "fork-a", 2, GroupRecordBody::MemberInvited {
+            peer_id: fixed_peer_id(13),
+            role: "member".to_string(),
+        });
+        apply(&app_state, &fork_a).expect("first fork slot wins");
+        let fork_b = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-fork-b-{}", rand::random::<u64>()),
+            1_700_000_101,
+            Vec::new(),
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: fixed_peer_id(14),
+                role: "member".to_string(),
+            },
+        )
+        .expect("record");
+        let error = apply(&app_state, &fork_b).expect_err("forked position must fail");
+        assert!(error.to_string().contains("forks"), "wrong error: {error}");
+    }
+
+    #[test]
+    fn replayed_record_is_a_noop() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let created = signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+            name: "Test".to_string(), settings: None, image_hash: None,
+        });
+        apply(&app_state, &created).expect("created");
+        let policy_before = get_group_policy(&app_state, &group_id).expect("policy");
+
+        // Replaying the same verified record is a no-op.
+        assert!(!apply(&app_state, &created).expect("replay"));
+        let policy_after = get_group_policy(&app_state, &group_id).expect("policy");
+        assert_eq!(policy_before.admin_peer_id, policy_after.admin_peer_id);
+        assert_eq!(policy_before.active_members, policy_after.active_members);
+    }
+
+    #[test]
+    fn admin_transfer_chain_pending_until_predecessor_arrives() {
+        // Admin A -> B (counter 4), then B -> C (counter 5). When the
+        // successor's transfer (B -> C) arrives before its predecessor's
+        // (A -> B), it must stay pending until the predecessor is applied —
+        // and then the chain resolves on retry.
+        let app_state = app_state();
+        let founder = keypair();
+        let successor = keypair();
+        let third = keypair();
+        let successor_id = peer_id(&successor);
+        let third_id = peer_id(&third);
+        let group_id = chat_kind::generate_group_chat_id();
+        for record in [
+            signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+            signed(&founder, &group_id, "invite-successor", 2, GroupRecordBody::MemberInvited {
+                peer_id: successor_id.clone(), role: "member".to_string(),
+            }),
+            signed(&successor, &group_id, "join-successor", 3, GroupRecordBody::MemberJoined {
+                peer_id: successor_id.clone(),
+            }),
+            signed(&founder, &group_id, "invite-third", 4, GroupRecordBody::MemberInvited {
+                peer_id: third_id.clone(), role: "member".to_string(),
+            }),
+            signed(&third, &group_id, "join-third", 5, GroupRecordBody::MemberJoined {
+                peer_id: third_id.clone(),
+            }),
+        ] {
+            apply(&app_state, &record).expect("setup");
+        }
+
+        let transfer_to_successor = signed(
+            &founder, &group_id, "to-successor", 6,
+            GroupRecordBody::AdminTransferred { new_admin_peer_id: successor_id.clone() },
+        );
+        let transfer_to_third = signed(
+            &successor, &group_id, "to-third", 7,
+            GroupRecordBody::AdminTransferred { new_admin_peer_id: third_id.clone() },
+        );
+
+        // Out-of-order: the successor's own transfer arrives first. It
+        // authorizes against the roster *before* the predecessor, where the
+        // author is not yet admin, so it waits.
+        assert!(!apply(&app_state, &transfer_to_third).expect("pending successor transfer"));
+        let pending = {
+            let conn = app_state.db_conn.lock().expect("db");
+            db::get_group_record(&conn, transfer_to_third.id())
+                .expect("query")
+                .is_some()
+        };
+        assert!(pending, "must be stored pending");
+
+        // Predecessor arrives: becomes admin, and retry cascades the pending
+        // successor — final administrator converges to the third member.
+        apply(&app_state, &transfer_to_successor).expect("predecessor");
+        let policy = get_group_policy(&app_state, &group_id).expect("policy");
+        assert_eq!(policy.admin_peer_id, third_id, "chain must resolve to the final successor");
     }
 
     #[test]
@@ -1674,6 +2129,7 @@ mod tests {
             "leave-child".to_string(),
             5,
             vec![transfer.id().to_string()],
+            5,
             GroupRecordBody::MemberLeft { peer_id: founder_id.clone() },
         ).expect("leave record");
 

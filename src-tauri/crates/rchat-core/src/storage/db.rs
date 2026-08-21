@@ -1083,6 +1083,33 @@ pub fn get_group_records_for_sync(
     Ok(out)
 }
 
+/// Every stored record for a group — verified and pending alike. Causal
+/// counter validation must see pending records too, otherwise two records
+/// claiming the same per-author position could both slip through while one
+/// waits for its dependencies.
+pub fn get_group_records_including_pending(
+    conn: &Connection,
+    group_id: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::network::gossip::SignedGroupRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT payload_json
+         FROM group_records
+         WHERE group_id = ?1
+         ORDER BY timestamp ASC
+        ",
+    )?;
+    let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub fn get_group_record_ids(conn: &Connection, group_id: &str) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT id FROM group_records WHERE group_id = ?1 AND verified = 1 ORDER BY timestamp ASC",
@@ -1998,6 +2025,7 @@ mod tests {
             id.to_string(),
             timestamp,
             Vec::new(),
+            1,
             GroupRecordBody::Head {
                 heads: vec![id.to_string()],
             },

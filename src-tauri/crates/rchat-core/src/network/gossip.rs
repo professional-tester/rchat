@@ -202,6 +202,17 @@ pub struct UnsignedGroupRecord {
     pub timestamp: i64,
     #[serde(default)]
     pub parents: Vec<String>,
+    /// Per-group Lamport clock stamped by the author and bound into the
+    /// signature. Authorization order is derived from `(lamport_counter,
+    /// author_peer_id, id)` — never from the wall-clock `timestamp`, which is
+    /// display metadata only: a skewed or forged clock cannot place a record
+    /// anywhere in history. Issuers advance past every counter they have
+    /// observed (Lamport receive rule); validators refuse counters that are
+    /// non-monotonic for their author or leap more than
+    /// [`MAX_GROUP_RECORD_COUNTER_JUMP`] past everything known, so a record
+    /// cannot authorize itself by claiming an arbitrary position.
+    #[serde(default)]
+    pub lamport_counter: u64,
     pub body: GroupRecordBody,
 }
 
@@ -246,7 +257,14 @@ pub struct GroupSyncResponse {
 }
 
 impl SignedGroupRecord {
-    pub const VERSION: u16 = 2;
+    pub const VERSION: u16 = 3;
+
+    /// Upper bound on how far past every known counter a new record may
+    /// reach. Mirrors the temporary-group membership clock: legitimate
+    /// issuers advance by small steps (they have seen the history they build
+    /// on), while attacker-chosen leaps far beyond the known frontier are
+    /// refused instead of permanently occupying the top of the order.
+    pub const MAX_COUNTER_JUMP: u64 = 1_000_000;
 
     pub fn new(
         keypair: &identity::Keypair,
@@ -254,6 +272,7 @@ impl SignedGroupRecord {
         id: String,
         timestamp: i64,
         parents: Vec<String>,
+        lamport_counter: u64,
         body: GroupRecordBody,
     ) -> anyhow::Result<Self> {
         let author_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
@@ -264,6 +283,7 @@ impl SignedGroupRecord {
             author_peer_id,
             timestamp,
             parents,
+            lamport_counter,
             body,
         };
         let canonical = serde_json::to_vec(&unsigned)?;
@@ -312,6 +332,10 @@ impl SignedGroupRecord {
 
     pub fn timestamp(&self) -> i64 {
         self.unsigned.timestamp
+    }
+
+    pub fn lamport_counter(&self) -> u64 {
+        self.unsigned.lamport_counter
     }
 
     pub fn body(&self) -> &GroupRecordBody {
@@ -379,6 +403,7 @@ mod tests {
             "rec-1".to_string(),
             42,
             Vec::new(),
+            1,
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
                 settings: None,
@@ -402,6 +427,7 @@ mod tests {
             author_peer_id: PeerId::from_public_key(&key.public()).to_string(),
             timestamp: 42,
             parents: Vec::new(),
+            lamport_counter: 0,
             body: GroupRecordBody::GroupCreated {
                 name: "Legacy".to_string(),
                 settings: None,
@@ -446,6 +472,7 @@ mod tests {
             "rec-1".to_string(),
             42,
             Vec::new(),
+            1,
             GroupRecordBody::GroupCreated {
                 name: "Test".to_string(),
                 settings: Some(GroupSettings {
