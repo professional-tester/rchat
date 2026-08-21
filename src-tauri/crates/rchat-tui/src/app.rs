@@ -3066,6 +3066,9 @@ async fn open_chat_list_item(
     state: &mut UiState,
     chat_id: &str,
 ) -> Result<()> {
+    if requires_direct_chat_loader(chat_id) {
+        return open_direct_chat(app_state, network_state, state, chat_id).await;
+    }
     if chat_kind::is_temp_group_chat_id(chat_id) {
         return open_direct_chat(app_state, network_state, state, chat_id).await;
     }
@@ -3073,7 +3076,7 @@ async fn open_chat_list_item(
         return open_group_chat(app_state, network_state, state, chat_id).await;
     }
 
-    open_direct_chat(app_state, network_state, state, chat_id).await
+    Ok(())
 }
 
 async fn open_group_chat(

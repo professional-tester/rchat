@@ -74,6 +74,7 @@ fn default_direct_chat_name(chat_id: &str) -> String {
 pub struct GroupChatResult {
     pub chat_id: String,
     pub name: String,
+    pub image_hash: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -90,6 +91,9 @@ pub struct GroupPolicyResult {
     pub members_can_invite: bool,
     pub active_members: Vec<String>,
     pub invited_members: Vec<String>,
+    pub member_aliases: std::collections::HashMap<String, String>,
+    pub automatic_successor_peer_id: Option<String>,
+    pub dissolved: bool,
 }
 
 #[tauri::command]
@@ -188,6 +192,7 @@ pub async fn get_chat_list(
             id: chat_id.clone(),
             name: session.name.clone(),
             is_group: matches!(session.kind, crate::app_state::TemporaryChatKind::Group),
+            image_hash: None,
         });
         seen.insert(chat_id.clone());
     }
@@ -238,34 +243,31 @@ pub async fn get_chat_list(
 
 #[tauri::command]
 pub async fn create_group_chat(
-    name: Option<String>,
+    name: String,
+    image_path: Option<String>,
+    members_can_invite: Option<bool>,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<GroupChatResult, String> {
     let net_state = app_handle.try_state::<NetworkState>();
-    let result = crate::chat::group::create_group(&state, net_state.as_deref(), name)
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = crate::chat::group::create_group_with_options(
+        &state,
+        net_state.as_deref(),
+        crate::chat::group::CreateGroupOptions {
+            name: Some(name),
+            image_path,
+            settings: Some(GroupSettings {
+                members_can_invite: members_can_invite.unwrap_or(false),
+            }),
+            require_name: true,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(GroupChatResult {
         chat_id: result.chat_id,
         name: result.name,
-    })
-}
-
-#[tauri::command]
-pub async fn join_group_chat(
-    chat_id: String,
-    name: Option<String>,
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<GroupChatResult, String> {
-    let net_state = app_handle.try_state::<NetworkState>();
-    let result = crate::chat::group::join_group_legacy(&state, net_state.as_deref(), chat_id, name)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(GroupChatResult {
-        chat_id: result.chat_id,
-        name: result.name,
+        image_hash: result.image_hash,
     })
 }
 
@@ -274,11 +276,33 @@ pub async fn leave_group_chat(
     chat_id: String,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<crate::chat::group::GroupLeaveOutcome, String> {
     let Some(net_state) = app_handle.try_state::<NetworkState>() else {
         return Err("Network is not started".to_string());
     };
     crate::chat::group::leave_group(&state, &net_state, chat_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_group_leave(
+    group_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::chat::group::GroupLeaveOutcome, String> {
+    crate::chat::group::preview_leave_group(&state, &group_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn transfer_group_admin(
+    group_id: String,
+    peer_id: String,
+    state: State<'_, AppState>,
+    net_state: State<'_, NetworkState>,
+) -> Result<(), String> {
+    crate::chat::group::transfer_group_admin(&state, &net_state, group_id, peer_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -300,6 +324,12 @@ pub async fn get_group_policy(
     group_id: String,
     state: State<'_, AppState>,
 ) -> Result<GroupPolicyResult, String> {
+    let member_aliases = crate::chat::group::get_group_roster(&state, &group_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|member| member.display_name != member.peer_id)
+        .map(|member| (member.peer_id, member.display_name))
+        .collect();
     let policy =
         crate::chat::group::get_group_policy(&state, &group_id).map_err(|e| e.to_string())?;
     let keypair = crate::chat::group::load_or_create_local_keypair(&state)
@@ -317,6 +347,9 @@ pub async fn get_group_policy(
         members_can_invite: policy.settings.members_can_invite,
         active_members,
         invited_members,
+        member_aliases,
+        automatic_successor_peer_id: policy.automatic_successor_peer_id,
+        dissolved: policy.dissolved,
     })
 }
 
@@ -827,10 +860,9 @@ pub async fn save_temporary_chat_to_archive(
     state: State<'_, AppState>,
     net_state: State<'_, NetworkState>,
 ) -> Result<ArchivedChatResult, String> {
-    let archived =
-        crate::chat::temporary::archive_temporary_chat(&state, &net_state, &chat_id)
-            .await
-            .map_err(|e| e.to_string())?;
+    let archived = crate::chat::temporary::archive_temporary_chat(&state, &net_state, &chat_id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(ArchivedChatResult {
         chat_id: archived.chat_id,
         name: archived.name,
