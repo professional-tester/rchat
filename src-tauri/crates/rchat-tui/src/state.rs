@@ -3,6 +3,7 @@ use rchat_core::{
     chat_identity::extract_peer_id_from_chat_id,
     chat_kind::{self, ChatKind},
     events::LocalPeerEvent,
+    settings::camera::CaptureDeviceInfo,
     storage::config::{ConnectivityMode, ConnectivitySettings},
     storage::db::{ChatFileRow, Message},
 };
@@ -523,6 +524,8 @@ pub enum SettingsField {
     RattyPathSave,
     RattyImportGhostty,
     RattyReset,
+    CameraDevice,
+    CameraRefresh,
     ScreenShareTest,
 }
 
@@ -571,6 +574,13 @@ pub struct SettingsModalState {
     pub ratty_path_source: Option<String>,
     pub ratty_config_source: String,
     pub ratty_warning: Option<String>,
+    pub selected_camera_device_id: Option<String>,
+    pub camera_devices: Vec<CaptureDeviceInfo>,
+    pub camera_loading: bool,
+    pub camera_loaded: bool,
+    pub camera_picker_open: bool,
+    pub camera_picker_index: usize,
+    pub camera_error: Option<String>,
     pub status: Option<String>,
     pub error: Option<String>,
 }
@@ -601,6 +611,13 @@ impl Default for SettingsModalState {
             ratty_path_source: None,
             ratty_config_source: "Ratty default/config discovery".to_string(),
             ratty_warning: None,
+            selected_camera_device_id: None,
+            camera_devices: Vec::new(),
+            camera_loading: false,
+            camera_loaded: false,
+            camera_picker_open: false,
+            camera_picker_index: 0,
+            camera_error: None,
             status: None,
             error: None,
         }
@@ -662,6 +679,8 @@ impl SettingsModalState {
                 ]);
             }
             SettingsSection::Media => fields.extend([
+                SettingsField::CameraDevice,
+                SettingsField::CameraRefresh,
                 SettingsField::RattyPath,
                 SettingsField::RattyPathSave,
                 SettingsField::RattyImportGhostty,
@@ -827,6 +846,115 @@ impl SettingsModalState {
             _ => {}
         }
     }
+
+    pub fn camera_selection_unavailable(&self) -> bool {
+        self.selected_camera_device_id
+            .as_ref()
+            .is_some_and(|selected| {
+                !self
+                    .camera_devices
+                    .iter()
+                    .any(|device| device.id == *selected)
+            })
+    }
+
+    pub fn camera_selection_label(&self) -> String {
+        let Some(selected) = self.selected_camera_device_id.as_deref() else {
+            return "Automatic".to_string();
+        };
+
+        self.camera_devices
+            .iter()
+            .find(|device| device.id == selected)
+            .map(camera_device_label)
+            .unwrap_or_else(|| format!("{selected} (unavailable)"))
+    }
+
+    pub fn camera_option_ids(&self) -> Vec<Option<String>> {
+        let mut options = Vec::with_capacity(self.camera_devices.len() + 2);
+        options.push(None);
+        options.extend(
+            self.camera_devices
+                .iter()
+                .map(|device| Some(device.id.clone())),
+        );
+        if self.camera_selection_unavailable() {
+            options.push(self.selected_camera_device_id.clone());
+        }
+        options
+    }
+
+    pub fn reset_camera_picker_index(&mut self) {
+        let selected = self.selected_camera_device_id.as_ref();
+        self.camera_picker_index = self
+            .camera_option_ids()
+            .iter()
+            .position(|option| option.as_ref() == selected)
+            .unwrap_or(0);
+    }
+
+    pub fn move_camera_picker(&mut self, delta: isize) {
+        let option_count = self.camera_option_ids().len();
+        self.camera_picker_index = next_index(self.camera_picker_index, delta, option_count);
+    }
+
+    pub fn camera_picker_selected_id(&self) -> Option<String> {
+        self.camera_option_ids()
+            .get(self.camera_picker_index)
+            .cloned()
+            .flatten()
+    }
+
+    pub fn camera_picker_selected_label(&self) -> String {
+        self.camera_option_label(self.camera_picker_index)
+    }
+
+    pub fn camera_picker_selected_name(&self) -> String {
+        let Some(selected) = self.camera_picker_selected_id() else {
+            return "Automatic".to_string();
+        };
+        self.camera_devices
+            .iter()
+            .find(|device| device.id == selected)
+            .map(|device| {
+                if device.name.trim().is_empty() {
+                    format!("Camera {}", device.index + 1)
+                } else {
+                    device.name.trim().to_string()
+                }
+            })
+            .unwrap_or(selected)
+    }
+
+    pub fn camera_option_label(&self, index: usize) -> String {
+        let Some(selected) = self.camera_option_ids().get(index).cloned().flatten() else {
+            return "Automatic".to_string();
+        };
+
+        self.camera_devices
+            .iter()
+            .find(|device| device.id == selected)
+            .map(camera_device_label)
+            .unwrap_or_else(|| format!("{selected} (unavailable)"))
+    }
+}
+
+fn camera_device_label(device: &CaptureDeviceInfo) -> String {
+    let name = if device.name.trim().is_empty() {
+        format!("Camera {}", device.index + 1)
+    } else {
+        device.name.trim().to_string()
+    };
+    let description = device.description.trim();
+    [
+        Some(name.clone()),
+        (!device.backend.trim().is_empty()).then(|| device.backend.trim().to_string()),
+        (!description.is_empty() && description != name).then(|| description.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2853,6 +2981,8 @@ mod tests {
         assert_eq!(
             modal.content_fields(),
             vec![
+                SettingsField::CameraDevice,
+                SettingsField::CameraRefresh,
                 SettingsField::RattyPath,
                 SettingsField::RattyPathSave,
                 SettingsField::RattyImportGhostty,
@@ -2860,13 +2990,68 @@ mod tests {
                 SettingsField::ScreenShareTest,
             ]
         );
-        assert_eq!(modal.focus, SettingsField::RattyPath);
+        assert_eq!(modal.focus, SettingsField::CameraDevice);
+    }
+
+    #[test]
+    fn media_settings_camera_picker_tracks_automatic_and_selected_device() {
+        let mut modal = SettingsModalState::default();
+        modal.activate_section(SettingsSection::Media);
+
+        assert!(modal
+            .content_fields()
+            .contains(&SettingsField::CameraDevice));
+        assert!(modal
+            .content_fields()
+            .contains(&SettingsField::CameraRefresh));
+        assert_eq!(modal.camera_selection_label(), "Automatic");
+
+        modal.camera_devices = vec![CaptureDeviceInfo {
+            id: "camera-a".to_string(),
+            index: 0,
+            name: "Front camera".to_string(),
+            description: "Built-in camera".to_string(),
+            backend: "AVFoundation".to_string(),
+        }];
+        modal.selected_camera_device_id = Some("camera-a".to_string());
+        modal.reset_camera_picker_index();
+
+        assert_eq!(
+            modal.camera_selection_label(),
+            "Front camera · AVFoundation · Built-in camera"
+        );
+        assert_eq!(modal.camera_picker_selected_name(), "Front camera");
+        assert_eq!(
+            modal.camera_option_ids(),
+            vec![None, Some("camera-a".to_string())]
+        );
+        assert_eq!(modal.camera_picker_index, 1);
+        modal.move_camera_picker(-1);
+        assert_eq!(modal.camera_picker_selected_id(), None);
+    }
+
+    #[test]
+    fn media_settings_camera_picker_preserves_disconnected_saved_device() {
+        let mut modal = SettingsModalState::default();
+        modal.selected_camera_device_id = Some("disconnected-camera".to_string());
+        modal.reset_camera_picker_index();
+
+        assert!(modal.camera_selection_unavailable());
+        assert_eq!(
+            modal.camera_option_ids(),
+            vec![None, Some("disconnected-camera".to_string())]
+        );
+        assert_eq!(
+            modal.camera_selection_label(),
+            "disconnected-camera (unavailable)"
+        );
     }
 
     #[test]
     fn only_ratty_path_accepts_text_input() {
         let mut modal = SettingsModalState::default();
         modal.activate_section(SettingsSection::Media);
+        modal.focus = SettingsField::RattyPath;
         modal.push_char('/');
         modal.push_char('x');
         assert_eq!(modal.ratty_path, "/x");

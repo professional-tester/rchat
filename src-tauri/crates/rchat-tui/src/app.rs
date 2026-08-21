@@ -61,7 +61,7 @@ use rchat_core::{
     network::{command::NetworkCommand, mdns},
     oauth, runtime,
     settings::{
-        connectivity as settings_connectivity, peers as settings_peers,
+        camera as settings_camera, connectivity as settings_connectivity, peers as settings_peers,
         profile as settings_profile, stickers as settings_stickers, theme as settings_theme,
     },
     storage,
@@ -328,7 +328,143 @@ fn should_request_qr_protocol(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rchat_core::events::CoreEventSink;
     use std::cell::RefCell;
+
+    fn camera_test_network_state() -> (NetworkState, mpsc::Receiver<NetworkCommand>) {
+        let (sender, receiver) = mpsc::channel(1);
+        (
+            NetworkState {
+                sender: Arc::new(tokio::sync::Mutex::new(sender)),
+                local_peer_id: Arc::new(tokio::sync::Mutex::new(None)),
+                listening_addresses: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                public_address_v6: Arc::new(tokio::sync::Mutex::new(None)),
+                public_address_v4: Arc::new(tokio::sync::Mutex::new(None)),
+                stun_external_port: Arc::new(tokio::sync::Mutex::new(None)),
+                temporary_state: Arc::new(tokio::sync::Mutex::new(Default::default())),
+                connected_chat_ids: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                chat_connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                voice_call_state: Arc::new(tokio::sync::Mutex::new(VoiceCallState::default())),
+                broadcast_state: Arc::new(tokio::sync::Mutex::new(BroadcastState::default())),
+                connectivity: Arc::new(tokio::sync::Mutex::new(
+                    rchat_core::storage::config::ConnectivitySettings::default(),
+                )),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn camera_selection_routes_shared_network_command() {
+        let (network_state, mut receiver) = camera_test_network_state();
+
+        send_camera_selection(&network_state, Some("camera-a".to_string()))
+            .await
+            .expect("camera command queues");
+
+        match receiver.recv().await.expect("camera command") {
+            NetworkCommand::SetVideoCallCameraDevice { device_id } => {
+                assert_eq!(device_id.as_deref(), Some("camera-a"));
+            }
+            _ => panic!("expected camera device command"),
+        }
+    }
+
+    #[test]
+    fn camera_refresh_failure_is_nonfatal_and_preserves_picker_state() {
+        let mut state = UiState::new(ProtocolType::Halfblocks, TuiEventSink::channel(1).0);
+        let mut modal = crate::state::SettingsModalState::default();
+        modal.section = SettingsSection::Media;
+        modal.camera_picker_open = true;
+        modal.camera_loaded = true;
+        state.app.settings = Some(modal);
+
+        let handled = apply_camera_refresh_result(
+            &mut state,
+            Err(anyhow!("native camera enumeration unavailable")),
+        );
+
+        assert!(!handled);
+        let modal = state.app.settings.as_ref().expect("settings modal");
+        assert!(modal.camera_picker_open);
+        assert!(!modal.camera_loading);
+        assert!(!modal.camera_loaded);
+        assert_eq!(
+            modal.camera_error.as_deref(),
+            Some("native camera enumeration unavailable")
+        );
+    }
+
+    #[test]
+    fn video_camera_error_event_surfaces_in_media_state_and_settings() {
+        let (sink, mut event_rx) = TuiEventSink::channel(1);
+        sink.emit(CoreEvent::VideoCallCameraError(
+            rchat_core::events::VideoCameraErrorEvent {
+                call_id: "call-1".to_string(),
+                message: "native camera unavailable".to_string(),
+            },
+        ));
+
+        let mut state = UiState::new(ProtocolType::Halfblocks, sink);
+        let mut settings = crate::state::SettingsModalState::default();
+        settings.section = SettingsSection::Media;
+        state.app.settings = Some(settings);
+        let mut pending_frames = LatestFrameSlot::<BroadcastFrameEvent>::default();
+        let mut pending_remote_video_frames =
+            LatestFrameSlot::<VideoEncodedRemoteFrameEvent>::default();
+        let mut decoder = ScreenFrameDecoder::default();
+        let mut remote_video_decoder = RemoteVideoFrameDecoder::default();
+        let mut refresh_requested = false;
+        let mut mark_read_chat_ids = Vec::new();
+
+        drain_core_events(
+            &mut event_rx,
+            &mut state,
+            &mut pending_frames,
+            &mut pending_remote_video_frames,
+            &mut decoder,
+            &mut remote_video_decoder,
+            &mut refresh_requested,
+            &mut mark_read_chat_ids,
+        );
+
+        assert_eq!(
+            state.media_error.as_deref(),
+            Some("native camera unavailable")
+        );
+        let settings = state.app.settings.as_ref().expect("media settings");
+        assert_eq!(
+            settings.camera_error.as_deref(),
+            Some("native camera unavailable")
+        );
+        assert_eq!(settings.error.as_deref(), Some("native camera unavailable"));
+        assert!(settings.status.is_none());
+    }
+
+    #[test]
+    fn settings_media_mouse_targets_camera_rows() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let popup = centered_rect(92, 30, area);
+        let inner = inset_rect(popup, 2);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(20)])
+            .split(inner);
+
+        assert_eq!(
+            settings_media_camera_click_target(area, columns[1].x + 2, columns[1].y + 2,),
+            Some(SettingsField::CameraDevice)
+        );
+        assert_eq!(
+            settings_media_camera_click_target(area, columns[1].x + 2, columns[1].y + 3,),
+            Some(SettingsField::CameraRefresh)
+        );
+    }
 
     #[test]
     fn ratty_view_snapshot_changes_only_for_render_geometry() {
@@ -2788,6 +2924,17 @@ async fn send_network_command(network_state: &NetworkState, command: NetworkComm
         .map_err(|_| anyhow!("network command channel is closed"))
 }
 
+async fn send_camera_selection(
+    network_state: &NetworkState,
+    device_id: Option<String>,
+) -> Result<()> {
+    send_network_command(
+        network_state,
+        NetworkCommand::SetVideoCallCameraDevice { device_id },
+    )
+    .await
+}
+
 async fn refresh_direct_chats(
     app_state: &AppState,
     network_state: &NetworkState,
@@ -4605,12 +4752,127 @@ async fn refresh_settings_modal(app_state: &AppState, state: &mut UiState) -> Re
     Ok(())
 }
 
+fn apply_camera_refresh_result(
+    state: &mut UiState,
+    result: Result<(Option<String>, Vec<settings_camera::CaptureDeviceInfo>)>,
+) -> bool {
+    match result {
+        Ok((selected_device_id, devices)) => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.selected_camera_device_id = selected_device_id;
+                modal.camera_devices = devices;
+                modal.camera_loaded = true;
+                modal.camera_loading = false;
+                modal.camera_error = None;
+                modal.reset_camera_picker_index();
+            }
+            true
+        }
+        Err(error) => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.camera_loaded = false;
+                modal.camera_loading = false;
+                modal.camera_error = Some(error.to_string());
+            }
+            false
+        }
+    }
+}
+
+async fn refresh_camera_settings(app_state: &AppState, state: &mut UiState) -> bool {
+    if let Some(modal) = state.app.settings.as_mut() {
+        modal.camera_loading = true;
+        modal.camera_error = None;
+    } else {
+        return true;
+    }
+
+    let result = async {
+        let selected_device_id = settings_camera::get_selected_camera_device_id(app_state).await?;
+        let devices = settings_camera::list_camera_devices()
+            .map_err(|error| anyhow!("failed to list native cameras: {error}"))?;
+        Ok::<_, anyhow::Error>((selected_device_id, devices))
+    }
+    .await;
+
+    apply_camera_refresh_result(state, result)
+}
+
+async fn handle_camera_picker_key(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    code: KeyCode,
+) -> Result<()> {
+    match code {
+        KeyCode::Esc => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.camera_picker_open = false;
+            }
+        }
+        KeyCode::Up => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.move_camera_picker(-1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.move_camera_picker(1);
+            }
+        }
+        KeyCode::Char('r') => {
+            refresh_camera_settings(app_state, state).await;
+        }
+        KeyCode::Enter => {
+            let Some((device_id, name, unavailable)) = state.app.settings.as_ref().map(|modal| {
+                let device_id = modal.camera_picker_selected_id();
+                let unavailable = device_id.as_ref().is_some_and(|selected| {
+                    !modal
+                        .camera_devices
+                        .iter()
+                        .any(|device| device.id == *selected)
+                });
+                (device_id, modal.camera_picker_selected_name(), unavailable)
+            }) else {
+                return Ok(());
+            };
+
+            if let Err(error) = send_camera_selection(network_state, device_id.clone()).await {
+                set_settings_error(state, format!("failed to switch native camera: {error}"));
+                return Ok(());
+            }
+
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.selected_camera_device_id = device_id;
+                modal.camera_picker_open = false;
+                modal.reset_camera_picker_index();
+            }
+            if unavailable {
+                set_settings_status(state, "Selected camera unavailable; calls use Automatic");
+            } else {
+                set_settings_status(state, format!("Camera switched to {name}"));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn handle_settings_key(
     app_state: &AppState,
     network_state: &NetworkState,
     state: &mut UiState,
     code: KeyCode,
 ) -> Result<()> {
+    if state
+        .app
+        .settings
+        .as_ref()
+        .is_some_and(|modal| modal.camera_picker_open)
+    {
+        return handle_camera_picker_key(app_state, network_state, state, code).await;
+    }
+
     match code {
         KeyCode::Esc => state.app.close_settings(),
         KeyCode::Tab => {
@@ -4667,6 +4929,31 @@ async fn activate_settings_focus(
                 if let Some(modal) = state.app.settings.as_mut() {
                     modal.activate_section(section);
                 }
+                if section == SettingsSection::Media {
+                    refresh_camera_settings(app_state, state).await;
+                }
+            }
+        }
+        SettingsField::CameraDevice => {
+            let should_refresh = state
+                .app
+                .settings
+                .as_ref()
+                .map(|modal| !modal.camera_loaded)
+                .unwrap_or(false);
+            if should_refresh {
+                refresh_camera_settings(app_state, state).await;
+            }
+            if let Some(modal) = state.app.settings.as_mut() {
+                modal.camera_picker_open = true;
+                modal.reset_camera_picker_index();
+                modal.status = None;
+                modal.error = None;
+            }
+        }
+        SettingsField::CameraRefresh => {
+            if refresh_camera_settings(app_state, state).await {
+                set_settings_status(state, "native cameras refreshed");
             }
         }
         SettingsField::ProfileSave => {
@@ -5478,8 +5765,17 @@ async fn handle_mouse_event(
         return handle_new_person_mouse(app_state, network_state, state, mouse, size).await;
     }
 
+    if state
+        .app
+        .settings
+        .as_ref()
+        .is_some_and(|modal| modal.camera_picker_open)
+    {
+        return handle_camera_picker_mouse(app_state, network_state, state, mouse, size).await;
+    }
+
     if state.app.settings.is_some() {
-        return Ok(());
+        return handle_settings_mouse(app_state, network_state, state, mouse, size).await;
     }
 
     if state.app.attachment_modal.is_some()
@@ -5600,6 +5896,104 @@ async fn handle_mouse_event(
     }
 
     Ok(())
+}
+
+async fn handle_settings_mouse(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    mouse: MouseEvent,
+    size: Size,
+) -> Result<()> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return Ok(());
+    };
+    let Some(section) = state.app.settings.as_ref().map(|modal| modal.section) else {
+        return Ok(());
+    };
+    if section != SettingsSection::Media {
+        return Ok(());
+    }
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: size.width,
+        height: size.height,
+    };
+    let Some(field) = settings_media_camera_click_target(area, mouse.column, mouse.row) else {
+        return Ok(());
+    };
+    if let Some(modal) = state.app.settings.as_mut() {
+        modal.focus = field;
+    }
+    activate_settings_focus(app_state, network_state, state).await
+}
+
+fn settings_media_camera_click_target(area: Rect, column: u16, row: u16) -> Option<SettingsField> {
+    let popup = centered_rect(92, 30, area);
+    let inner = inset_rect(popup, 2);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(20)])
+        .split(inner);
+    if !rect_contains(columns[1], column, row) {
+        return None;
+    }
+    let line = row.saturating_sub(columns[1].y.saturating_add(1)) as usize;
+    match line {
+        1 => Some(SettingsField::CameraDevice),
+        2 => Some(SettingsField::CameraRefresh),
+        _ => None,
+    }
+}
+
+async fn handle_camera_picker_mouse(
+    app_state: &AppState,
+    network_state: &NetworkState,
+    state: &mut UiState,
+    mouse: MouseEvent,
+    size: Size,
+) -> Result<()> {
+    let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+        return Ok(());
+    };
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: size.width,
+        height: size.height,
+    };
+    let popup = centered_rect(78, 30, area);
+    if !rect_contains(popup, mouse.column, mouse.row) {
+        return Ok(());
+    }
+
+    let Some((start, visible_count)) = state.app.settings.as_ref().map(|modal| {
+        let options = modal.camera_option_ids();
+        let visible_count = 14.min(options.len().max(1));
+        let start = modal
+            .camera_picker_index
+            .saturating_sub(visible_count.saturating_sub(1))
+            .min(options.len().saturating_sub(visible_count));
+        (start, visible_count)
+    }) else {
+        return Ok(());
+    };
+
+    let option_row = popup.y.saturating_add(3);
+    let Some(offset) = mouse.row.checked_sub(option_row).map(usize::from) else {
+        return Ok(());
+    };
+    if offset >= visible_count {
+        return Ok(());
+    }
+    let index = start + offset;
+    if let Some(modal) = state.app.settings.as_mut() {
+        if index < modal.camera_option_ids().len() {
+            modal.camera_picker_index = index;
+        }
+    }
+    handle_camera_picker_key(app_state, network_state, state, KeyCode::Enter).await
 }
 
 async fn handle_new_person_mouse(
@@ -6879,6 +7273,16 @@ fn drain_core_events(
             TuiEvent::Core(CoreEvent::ScreenBroadcastCaptureError(error)) => {
                 state.media_error = Some(error.message);
             }
+            TuiEvent::Core(CoreEvent::VideoCallCameraError(error)) => {
+                state.media_error = Some(error.message.clone());
+                if let Some(settings) = state.app.settings.as_mut() {
+                    if settings.section == SettingsSection::Media {
+                        settings.camera_error = Some(error.message.clone());
+                        settings.error = Some(error.message);
+                        settings.status = None;
+                    }
+                }
+            }
             TuiEvent::Core(CoreEvent::LocalPeerDiscovered(peer)) => {
                 state.app.apply_local_peer_discovered(peer.clone());
                 state.last_peer_event = Some(format!("discovered {}", peer.peer_id));
@@ -7970,6 +8374,14 @@ fn render_app_shell(
     }
     if state.app.settings.is_some() {
         render_settings_overlay(frame, frame.area(), state, &modal_theme);
+    }
+    if state
+        .app
+        .settings
+        .as_ref()
+        .is_some_and(|modal| modal.camera_picker_open)
+    {
+        render_camera_picker_overlay(frame, frame.area(), state, &modal_theme);
     }
     if state.app.attachment_modal.is_some() {
         render_attachment_overlay(
@@ -10755,6 +11167,89 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, t
     );
 }
 
+fn render_camera_picker_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState, theme: &Theme) {
+    let Some(modal) = state.app.settings.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(78, 30, area);
+    draw_shadow(frame, popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        themed_block(" Native call camera ", theme)
+            .style(Style::default().bg(theme.surface).fg(theme.text)),
+        popup,
+    );
+    let inner = popup.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+
+    let options = modal.camera_option_ids();
+    let visible_count = 14.min(options.len().max(1));
+    let start = modal
+        .camera_picker_index
+        .saturating_sub(visible_count.saturating_sub(1));
+    let start = start.min(options.len().saturating_sub(visible_count));
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Choose the camera for native RChat calls",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for index in start..start.saturating_add(visible_count) {
+        let selected = index == modal.camera_picker_index;
+        let style = if selected {
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let marker = if selected { ">" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{marker} {}",
+                short_identifier(&modal.camera_option_label(index), 68)
+            ),
+            style,
+        )));
+    }
+
+    if modal.camera_loading {
+        lines.push(Line::from(Span::styled(
+            "Loading native cameras…",
+            Style::default().fg(theme.muted),
+        )));
+    } else if options.len() == 1 {
+        lines.push(Line::from(Span::styled(
+            "No native cameras reported",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    if let Some(error) = modal.camera_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            error.to_string(),
+            Style::default().fg(theme.error),
+        )));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "Up/Down choose | Enter select | r refresh | Esc close",
+            Style::default().fg(theme.muted),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.surface).fg(theme.text))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn settings_profile_lines(
     modal: &crate::state::SettingsModalState,
     theme: &Theme,
@@ -11000,6 +11495,46 @@ fn settings_media_lines(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
         .as_ref()
         .expect("settings media lines require an open settings modal");
     let lines = vec![
+        Line::from("Native call camera"),
+        settings_button_line(
+            modal,
+            SettingsField::CameraDevice,
+            &format!("Camera device: {}", modal.camera_selection_label()),
+            theme,
+        ),
+        settings_button_line(
+            modal,
+            SettingsField::CameraRefresh,
+            "Refresh cameras",
+            theme,
+        ),
+        if modal.camera_loading {
+            Line::from(Span::styled(
+                "Loading native cameras…",
+                Style::default().fg(theme.muted),
+            ))
+        } else if let Some(error) = modal.camera_error.as_deref() {
+            Line::from(Span::styled(
+                format!("Camera error: {error}"),
+                Style::default().fg(theme.error),
+            ))
+        } else if modal.camera_selection_unavailable() {
+            Line::from(Span::styled(
+                "Saved camera unavailable; calls use Automatic",
+                Style::default().fg(theme.warning),
+            ))
+        } else if modal.camera_devices.is_empty() {
+            Line::from(Span::styled(
+                "No native cameras reported; calls use Automatic",
+                Style::default().fg(theme.muted),
+            ))
+        } else {
+            Line::from(Span::styled(
+                "Select a camera to apply it to native calls",
+                Style::default().fg(theme.muted),
+            ))
+        },
+        Line::from(""),
         Line::from("Ratty terminal host"),
         Line::from(format!(
             "Resolved: {} ({})",
