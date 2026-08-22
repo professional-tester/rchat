@@ -147,7 +147,7 @@ pub async fn create_group_with_options(
         db::upsert_chat(&conn, &group_id, &resolved_name, true)?;
         db::update_chat_image_hash(&conn, &group_id, image_hash.as_deref())?;
         db::add_chat_member(&conn, &group_id, "Me", "admin")?;
-        db::insert_group_record(&conn, &record, true, false)?;
+        mark_group_record_verified(&conn, record.id())?;
         if let (Some(image_hash), Some(file_record)) = (&image_hash, &file_availability_record) {
             db::upsert_group_file_source(&conn, &group_id, image_hash, &local_peer_id)?;
             db::insert_group_record(&conn, file_record, true, false)?;
@@ -378,7 +378,7 @@ pub async fn invite_member(
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         db::upsert_group_invite(&conn, &payload, "sent")?;
-        db::insert_group_record(&conn, &invite_record, true, false)?;
+        mark_group_record_verified(&conn, invite_record.id())?;
     }
 
     send_network_command(
@@ -446,7 +446,7 @@ pub async fn accept_invite(
         db::update_group_invite_status(&conn, &invite_id, "accepted")?;
         db::upsert_chat(&conn, &invite.group_id, &invite.group_name, true)?;
         db::add_chat_member(&conn, &invite.group_id, "Me", "member")?;
-        db::insert_group_record(&conn, &joined_record, true, false)?;
+        mark_group_record_verified(&conn, joined_record.id())?;
     }
 
     send_network_command(
@@ -602,7 +602,7 @@ pub async fn rename_group(
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         db::upsert_chat(&conn, &group_id, &name, true)?;
-        db::insert_group_record(&conn, &record, true, false)?;
+        mark_group_record_verified(&conn, record.id())?;
     }
     send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await?;
     Ok(())
@@ -928,12 +928,9 @@ fn validate_group_record(
             return Ok(RecordDisposition::PendingDependency);
         }
     }
-    // Mandatory v3: every policy-changing non-creation record must name its
-    // causal head(s). Counter 0/MAX are handled as hard counter errors, not
-    // parent errors. Non-policy records (Message, Head, etc.) may have empty
-    // parents and are ordered by counter alone.
-    if is_policy_changing(record.body())
-        && !matches!(record.body(), GroupRecordBody::GroupCreated { .. })
+    // Mandatory v3: every non-creation record must name its causal head(s).
+    // Counter 0/MAX are handled as hard counter errors, not parent errors.
+    if !matches!(record.body(), GroupRecordBody::GroupCreated { .. })
         && record.unsigned.parents.is_empty()
         && record.lamport_counter() != 0
         && record.lamport_counter() != u64::MAX
@@ -973,7 +970,7 @@ fn validate_group_record(
             } else if policy.active_members.contains(record.author_peer_id()) {
                 Err(anyhow!("Members cannot invite unless group settings allow it"))
             } else {
-                Ok(RecordDisposition::PendingDependency)
+                Err(anyhow!("Only members can invite"))
             }
         }
         GroupRecordBody::MemberJoined { peer_id } => {
@@ -986,7 +983,7 @@ fn validate_group_record(
             if policy.invited_members.contains(peer_id) {
                 Ok(RecordDisposition::Apply)
             } else {
-                Ok(RecordDisposition::PendingDependency)
+                Err(anyhow!("Member was not invited"))
             }
         }
         GroupRecordBody::MemberLeft { peer_id } => {
@@ -1004,7 +1001,7 @@ fn validate_group_record(
             if policy.active_members.contains(peer_id) {
                 Ok(RecordDisposition::Apply)
             } else {
-                Ok(RecordDisposition::PendingDependency)
+                Err(anyhow!("Member is not active"))
             }
         }
         GroupRecordBody::GroupRenamed { .. }
@@ -1030,9 +1027,6 @@ fn validate_group_record(
                 return Ok(RecordDisposition::PendingDependency);
             };
             if policy.admin_peer_id != record.author_peer_id() {
-                if policy.active_members.contains(record.author_peer_id()) {
-                    return Ok(RecordDisposition::PendingDependency);
-                }
                 return Err(anyhow!("Only the group admin can transfer administration"));
             }
             if new_admin_peer_id == record.author_peer_id() {
@@ -1048,9 +1042,6 @@ fn validate_group_record(
                 return Ok(RecordDisposition::PendingDependency);
             };
             if policy.admin_peer_id != record.author_peer_id() {
-                if policy.active_members.contains(record.author_peer_id()) {
-                    return Ok(RecordDisposition::PendingDependency);
-                }
                 return Err(anyhow!("Only the group admin can dissolve the group"));
             }
             if policy.active_members.len() != 1 {
@@ -1068,7 +1059,7 @@ fn validate_group_record(
             if policy.active_members.contains(record.author_peer_id()) {
                 Ok(RecordDisposition::Apply)
             } else {
-                Ok(RecordDisposition::PendingDependency)
+                Err(anyhow!("Only active members can create this record"))
             }
         }
     }
@@ -1525,7 +1516,7 @@ async fn send_group_message_record(
             db::upsert_group_file_source(&conn, &group_id, file_hash, "Me")?;
         }
         db::insert_message(&conn, &db_msg)?;
-        db::insert_group_record(&conn, &record, true, false)?;
+        mark_group_record_verified(&conn, record.id())?;
     }
     let msg_id = record.id().to_string();
     send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await?;
@@ -2576,7 +2567,7 @@ mod tests {
             },
         );
 
-        assert!(!apply(&app_state, &joined).expect("pending"));
+        assert!(apply(&app_state, &joined).is_err(), "join without invite must be hard error");
         let policy = get_group_policy(&app_state, &group_id).expect("policy");
         assert!(!policy.active_members.contains(&peer_id(&member)));
     }
@@ -2744,7 +2735,10 @@ mod tests {
             },
         );
 
-        assert!(!apply(&app_state, &message).expect("pending message"));
+        assert!(
+            apply(&app_state, &message).is_err(),
+            "pre-join message must be hard error (parents present, not active)"
+        );
         apply(
             &app_state,
             &signed(
@@ -2774,9 +2768,10 @@ mod tests {
         .expect("joined");
 
         let conn = app_state.db_conn.lock().expect("db");
+        // Hard error, not pending, so not stored at all.
         assert_eq!(
             group_record_state(&conn, message.id()).expect("state"),
-            Some((false, true))
+            None
         );
         let inserted: bool = conn
             .query_row(
