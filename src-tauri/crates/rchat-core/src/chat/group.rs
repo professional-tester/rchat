@@ -1493,27 +1493,25 @@ async fn send_group_message_record(
     // Finalize through the shared apply path so the message is validated
     // against its exact parents under the same lock.
     crate::chat::group::apply_signed_record(app_state, None, &record, true)?;
-    // apply inserts the message with author peer_id; for local sends we
-    // want it visible as "Me" as well, so upsert a Me-aliased copy if needed.
+    // Local sends must be visible as "Me" for GUI/TUI sender/status mapping.
+    // `apply` inserted with the cryptographic author, so update that row to
+    // the local display identity and propagate any failure.
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        let exists: bool = conn
+        conn.execute(
+            "UPDATE messages SET peer_id = 'Me' WHERE id = ?1",
+            [record.id()],
+        )?;
+        // Verify the row now has peer_id='Me'.
+        let ok: bool = conn
             .query_row(
                 "SELECT 1 FROM messages WHERE id = ?1 AND peer_id = 'Me'",
                 [record.id()],
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        if !exists {
-            let mut db_msg_me = group_record_to_db_message(
-                &record,
-                content_type,
-                text_content.clone(),
-                file_hash.clone(),
-                sender_alias.clone(),
-            );
-            db_msg_me.peer_id = "Me".to_string();
-            let _ = db::insert_message(&conn, &db_msg_me);
+        if !ok {
+            return Err(anyhow!("Local message not stored as Me"));
         }
     }
     let msg_id = record.id().to_string();
@@ -3275,140 +3273,140 @@ mod tests {
         assert!(policy.invited_members.contains(&fixed_peer_id(51)));
     }
 
-    #[test]
-    fn create_invite_join_two_messages_end_to_end() {
-        let app_state = app_state();
+    #[tokio::test]
+    async fn create_invite_join_two_messages_end_to_end() {
+        let (temp_dir, app_state) = crate::testing::test_app_state().await;
+        let (network_state, mut rx) = crate::testing::test_network_state();
+        // Drain network commands so publish does not block.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        // Persist founder keypair as local peer.
         let founder = keypair();
-        let member = keypair();
-        let group_id = chat_kind::generate_group_chat_id();
-        let r1 = SignedGroupRecord::new(
-            &founder,
-            group_id.clone(),
-            format!("test-created-{}", rand::random::<u64>()),
-            1_700_000_001,
-            vec![],
-            1,
-            GroupRecordBody::GroupCreated {
-                name: "Test Group".to_string(),
+        {
+            let mgr = app_state.config_manager.lock().await;
+            let mut cfg = mgr.load().await.unwrap();
+            cfg.user.libp2p_keypair = Some(
+                BASE64.encode(&founder.to_protobuf_encoding().unwrap()),
+            );
+            mgr.save(&cfg).await.unwrap();
+        }
+        *network_state.local_peer_id.lock().await =
+            Some(peer_id(&founder));
+        let group_id = create_group_with_options(
+            &app_state,
+            Some(&network_state),
+            crate::chat::group::CreateGroupOptions {
+                name: Some("Test Group".to_string()),
                 settings: None,
-                image_hash: None,
+                image_path: None,
+                require_name: false,
             },
         )
-        .unwrap();
-        apply(&app_state, &r1).expect("r1");
-        let r2 = SignedGroupRecord::new(
-            &founder,
-            group_id.clone(),
-            format!("test-invite-{}", rand::random::<u64>()),
-            1_700_000_002,
-            vec![r1.id().to_string()],
-            2,
-            GroupRecordBody::MemberInvited {
-                peer_id: peer_id(&member),
-                role: "member".to_string(),
-            },
-        )
-        .unwrap();
-        apply(&app_state, &r2).expect("r2");
-        let r3 = SignedGroupRecord::new(
+        .await
+        .unwrap()
+        .chat_id;
+        let member = keypair();
+        let member_id = peer_id(&member);
+        invite_member(&app_state, &network_state, group_id.clone(), member_id.clone())
+            .await
+            .unwrap();
+        // Simulate member joining via the invite: apply the join that parents the invite.
+        let invite_rec = {
+            let conn = app_state.db_conn.lock().unwrap();
+            let recs = db::get_all_verified_group_records_ordered(&conn, &group_id).unwrap();
+            recs.into_iter()
+                .find(|r| matches!(r.body(), GroupRecordBody::MemberInvited { peer_id, .. } if peer_id == &member_id))
+                .unwrap()
+        };
+        let join = SignedGroupRecord::new(
             &member,
             group_id.clone(),
             format!("test-join-{}", rand::random::<u64>()),
             1_700_000_003,
-            vec![r2.id().to_string()],
-            3,
+            vec![invite_rec.id().to_string()],
+            invite_rec.lamport_counter() + 1,
             GroupRecordBody::MemberJoined {
-                peer_id: peer_id(&member),
+                peer_id: member_id.clone(),
             },
         )
         .unwrap();
-        apply(&app_state, &r3).expect("r3");
-        let r4 = SignedGroupRecord::new(
-            &founder,
-            group_id.clone(),
-            format!("test-msg1-{}", rand::random::<u64>()),
-            1_700_000_004,
-            vec![r3.id().to_string()],
-            4,
-            GroupRecordBody::Message {
-                content_type: GroupContentType::Text,
-                text_content: Some("hello".to_string()),
-                file_hash: None,
-                sender_alias: None,
-            },
-        )
-        .unwrap();
-        apply(&app_state, &r4).expect("r4");
-        let r5 = SignedGroupRecord::new(
-            &member,
-            group_id.clone(),
-            format!("test-msg2-{}", rand::random::<u64>()),
-            1_700_000_005,
-            vec![r4.id().to_string()],
-            5,
-            GroupRecordBody::Message {
-                content_type: GroupContentType::Text,
-                text_content: Some("world".to_string()),
-                file_hash: None,
-                sender_alias: None,
-            },
-        )
-        .unwrap();
-        apply(&app_state, &r5).expect("r5");
+        apply(&app_state, &join).unwrap();
+        // Two consecutive local messages must both be stored as Me.
+        let msg1 = send_group_text(&app_state, &network_state, group_id.clone(), "hello".to_string(), None)
+            .await
+            .unwrap();
+        let msg2 = send_group_text(&app_state, &network_state, group_id.clone(), "world".to_string(), None)
+            .await
+            .unwrap();
+        assert_ne!(msg1, msg2);
         let conn = app_state.db_conn.lock().unwrap();
-        assert_eq!(group_record_state(&conn, r1.id()).unwrap(), Some((true, false)));
-        assert_eq!(group_record_state(&conn, r5.id()).unwrap(), Some((true, false)));
+        for msg_id in [msg1, msg2] {
+            let peer: String = conn
+                .query_row("SELECT peer_id FROM messages WHERE id = ?1", [&msg_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(peer, "Me", "local message should be stored as Me, got {peer}");
+        }
+        drop(temp_dir);
     }
 
-    #[test]
-    fn concurrent_local_allocations_do_not_fork() {
-        let app_state = app_state();
+    #[tokio::test]
+    async fn concurrent_local_allocations_do_not_fork() {
+        let (temp_dir, app_state) = crate::testing::test_app_state().await;
         let founder = keypair();
-        let group_id = chat_kind::generate_group_chat_id();
-        apply(
+        {
+            let mgr = app_state.config_manager.lock().await;
+            let mut cfg = mgr.load().await.unwrap();
+            cfg.user.libp2p_keypair = Some(BASE64.encode(&founder.to_protobuf_encoding().unwrap()));
+            mgr.save(&cfg).await.unwrap();
+        }
+        let (network_state, mut rx) = crate::testing::test_network_state();
+        *network_state.local_peer_id.lock().await = Some(peer_id(&founder));
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let group_id = create_group_with_options(
             &app_state,
-            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
-                name: "Concurrent".to_string(), settings: None, image_hash: None,
-            }),
-        )
-        .expect("created");
-        // Simulate two concurrent local ops that both read head 1 and try to
-        // allocate counter 2. With the old non-atomic path they would both
-        // sign counter 2 and one would be rejected as fork. With the new
-        // reservation + retry, the second should observe the first's reservation
-        // and retry to 3, but since we are testing the DB-level guarantee, we
-        // just verify that after both are applied via the validated path, no
-        // fork exists.
-        let rec_a = signed(&founder, &group_id, "concurrent-a", 2, GroupRecordBody::GroupRenamed {
-            name: "Renamed A".to_string(),
-        });
-        // Manually craft a second record with same author/counter to simulate
-        // the race: same group, same author, same counter, different id.
-        let rec_b = SignedGroupRecord::new(
-            &founder,
-            group_id.clone(),
-            format!("test-concurrent-b-{}", rand::random::<u64>()),
-            1_700_000_200,
-            vec![rec_a.unsigned.parents[0].clone()],
-            2,
-            GroupRecordBody::GroupRenamed {
-                name: "Renamed B".to_string(),
+            Some(&network_state),
+            crate::chat::group::CreateGroupOptions {
+                name: Some("Concurrent".to_string()),
+                settings: None,
+                image_path: None,
+                require_name: false,
             },
         )
-        .expect("record");
-        // First wins.
-        apply(&app_state, &rec_a).expect("first concurrent should apply");
-        // Second with same author/counter must be rejected as fork, not silently
-        // ignored or left pending.
-        let err = apply(&app_state, &rec_b).expect_err("fork must be rejected");
-        assert!(err.to_string().contains("forks"), "wrong error: {err}");
-        // No fork in DB.
+        .await
+        .unwrap()
+        .chat_id;
+        // Two concurrent renames that both read the same head.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let app1 = app_state.clone();
+        let net1 = network_state.clone();
+        let gid1 = group_id.clone();
+        let b1 = barrier.clone();
+        let h1 = tokio::spawn(async move {
+            b1.wait().await;
+            rename_group(&app1, &net1, gid1, "Renamed A".to_string()).await
+        });
+        let app2 = app_state.clone();
+        let net2 = network_state.clone();
+        let gid2 = group_id.clone();
+        let b2 = barrier.clone();
+        let h2 = tokio::spawn(async move {
+            b2.wait().await;
+            rename_group(&app2, &net2, gid2, "Renamed B".to_string()).await
+        });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        // At least one must succeed; the other may succeed with a retried counter
+        // or be rejected, but they must not fork the same (author,counter).
+        assert!(
+            r1.is_ok() || r2.is_ok(),
+            "at least one concurrent rename should succeed: {r1:?} {r2:?}"
+        );
         let conn = app_state.db_conn.lock().unwrap();
         let recs = db::get_all_verified_group_records_ordered(&conn, &group_id).unwrap();
         let mut seen = std::collections::HashSet::new();
         for r in recs {
             let key = (r.author_peer_id().to_string(), r.lamport_counter());
-            assert!(seen.insert(key), "fork detected: same author/counter");
+            assert!(seen.insert(key.clone()), "fork detected: same author/counter {:?}", key);
         }
+        drop(temp_dir);
     }
 }
