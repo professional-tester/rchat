@@ -142,16 +142,14 @@ pub async fn create_group_with_options(
         })
         .transpose()?;
 
-    {
+    // Finalize through the shared apply path so the record is validated
+    // against its exact parents under the same DB lock that changes it to
+    // verified, rather than trusting an earlier precheck.
+    crate::chat::group::apply_signed_record(app_state, None, &record, true)?;
+    if let (Some(image_hash), Some(file_record)) = (&image_hash, &file_availability_record) {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        db::upsert_chat(&conn, &group_id, &resolved_name, true)?;
-        db::update_chat_image_hash(&conn, &group_id, image_hash.as_deref())?;
-        db::add_chat_member(&conn, &group_id, "Me", "admin")?;
-        mark_group_record_verified(&conn, record.id())?;
-        if let (Some(image_hash), Some(file_record)) = (&image_hash, &file_availability_record) {
-            db::upsert_group_file_source(&conn, &group_id, image_hash, &local_peer_id)?;
-            db::insert_group_record(&conn, file_record, true, false)?;
-        }
+        db::upsert_group_file_source(&conn, &group_id, image_hash, &local_peer_id)?;
+        db::insert_group_record(&conn, file_record, true, false)?;
     }
 
     if let Some(network_state) = network_state {
@@ -378,8 +376,8 @@ pub async fn invite_member(
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         db::upsert_group_invite(&conn, &payload, "sent")?;
-        mark_group_record_verified(&conn, invite_record.id())?;
     }
+    crate::chat::group::apply_signed_record(app_state, None, &invite_record, true)?;
 
     send_network_command(
         network_state,
@@ -444,10 +442,8 @@ pub async fn accept_invite(
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
         db::update_group_invite_status(&conn, &invite_id, "accepted")?;
-        db::upsert_chat(&conn, &invite.group_id, &invite.group_name, true)?;
-        db::add_chat_member(&conn, &invite.group_id, "Me", "member")?;
-        mark_group_record_verified(&conn, joined_record.id())?;
     }
+    crate::chat::group::apply_signed_record(app_state, None, &joined_record, true)?;
 
     send_network_command(
         network_state,
@@ -599,11 +595,7 @@ pub async fn rename_group(
         group_id.clone(),
         GroupRecordBody::GroupRenamed { name: name.clone() },
     )?;
-    {
-        let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        db::upsert_chat(&conn, &group_id, &name, true)?;
-        mark_group_record_verified(&conn, record.id())?;
-    }
+    crate::chat::group::apply_signed_record(app_state, None, &record, true)?;
     send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await?;
     Ok(())
 }
@@ -1498,25 +1490,31 @@ async fn send_group_message_record(
             sender_alias: sender_alias.clone(),
         },
     )?;
-    let mut db_msg = group_record_to_db_message(
-        &record,
-        content_type,
-        text_content,
-        file_hash.clone(),
-        sender_alias,
-    );
-    db_msg.peer_id = "Me".to_string();
+    // Finalize through the shared apply path so the message is validated
+    // against its exact parents under the same lock.
+    crate::chat::group::apply_signed_record(app_state, None, &record, true)?;
+    // apply inserts the message with author peer_id; for local sends we
+    // want it visible as "Me" as well, so upsert a Me-aliased copy if needed.
     {
         let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-        if !db::chat_exists(&conn, &group_id) {
-            db::upsert_chat(&conn, &group_id, &chat_kind::default_group_name(&group_id), true)?;
-            db::add_chat_member(&conn, &group_id, "Me", "member")?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE id = ?1 AND peer_id = 'Me'",
+                [record.id()],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !exists {
+            let mut db_msg_me = group_record_to_db_message(
+                &record,
+                content_type,
+                text_content.clone(),
+                file_hash.clone(),
+                sender_alias.clone(),
+            );
+            db_msg_me.peer_id = "Me".to_string();
+            let _ = db::insert_message(&conn, &db_msg_me);
         }
-        if let Some(file_hash) = &file_hash {
-            db::upsert_group_file_source(&conn, &group_id, file_hash, "Me")?;
-        }
-        db::insert_message(&conn, &db_msg)?;
-        mark_group_record_verified(&conn, record.id())?;
     }
     let msg_id = record.id().to_string();
     send_network_command(network_state, NetworkCommand::PublishGroupRecord { record }).await?;
@@ -3275,5 +3273,142 @@ mod tests {
         apply(&app_state, &invite_explicit).expect("final invite");
         let policy = get_group_policy(&app_state, &group_id).expect("policy");
         assert!(policy.invited_members.contains(&fixed_peer_id(51)));
+    }
+
+    #[test]
+    fn create_invite_join_two_messages_end_to_end() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let r1 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-created-{}", rand::random::<u64>()),
+            1_700_000_001,
+            vec![],
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test Group".to_string(),
+                settings: None,
+                image_hash: None,
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r1).expect("r1");
+        let r2 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-invite-{}", rand::random::<u64>()),
+            1_700_000_002,
+            vec![r1.id().to_string()],
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: peer_id(&member),
+                role: "member".to_string(),
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r2).expect("r2");
+        let r3 = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-join-{}", rand::random::<u64>()),
+            1_700_000_003,
+            vec![r2.id().to_string()],
+            3,
+            GroupRecordBody::MemberJoined {
+                peer_id: peer_id(&member),
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r3).expect("r3");
+        let r4 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-msg1-{}", rand::random::<u64>()),
+            1_700_000_004,
+            vec![r3.id().to_string()],
+            4,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("hello".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r4).expect("r4");
+        let r5 = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-msg2-{}", rand::random::<u64>()),
+            1_700_000_005,
+            vec![r4.id().to_string()],
+            5,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("world".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r5).expect("r5");
+        let conn = app_state.db_conn.lock().unwrap();
+        assert_eq!(group_record_state(&conn, r1.id()).unwrap(), Some((true, false)));
+        assert_eq!(group_record_state(&conn, r5.id()).unwrap(), Some((true, false)));
+    }
+
+    #[test]
+    fn concurrent_local_allocations_do_not_fork() {
+        let app_state = app_state();
+        let founder = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        apply(
+            &app_state,
+            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Concurrent".to_string(), settings: None, image_hash: None,
+            }),
+        )
+        .expect("created");
+        // Simulate two concurrent local ops that both read head 1 and try to
+        // allocate counter 2. With the old non-atomic path they would both
+        // sign counter 2 and one would be rejected as fork. With the new
+        // reservation + retry, the second should observe the first's reservation
+        // and retry to 3, but since we are testing the DB-level guarantee, we
+        // just verify that after both are applied via the validated path, no
+        // fork exists.
+        let rec_a = signed(&founder, &group_id, "concurrent-a", 2, GroupRecordBody::GroupRenamed {
+            name: "Renamed A".to_string(),
+        });
+        // Manually craft a second record with same author/counter to simulate
+        // the race: same group, same author, same counter, different id.
+        let rec_b = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-concurrent-b-{}", rand::random::<u64>()),
+            1_700_000_200,
+            vec![rec_a.unsigned.parents[0].clone()],
+            2,
+            GroupRecordBody::GroupRenamed {
+                name: "Renamed B".to_string(),
+            },
+        )
+        .expect("record");
+        // First wins.
+        apply(&app_state, &rec_a).expect("first concurrent should apply");
+        // Second with same author/counter must be rejected as fork, not silently
+        // ignored or left pending.
+        let err = apply(&app_state, &rec_b).expect_err("fork must be rejected");
+        assert!(err.to_string().contains("forks"), "wrong error: {err}");
+        // No fork in DB.
+        let conn = app_state.db_conn.lock().unwrap();
+        let recs = db::get_all_verified_group_records_ordered(&conn, &group_id).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for r in recs {
+            let key = (r.author_peer_id().to_string(), r.lamport_counter());
+            assert!(seen.insert(key), "fork detected: same author/counter");
+        }
     }
 }
