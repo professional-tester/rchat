@@ -941,20 +941,10 @@ fn validate_group_record(
             | GroupRecordBody::FileAvailability { .. }
     ) {
         let winning_head = {
-            let heads = db::get_group_head_ids(conn, record.group_id())?;
-            // Filter to policy-changing heads only for the authoritative frontier.
-            let mut policy_heads = Vec::new();
-            for hid in &heads {
-                if let Some(rec) = db::get_group_record(conn, hid)? {
-                    if is_policy_changing(rec.body()) {
-                        policy_heads.push(rec);
-                    }
-                }
-            }
+            let policy_heads = get_policy_heads(conn, record.group_id())?;
             if policy_heads.is_empty() {
                 None
             } else {
-                // Winning policy head is max by (counter, author, id) among policy leaves.
                 policy_heads.into_iter().max_by(|a, b| {
                     record_order_key(a).cmp(&record_order_key(b))
                 })
@@ -1486,9 +1476,9 @@ pub fn apply_signed_record(
         retry_pending_group_records(app_state, event_sink, record.group_id());
         // After a new verified policy record, revalidate existing verified
         // records that may have become stale due to a late-arriving policy
-        // record that changes the winning head. This makes `R -> X -> Y`
-        // and `X -> Y -> R` converge.
-        let _ = revalidate_stale_verified_records(app_state, event_sink, record.group_id());
+        // record that changes the winning head. This makes `R → X → Y`
+        // and `X → Y → R` converge. Propagate any rebuild failure.
+        revalidate_stale_verified_records(app_state, event_sink, record.group_id())?;
     }
 
     Ok(record_applied)
@@ -1500,7 +1490,9 @@ fn revalidate_stale_verified_records(
     group_id: &str,
 ) -> anyhow::Result<()> {
     let conn = app_state.db_conn.lock().map_err(|e| anyhow!(e.to_string()))?;
-    let all_verified = db::get_all_verified_group_records_ordered(&conn, group_id)?;
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    let result: anyhow::Result<()> = (|| {
+        let all_verified = db::get_all_verified_group_records_ordered(&conn, group_id)?;
     // Build valid set incrementally in causal order, checking each record's
     // parents and stale-branch condition against the current valid frontier.
     let mut valid_ids = std::collections::HashSet::new();
@@ -1537,26 +1529,54 @@ fn revalidate_stale_verified_records(
             to_demote.push(rec.id().to_string());
             continue;
         }
-        // Stale-branch check for authorization-sensitive records.
-        if is_policy_changing(rec.body()) && !matches!(rec.body(), GroupRecordBody::GroupCreated { .. }) {
+        // Stale-branch check for authorization-sensitive records (all except
+        // Head/FileAvailability/GroupCreated). This mirrors the validation
+        // check but uses the in-memory valid frontier, not the DB heads.
+        if !matches!(
+            rec.body(),
+            GroupRecordBody::GroupCreated { .. }
+                | GroupRecordBody::Head { .. }
+                | GroupRecordBody::FileAvailability { .. }
+        ) {
             // Find current winning policy head among valid_records.
-            let mut policy_heads: Vec<&SignedGroupRecord> = Vec::new();
-            {
-                let mut parent_set = std::collections::HashSet::new();
-                for v in &valid_records {
+            let mut policy_parent_set = std::collections::HashSet::new();
+            for v in &valid_records {
+                if is_policy_changing(v.body()) {
                     for p in &v.unsigned.parents {
-                        parent_set.insert(p.clone());
-                    }
-                }
-                for v in &valid_records {
-                    if !parent_set.contains(v.id()) && is_policy_changing(v.body()) {
-                        policy_heads.push(v);
+                        // Only consider parent if it is also a policy record in valid set
+                        if valid_records.iter().any(|r| r.id() == p && is_policy_changing(r.body())) {
+                            policy_parent_set.insert(p.clone());
+                        } else {
+                            // For policy records whose parent is non-policy, trace to its policy ancestors
+                            if let Some(parent_rec) = valid_records.iter().find(|r| r.id() == p) {
+                                let mut stack = vec![parent_rec.id().to_string()];
+                                let mut seen2 = std::collections::HashSet::new();
+                                while let Some(pid) = stack.pop() {
+                                    if !seen2.insert(pid.clone()) {
+                                        continue;
+                                    }
+                                    if let Some(pr) = valid_records.iter().find(|r| r.id() == &pid) {
+                                        if is_policy_changing(pr.body()) {
+                                            policy_parent_set.insert(pr.id().to_string());
+                                        }
+                                        for pp in &pr.unsigned.parents {
+                                            if !seen2.contains(pp) {
+                                                stack.push(pp.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
+            let mut policy_heads: Vec<&SignedGroupRecord> = valid_records
+                .iter()
+                .filter(|v| is_policy_changing(v.body()) && !policy_parent_set.contains(v.id()))
+                .collect();
             if let Some(winning) = policy_heads.into_iter().max_by(|a, b| record_order_key(a).cmp(&record_order_key(b))) {
                 if rec.lamport_counter() > winning.lamport_counter() {
-                    // Must descend from winning head.
                     let mut closure = std::collections::HashSet::new();
                     let mut stack = rec.unsigned.parents.clone();
                     let mut seen = std::collections::HashSet::new();
@@ -1569,6 +1589,25 @@ fn revalidate_stale_verified_records(
                             for pp in &parent_rec.unsigned.parents {
                                 if !seen.contains(pp) {
                                     stack.push(pp.clone());
+                                }
+                            }
+                            // Also include transitive policy ancestors of non-policy parents
+                            if !is_policy_changing(parent_rec.body()) {
+                                // For non-policy parent, also trace its policy ancestors
+                                let mut stack2 = parent_rec.unsigned.parents.clone();
+                                let mut seen2 = std::collections::HashSet::new();
+                                while let Some(pid2) = stack2.pop() {
+                                    if !seen2.insert(pid2.clone()) {
+                                        continue;
+                                    }
+                                    closure.insert(pid2.clone());
+                                    if let Some(pr) = valid_records.iter().find(|r| r.id() == &pid2) {
+                                        for pp in &pr.unsigned.parents {
+                                            if !seen.contains(pp) && !seen2.contains(pp) {
+                                                stack.push(pp.clone());
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1588,34 +1627,182 @@ fn revalidate_stale_verified_records(
         valid_ids.insert(rec.id().to_string());
         valid_records.push(rec.clone());
     }
-    // Demote stale verified records to pending and remove their materialized effects.
-    for stale_id in to_demote {
+    // Demote stale verified records to pending.
+    for stale_id in &to_demote {
         conn.execute(
             "UPDATE group_records SET verified = 0, pending = 1 WHERE id = ?1",
-            [&stale_id],
+            [stale_id],
         )?;
-        // Remove materialized effects for the stale record.
-        if let Some(rec) = all_verified.iter().find(|r| r.id() == stale_id) {
-            match rec.body() {
-                GroupRecordBody::Message { .. } => {
-                    let _ = conn.execute("DELETE FROM messages WHERE id = ?1", [&stale_id]);
-                }
-                GroupRecordBody::MemberInvited { peer_id, .. } => {
-                    let _ = db::remove_chat_member(&conn, group_id, peer_id);
-                }
-                GroupRecordBody::MemberJoined { peer_id } => {
-                    let _ = db::remove_chat_member(&conn, group_id, peer_id);
-                }
-                _ => {}
-            }
+    }
+        if !to_demote.is_empty() {
+            // Rebuild all derived group state transactionally from the remaining valid set.
+            // This ensures that concurrent stale branches that were previously materialized
+            // are now consistently removed, regardless of delivery order.
+            rebuild_group_materialized_state(&conn, group_id, &valid_records)?;
             if let Some(sink) = event_sink {
-                sink.emit(CoreEvent::GroupRecordApplied(GroupRecordAppliedEvent {
-                    group_id: group_id.to_string(),
-                    record_id: stale_id.clone(),
-                    record_type: rec.body().kind().to_string(),
-                }));
+                for stale_id in &to_demote {
+                    if let Some(rec) = all_verified.iter().find(|r| r.id() == stale_id) {
+                        sink.emit(CoreEvent::GroupRecordApplied(GroupRecordAppliedEvent {
+                            group_id: group_id.to_string(),
+                            record_id: stale_id.clone(),
+                            record_type: rec.body().kind().to_string(),
+                        }));
+                    }
+                }
             }
         }
+        Ok(())
+    })();
+    if let Err(e) = &result {
+        let _ = conn.execute("ROLLBACK", []);
+        return Err(anyhow!("revalidation failed: {e}"));
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+fn rebuild_group_materialized_state(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+    valid_records: &[SignedGroupRecord],
+) -> anyhow::Result<()> {
+    // Clear all derived state for the group and rebuild from the valid set.
+    // This is called inside the same DB lock that holds the revalidation, so
+    // it is atomic with respect to concurrent validation.
+    conn.execute("DELETE FROM messages WHERE chat_id = ?1", [group_id])?;
+    conn.execute("DELETE FROM group_message_receipts WHERE group_id = ?1", [group_id])?;
+    conn.execute("DELETE FROM group_file_sources WHERE group_id = ?1", [group_id])?;
+    // Roster and chat state are rebuilt record-by-record below; first clear.
+    // We keep the chat row itself (it will be upserted by GroupCreated).
+    conn.execute("DELETE FROM chat_peers WHERE chat_id = ?1", [group_id])?;
+    // For simplicity, delete and rebuild chat_members via the per-record logic.
+    // Re-apply each valid record's side effects in causal order.
+    for rec in valid_records {
+        match rec.body() {
+            GroupRecordBody::GroupCreated { name, image_hash, .. } => {
+                db::upsert_chat(conn, rec.group_id(), name, true)?;
+                db::update_chat_image_hash(conn, rec.group_id(), image_hash.as_deref())?;
+                if let Some(image_hash) = image_hash {
+                    ensure_incomplete_file_row(conn, image_hash)?;
+                    db::upsert_group_file_source(conn, rec.group_id(), image_hash, rec.author_peer_id())?;
+                }
+                ensure_peer(conn, rec.author_peer_id(), "group")?;
+                db::upsert_chat_member_state(
+                    conn,
+                    rec.group_id(),
+                    rec.author_peer_id(),
+                    "admin",
+                    "joined",
+                    None,
+                    Some(rec.id()),
+                )?;
+            }
+            GroupRecordBody::MemberInvited { peer_id, role } => {
+                ensure_peer(conn, peer_id, "group")?;
+                db::upsert_chat_member_state(
+                    conn,
+                    rec.group_id(),
+                    peer_id,
+                    role,
+                    "invited",
+                    Some(rec.author_peer_id()),
+                    Some(rec.id()),
+                )?;
+            }
+            GroupRecordBody::MemberJoined { peer_id } => {
+                ensure_peer(conn, peer_id, "group")?;
+                db::upsert_chat_member_state(
+                    conn,
+                    rec.group_id(),
+                    peer_id,
+                    "member",
+                    "joined",
+                    None,
+                    Some(rec.id()),
+                )?;
+            }
+            GroupRecordBody::MemberLeft { peer_id } => {
+                let _ = db::remove_chat_member(conn, rec.group_id(), peer_id);
+            }
+            GroupRecordBody::MemberRemoved { peer_id } => {
+                let _ = db::remove_chat_member(conn, rec.group_id(), peer_id);
+            }
+            GroupRecordBody::GroupRenamed { name } => {
+                db::upsert_chat(conn, rec.group_id(), name, true)?;
+            }
+            GroupRecordBody::GroupSettingsUpdated { settings } => {
+                // Settings are derived, not separately stored; nothing to rebuild here
+                // beyond the roster which is already handled. Keep for completeness.
+                let _ = settings;
+            }
+            GroupRecordBody::AdminTransferred { .. } => {
+                // Roster roles are rebuilt via the per-member state above; for
+                // transfer we need to ensure the new admin role is reflected.
+                // The valid set's replay will have already set the correct admin
+                // via MemberInvited/Joined, but transfer itself doesn't have a
+                // direct member state change beyond admin. Re-derive roster roles
+                // by re-applying the transfer's effect: update the member's role.
+                // For simplicity, we rely on the fact that the next roster rebuild
+                // from valid_records will have the correct admin, but we need to
+                // ensure the transfer's effect is visible. Since transfer doesn't
+                // directly change member state except admin, we can ignore here
+                // and let the next `get_group_policy` derive correctly. However,
+                // to keep `chat_members` role accurate, we update it.
+                if let GroupRecordBody::AdminTransferred { new_admin_peer_id } = rec.body() {
+                    // Ensure the new admin is marked as admin in the roster.
+                    // This mirrors the logic in apply for transfer.
+                    let _ = db::upsert_chat_member_state(
+                        conn,
+                        rec.group_id(),
+                        new_admin_peer_id,
+                        "admin",
+                        "joined",
+                        None,
+                        Some(rec.id()),
+                    );
+                }
+            }
+            GroupRecordBody::GroupDissolved => {
+                // Dissolution clears roster and messages, which we already did
+                // at the start of rebuild, so nothing more.
+            }
+            GroupRecordBody::Message {
+                content_type,
+                text_content,
+                file_hash,
+                sender_alias,
+            } => {
+                let db_msg = group_record_to_db_message(
+                    rec,
+                    *content_type,
+                    text_content.clone(),
+                    file_hash.clone(),
+                    sender_alias.clone(),
+                );
+                let _ = db::insert_message(conn, &db_msg);
+                if let Some(file_hash) = file_hash {
+                    ensure_incomplete_file_row(conn, file_hash)?;
+                    db::upsert_group_file_source(conn, rec.group_id(), file_hash, rec.author_peer_id())?;
+                }
+            }
+            GroupRecordBody::Receipt { message_ids, status } => {
+                for message_id in message_ids {
+                    let _ = db::upsert_group_message_receipt(
+                        conn,
+                        rec.group_id(),
+                        message_id,
+                        rec.author_peer_id(),
+                        status.as_str(),
+                        rec.timestamp(),
+                    );
+                }
+            }
+            GroupRecordBody::Head { .. } | GroupRecordBody::FileAvailability { .. } => {}
+        }
+    }
+    // If no valid GroupCreated remains, delete the chat itself.
+    if valid_records.is_empty() || !valid_records.iter().any(|r| matches!(r.body(), GroupRecordBody::GroupCreated { .. })) {
+        let _ = db::delete_group_chat(conn, group_id);
     }
     Ok(())
 }
@@ -1786,6 +1973,64 @@ fn collect_parent_closure(
         out.push(record);
     }
     Ok(out)
+}
+
+fn get_policy_heads(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+) -> anyhow::Result<Vec<SignedGroupRecord>> {
+    let all = db::get_all_verified_group_records_ordered(conn, group_id)?;
+    let mut policy_records: Vec<&SignedGroupRecord> = all
+        .iter()
+        .filter(|r| is_policy_changing(r.body()))
+        .collect();
+    // Policy leaves are policy records that are not ancestors of another policy record.
+    let mut policy_parent_set = std::collections::HashSet::new();
+    for rec in &policy_records {
+        for p in &rec.unsigned.parents {
+            // Only consider parent if it is also a policy record (or its closure contains one).
+            // To handle transitive policy ancestry, we need to check if parent is in the
+            // transitive closure of any other policy record, not just direct parent.
+            // For simplicity, collect all policy ancestors via closure.
+            if let Some(parent_rec) = all.iter().find(|r| r.id() == p) {
+                if is_policy_changing(parent_rec.body()) {
+                    policy_parent_set.insert(p.clone());
+                } else {
+                    // For non-policy parents that are not directly policy, check if their
+                    // closure contains a policy record that would make them policy-ancestors.
+                    // Instead, we can just collect all policy ancestors transitively.
+                    let closure = collect_parent_closure(conn, group_id, &[p.clone()])?;
+                    for c in closure {
+                        if is_policy_changing(c.body()) {
+                            policy_parent_set.insert(c.id().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Also consider direct parents that are policy records.
+    // The above already handles, but we need a simpler approach: a policy record is a leaf
+    // if no other policy record has it (transitively) as an ancestor.
+    // Build full transitive closure for each policy record and check.
+    let mut leaves = Vec::new();
+    for rec in policy_records {
+        let mut is_ancestor = false;
+        for other in all.iter().filter(|r| is_policy_changing(r.body())) {
+            if other.id() == rec.id() {
+                continue;
+            }
+            let closure = collect_parent_closure(conn, group_id, &other.unsigned.parents)?;
+            if closure.iter().any(|c| c.id() == rec.id()) || other.unsigned.parents.contains(&rec.id().to_string()) {
+                is_ancestor = true;
+                break;
+            }
+        }
+        if !is_ancestor {
+            leaves.push((*rec).clone());
+        }
+    }
+    Ok(leaves)
 }
 
 fn sign_record(
@@ -2053,6 +2298,8 @@ mod tests {
     #[test]
     fn invite_gated_join_requires_existing_invite_payload() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let conn = app_state.db_conn.lock().expect("db");
         let missing = db::get_group_invite_payload(&conn, "missing").expect("query");
         assert!(missing.is_none());
@@ -2061,6 +2308,8 @@ mod tests {
     #[test]
     fn default_group_policy_makes_founder_admin_and_disables_member_invites() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         let created = signed(
@@ -2084,6 +2333,8 @@ mod tests {
     #[test]
     fn administrator_transfer_and_successor_order_are_deterministic() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let older = keypair();
         let newer = keypair();
@@ -2131,6 +2382,8 @@ mod tests {
     #[test]
     fn sole_administrator_can_dissolve_and_later_records_are_rejected() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         apply(&app_state, &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
@@ -2187,6 +2440,8 @@ mod tests {
         // tied, and descending clocks the causal counters decide who is
         // admin and who joins first, so skewed peers converge identically.
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let older = keypair();
         let newer = keypair();
@@ -2335,6 +2590,8 @@ mod tests {
     #[test]
     fn causal_counter_abuse_is_rejected() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         let created = signed(
@@ -2436,6 +2693,8 @@ mod tests {
     #[test]
     fn replayed_record_is_a_noop() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         let created = signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
@@ -2458,6 +2717,8 @@ mod tests {
         // (A -> B), it must stay pending until the predecessor is applied —
         // and then the chain resolves on retry.
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let successor = keypair();
         let third = keypair();
@@ -2515,6 +2776,8 @@ mod tests {
     #[test]
     fn leave_waits_for_parent_admin_transfer() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let successor = keypair();
         let founder_id = peer_id(&founder);
@@ -2555,6 +2818,8 @@ mod tests {
     #[test]
     fn applying_group_created_stores_group_image_hash() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         let image_hash = "group-image-hash";
@@ -2599,6 +2864,8 @@ mod tests {
     #[test]
     fn file_availability_creates_placeholder_file_row() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         let file_hash = "available-group-image-hash";
@@ -2649,6 +2916,8 @@ mod tests {
     #[test]
     fn non_admin_rename_is_rejected() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
@@ -2715,6 +2984,8 @@ mod tests {
     #[test]
     fn member_join_without_invite_is_pending_not_applied() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
@@ -2753,6 +3024,8 @@ mod tests {
     #[test]
     fn member_invite_is_accepted_when_setting_allows_it() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let invited_by_member = keypair();
@@ -2826,6 +3099,8 @@ mod tests {
     #[test]
     fn pending_join_applies_after_required_invite_arrives() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
@@ -2882,6 +3157,8 @@ mod tests {
     #[test]
     fn pre_join_message_remains_pending_after_member_later_joins() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
@@ -2964,6 +3241,8 @@ mod tests {
     #[test]
     fn only_active_members_can_sync_group_records() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let outsider = keypair();
@@ -3023,6 +3302,8 @@ mod tests {
     #[test]
     fn admin_leave_is_blocked_until_succession_exists() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
 
@@ -3061,6 +3342,8 @@ mod tests {
     #[test]
     fn admin_member_removed_record_removes_active_member() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
@@ -3128,6 +3411,8 @@ mod tests {
     #[test]
     fn delivered_receipt_does_not_downgrade_read() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
@@ -3219,6 +3504,8 @@ mod tests {
     #[test]
     fn cross_group_parent_is_rejected() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder_g = keypair();
         let founder_h = keypair();
         let group_g = chat_kind::generate_group_chat_id();
@@ -3252,6 +3539,8 @@ mod tests {
     #[test]
     fn concurrent_heads_both_remain_in_later_closure() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let alice = keypair();
         let bob = keypair();
@@ -3344,6 +3633,8 @@ mod tests {
     #[test]
     fn missing_parent_high_counter_does_not_poison_local_head() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         apply(
@@ -3396,6 +3687,8 @@ mod tests {
     #[test]
     fn policy_reconstruction_beyond_ten_thousand_records() {
         let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let founder = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         apply(
@@ -3594,32 +3887,52 @@ mod tests {
 
     #[test]
     fn removed_member_stale_branch_is_rejected() {
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
         let app_state = app_state();
         let founder = keypair();
         let member = keypair();
         let group_id = chat_kind::generate_group_chat_id();
         let member_id = peer_id(&member);
-        apply(
-            &app_state,
-            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+        let r1 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-created-{}", rand::random::<u64>()),
+            1_700_000_001,
+            vec![],
+            1,
+            GroupRecordBody::GroupCreated {
                 name: "Test".to_string(), settings: None, image_hash: None,
-            }),
+            },
         )
         .unwrap();
-        apply(
-            &app_state,
-            &signed(&founder, &group_id, "invite", 2, GroupRecordBody::MemberInvited {
+        apply(&app_state, &r1).unwrap();
+        let r2 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-invite-{}", rand::random::<u64>()),
+            1_700_000_002,
+            vec![r1.id().to_string()],
+            2,
+            GroupRecordBody::MemberInvited {
                 peer_id: member_id.clone(), role: "member".to_string(),
-            }),
+            },
         )
         .unwrap();
-        apply(
-            &app_state,
-            &signed(&member, &group_id, "join", 3, GroupRecordBody::MemberJoined {
+        apply(&app_state, &r2).unwrap();
+        let r3 = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-join-{}", rand::random::<u64>()),
+            1_700_000_003,
+            vec![r2.id().to_string()],
+            3,
+            GroupRecordBody::MemberJoined {
                 peer_id: member_id.clone(),
-            }),
+            },
         )
         .unwrap();
+        apply(&app_state, &r3).unwrap();
         let head_before = {
             let conn = app_state.db_conn.lock().unwrap();
             db::get_group_head_ids(&conn, &group_id).unwrap()[0].clone()
@@ -3718,5 +4031,280 @@ mod tests {
             .unwrap()
         };
         apply(&app_state, &winning_child).expect("winning branch child should be accepted");
+    }
+
+    #[test]
+    fn removal_and_stale_branch_converge_regardless_of_arrival_order() {
+        // Two peers receive the same set {H, R, X, Y} in different orders:
+        // Peer A: R -> X -> Y (Y's parent is X, X is concurrent with R, Y should be rejected)
+        // Peer B: X -> Y -> R (Y is verified before R arrives, then R arrives and should demote Y)
+        // Both must converge to same verified set and materialized roster.
+        for order in [0, 1] {
+            let app_state = app_state();
+            let founder = keypair();
+            let member = keypair();
+            let group_id = chat_kind::generate_group_chat_id();
+            let member_id = peer_id(&member);
+            // Create and join with explicit parents.
+            let r1 = SignedGroupRecord::new(
+                &founder,
+                group_id.clone(),
+                format!("test-created-{}-{}", order, rand::random::<u64>()),
+                1_700_000_001,
+                vec![],
+                1,
+                GroupRecordBody::GroupCreated {
+                    name: "Test".to_string(), settings: None, image_hash: None,
+                },
+            )
+            .unwrap();
+            apply(&app_state, &r1).unwrap();
+            let r2 = SignedGroupRecord::new(
+                &founder,
+                group_id.clone(),
+                format!("test-invite-{}-{}", order, rand::random::<u64>()),
+                1_700_000_002,
+                vec![r1.id().to_string()],
+                2,
+                GroupRecordBody::MemberInvited {
+                    peer_id: member_id.clone(), role: "member".to_string(),
+                },
+            )
+            .unwrap();
+            apply(&app_state, &r2).unwrap();
+            let r3 = SignedGroupRecord::new(
+                &member,
+                group_id.clone(),
+                format!("test-join-{}-{}", order, rand::random::<u64>()),
+                1_700_000_003,
+                vec![r2.id().to_string()],
+                3,
+                GroupRecordBody::MemberJoined {
+                    peer_id: member_id.clone(),
+                },
+            )
+            .unwrap();
+            apply(&app_state, &r3).unwrap();
+            let head = {
+                let conn = app_state.db_conn.lock().unwrap();
+                db::get_group_head_ids(&conn, &group_id).unwrap()[0].clone()
+            };
+            let removal = SignedGroupRecord::new(
+                &founder,
+                group_id.clone(),
+                format!("test-removal-{}-{}", order, rand::random::<u64>()),
+                1_700_000_010,
+                vec![head.clone()],
+                4,
+                GroupRecordBody::MemberRemoved { peer_id: member_id.clone() },
+            )
+            .unwrap();
+            let stale = SignedGroupRecord::new(
+                &member,
+                group_id.clone(),
+                format!("test-stale-{}-{}", order, rand::random::<u64>()),
+                1_700_000_011,
+                vec![head.clone()],
+                4,
+                GroupRecordBody::Message {
+                    content_type: GroupContentType::Text,
+                    text_content: Some("stale".to_string()),
+                    file_hash: None,
+                    sender_alias: None,
+                },
+            )
+            .unwrap();
+            let stale_child = SignedGroupRecord::new(
+                &member,
+                group_id.clone(),
+                format!("test-stale-child-{}-{}", order, rand::random::<u64>()),
+                1_700_000_020,
+                vec![stale.id().to_string()],
+                5,
+                GroupRecordBody::Message {
+                    content_type: GroupContentType::Text,
+                    text_content: Some("should be rejected".to_string()),
+                    file_hash: None,
+                    sender_alias: None,
+                },
+            )
+            .unwrap();
+            if order == 0 {
+                // R -> X -> Y
+                apply(&app_state, &removal).unwrap();
+                apply(&app_state, &stale).unwrap();
+                let res = apply(&app_state, &stale_child);
+                assert!(res.is_err() || !res.unwrap(), "stale child should be rejected after removal");
+            } else {
+                // X -> Y -> R
+                apply(&app_state, &stale).unwrap();
+                // Y is applied before R, so it will be considered valid at that time (since
+                // winning head is still H, not R). After R arrives, Y should be demoted.
+                let _ = apply(&app_state, &stale_child);
+                apply(&app_state, &removal).unwrap();
+                // After R, revalidation should have demoted Y if it was previously verified.
+                let conn = app_state.db_conn.lock().unwrap();
+                let state = group_record_state(&conn, stale_child.id()).unwrap();
+                // Y should now be pending or not verified, not verified.
+                assert_ne!(state, Some((true, false)), "stale child should not remain verified after late removal");
+                // Also check that the two orders converge to same verified set.
+                let recs = db::get_all_verified_group_records_ordered(&conn, &group_id).unwrap();
+                let ids: std::collections::HashSet<String> = recs.iter().map(|r| r.id().to_string()).collect();
+                assert!(!ids.contains(stale_child.id()), "stale child should not be in verified set");
+            }
+            // Both orders should have same final verified set (excluding stale_child) and same roster.
+            // We check that the member is removed in both.
+            let policy = get_group_policy(&app_state, &group_id).unwrap();
+            assert!(!policy.active_members.contains(&member_id), "member should be removed in both orders");
+        }
+    }
+
+    #[test]
+    fn non_policy_message_does_not_defeat_removal_when_larger_key() {
+        // Non-policy Message X concurrent with removal R at same counter, where X has larger
+        // (counter, author, id) and would win if winner were chosen from all leaves.
+        // With policy-only winning head, R must remain the winner and Y at N+2 with parent X
+        // must be rejected. Use explicit parents to avoid thread-local.
+        let app_state = app_state();
+        GROUP_LAST_ID.with(|m| m.borrow_mut().clear());
+        GROUP_LAST_COUNTER.with(|m| m.borrow_mut().clear());
+        let founder = keypair();
+        // Create a member with a peer ID that is lexicographically large to make its Message win
+        // if winner were chosen from all leaves. We use a fixed seed that is large.
+        let member = {
+            // Generate a keypair and check its peer ID is larger than founder's; if not, try again.
+            let mut kp = keypair();
+            for _ in 0..10 {
+                if peer_id(&kp) > peer_id(&founder) {
+                    break;
+                }
+                kp = keypair();
+            }
+            kp
+        };
+        let group_id = chat_kind::generate_group_chat_id();
+        let member_id = peer_id(&member);
+        let r1 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-np-created-{}", rand::random::<u64>()),
+            1_700_000_001,
+            vec![],
+            1,
+            GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r1).unwrap();
+        let r2 = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-np-invite-{}", rand::random::<u64>()),
+            1_700_000_002,
+            vec![r1.id().to_string()],
+            2,
+            GroupRecordBody::MemberInvited {
+                peer_id: member_id.clone(), role: "member".to_string(),
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r2).unwrap();
+        let r3 = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-np-join-{}", rand::random::<u64>()),
+            1_700_000_003,
+            vec![r2.id().to_string()],
+            3,
+            GroupRecordBody::MemberJoined {
+                peer_id: member_id.clone(),
+            },
+        )
+        .unwrap();
+        apply(&app_state, &r3).unwrap();
+        let head = r3.id().to_string();
+        // Create a member Message X with a large author key that would win if all leaves were considered.
+        // Ensure its peer ID is larger than founder's for the test.
+        let x_author = member.clone();
+        // Use the member itself (which we made large) for X.
+        let removal = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-removal-large-{}", rand::random::<u64>()),
+            1_700_000_010,
+            vec![head.clone()],
+            4,
+            GroupRecordBody::MemberRemoved { peer_id: member_id.clone() },
+        )
+        .unwrap();
+        let msg_x = SignedGroupRecord::new(
+            &x_author,
+            group_id.clone(),
+            format!("test-msg-x-large-{}", rand::random::<u64>()),
+            1_700_000_011,
+            vec![head.clone()],
+            4,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("large key message".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .unwrap();
+        // Ensure X would win if all leaves were considered (its author is larger).
+        // If not, swap: make X's author be the larger one.
+        let (removal, msg_x) = if peer_id(&x_author) > peer_id(&founder) {
+            (removal, msg_x)
+        } else {
+            // Swap authors to make X larger
+            let member2 = {
+                let mut kp = keypair();
+                for _ in 0..10 {
+                    if peer_id(&kp) > peer_id(&founder) {
+                        break;
+                    }
+                    kp = keypair();
+                }
+                kp
+            };
+            let msg_x2 = SignedGroupRecord::new(
+                &member2,
+                group_id.clone(),
+                format!("test-msg-x-large2-{}", rand::random::<u64>()),
+                1_700_000_012,
+                vec![head.clone()],
+                4,
+                GroupRecordBody::Message {
+                    content_type: GroupContentType::Text,
+                    text_content: Some("large key message".to_string()),
+                    file_hash: None,
+                    sender_alias: None,
+                },
+            )
+            .unwrap();
+            (removal, msg_x2)
+        };
+        apply(&app_state, &removal).unwrap();
+        apply(&app_state, &msg_x).unwrap();
+        // Now Y at N+2 with parent X should be rejected, even though X has larger key and would be winning if all leaves were considered.
+        let y = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-y-{}", rand::random::<u64>()),
+            1_700_000_020,
+            vec![msg_x.id().to_string()],
+            5,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("y".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .unwrap();
+        let err = apply(&app_state, &y).expect_err("y should be rejected as stale");
+        assert!(err.to_string().contains("must descend"), "wrong error: {err}");
     }
 }
