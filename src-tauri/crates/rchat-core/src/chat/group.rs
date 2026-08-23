@@ -930,6 +930,54 @@ fn validate_group_record(
         return Err(anyhow!("Group record must name the policy head it builds on"));
     }
     validate_record_counter(conn, record)?;
+    // Stale-branch check: an authorization-sensitive record that descends
+    // from an old branch must not retain superseded authority. If the new
+    // record is strictly after the current winning policy head, it must
+    // contain that head in its closure.
+    if !matches!(record.body(), GroupRecordBody::GroupCreated { .. })
+        && !matches!(
+            record.body(),
+            GroupRecordBody::Head { .. } | GroupRecordBody::FileAvailability { .. }
+        )
+    {
+        let winning_head = {
+            let heads = db::get_group_head_ids(conn, record.group_id())?;
+            if heads.is_empty() {
+                None
+            } else {
+                // Winning head is max by (counter, author, id) among verified leaves.
+                let mut all_heads = Vec::new();
+                for hid in heads {
+                    if let Some(rec) = db::get_group_record(conn, &hid)? {
+                        all_heads.push(rec);
+                    }
+                }
+                all_heads.into_iter().max_by(|a, b| {
+                    record_order_key(a).cmp(&record_order_key(b))
+                })
+            }
+        };
+        if let Some(winning) = winning_head {
+            if record.lamport_counter() > winning.lamport_counter() {
+                let closure = collect_parent_closure(conn, record.group_id(), &record.unsigned.parents)?;
+                let closure_ids: std::collections::HashSet<String> =
+                    closure.iter().map(|r| r.id().to_string()).collect();
+                // Also consider direct parents themselves.
+                let mut closure_with_parents = closure_ids.clone();
+                for pid in &record.unsigned.parents {
+                    closure_with_parents.insert(pid.clone());
+                }
+                if !closure_with_parents.contains(winning.id()) {
+                    return Err(anyhow!(
+                        "Group record at {} must descend from current policy head {} at {}",
+                        record.lamport_counter(),
+                        winning.id(),
+                        winning.lamport_counter()
+                    ));
+                }
+            }
+        }
+    }
     let existing_records = db::get_all_verified_group_records_ordered(conn, record.group_id())?;
     let current_policy = derive_group_policy(&existing_records);
     let policy_before_record = if matches!(record.body(), GroupRecordBody::GroupCreated { .. }) {
@@ -3408,5 +3456,133 @@ mod tests {
             assert!(seen.insert(key.clone()), "fork detected: same author/counter {:?}", key);
         }
         drop(temp_dir);
+    }
+
+    #[test]
+    fn removed_member_stale_branch_is_rejected() {
+        let app_state = app_state();
+        let founder = keypair();
+        let member = keypair();
+        let group_id = chat_kind::generate_group_chat_id();
+        let member_id = peer_id(&member);
+        apply(
+            &app_state,
+            &signed(&founder, &group_id, "created", 1, GroupRecordBody::GroupCreated {
+                name: "Test".to_string(), settings: None, image_hash: None,
+            }),
+        )
+        .unwrap();
+        apply(
+            &app_state,
+            &signed(&founder, &group_id, "invite", 2, GroupRecordBody::MemberInvited {
+                peer_id: member_id.clone(), role: "member".to_string(),
+            }),
+        )
+        .unwrap();
+        apply(
+            &app_state,
+            &signed(&member, &group_id, "join", 3, GroupRecordBody::MemberJoined {
+                peer_id: member_id.clone(),
+            }),
+        )
+        .unwrap();
+        let head_before = {
+            let conn = app_state.db_conn.lock().unwrap();
+            db::get_group_head_ids(&conn, &group_id).unwrap()[0].clone()
+        };
+        let removal = SignedGroupRecord::new(
+            &founder,
+            group_id.clone(),
+            format!("test-removal-{}", rand::random::<u64>()),
+            1_700_000_010,
+            vec![head_before.clone()],
+            4,
+            GroupRecordBody::MemberRemoved { peer_id: member_id.clone() },
+        )
+        .unwrap();
+        let stale_msg = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-stale-{}", rand::random::<u64>()),
+            1_700_000_011,
+            vec![head_before.clone()],
+            4,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("stale".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .unwrap();
+        apply(&app_state, &removal).unwrap();
+        apply(&app_state, &stale_msg).unwrap();
+        let winning = {
+            let conn = app_state.db_conn.lock().unwrap();
+            let heads = db::get_group_head_ids(&conn, &group_id).unwrap();
+            let mut recs = Vec::new();
+            for hid in heads {
+                recs.push(db::get_group_record(&conn, &hid).unwrap().unwrap());
+            }
+            recs.into_iter().max_by(|a, b| record_order_key(a).cmp(&record_order_key(b))).unwrap()
+        };
+        let losing_head = {
+            let conn = app_state.db_conn.lock().unwrap();
+            let heads = db::get_group_head_ids(&conn, &group_id).unwrap();
+            let mut recs = Vec::new();
+            for hid in heads {
+                recs.push(db::get_group_record(&conn, &hid).unwrap().unwrap());
+            }
+            recs.into_iter().find(|r| r.id() != winning.id()).unwrap()
+        };
+        let stale_child = SignedGroupRecord::new(
+            &member,
+            group_id.clone(),
+            format!("test-stale-child-{}", rand::random::<u64>()),
+            1_700_000_020,
+            vec![losing_head.id().to_string()],
+            losing_head.lamport_counter() + 1,
+            GroupRecordBody::Message {
+                content_type: GroupContentType::Text,
+                text_content: Some("should be rejected".to_string()),
+                file_hash: None,
+                sender_alias: None,
+            },
+        )
+        .unwrap();
+        let err = apply(&app_state, &stale_child).expect_err("stale branch child must be rejected");
+        assert!(
+            err.to_string().contains("must descend from current policy head"),
+            "wrong error for stale branch: {err}"
+        );
+        let winning_child = if winning.id() == removal.id() {
+            SignedGroupRecord::new(
+                &founder,
+                group_id.clone(),
+                format!("test-winning-child-{}", rand::random::<u64>()),
+                1_700_000_021,
+                vec![winning.id().to_string()],
+                winning.lamport_counter() + 1,
+                GroupRecordBody::GroupRenamed {
+                    name: "After Removal".to_string(),
+                },
+            )
+            .unwrap()
+        } else {
+            SignedGroupRecord::new(
+                &founder,
+                group_id.clone(),
+                format!("test-winning-child-{}", rand::random::<u64>()),
+                1_700_000_021,
+                vec![winning.id().to_string()],
+                winning.lamport_counter() + 1,
+                GroupRecordBody::MemberInvited {
+                    peer_id: fixed_peer_id(99),
+                    role: "member".to_string(),
+                },
+            )
+            .unwrap()
+        };
+        apply(&app_state, &winning_child).expect("winning branch child should be accepted");
     }
 }
